@@ -43,7 +43,10 @@ class CarController(CarControllerBase):
     self.lkas_enabled_last = False
     self.steer_alert_last = False
     self.lead_distance_bars_last = None
+    self.human_turn = False
     self.distance_bar_frame = 0
+    self.human_turn_dur_threshold = 0.5  # how long does a human need to be turning the wheel before we consider it an over-ride instead of an adjustment
+    self.human_turn_dur_frames = int(self.human_turn_dur_threshold / (DT_CTRL * 5))  # convert time to scans
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -86,7 +89,28 @@ class CarController(CarControllerBase):
         # steer actuation, the other three signals are necessary. Ford controls vehicles differently than most other makes.
         # A detailed explanation on ford control can be found here:
         # https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
+        if steeringPressed and abs(steeringAngleDeg_PV) > 45:
+            self.human_turn = True
+          else:
+            self.human_turn = False
+
+          # Determine when to reset steering
+          if (self.human_turn) and self.enable_human_turn_detection:
+            reset_steering = 1
+          else:
+            reset_steering = 0
+
         mode = 1 if CC.latActive else 0
+
+        if reset_steering == 1:
+          apply_curvature = 0
+          path_offset = 0
+          path_angle = 0
+          desired_curvature_rate = 0
+          mode = 3
+        else:
+          mode = 2
+        
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -apply_curvature, 0., counter))
       else:
