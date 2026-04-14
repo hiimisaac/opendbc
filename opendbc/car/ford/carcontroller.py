@@ -80,6 +80,10 @@ def get_ford_canfd_c0_lookahead(v_ego: float, d_look: float) -> float:
   return float(min(d_look, c0_lookahead))
 
 
+def scale_ford_canfd_path_offset(path_offset: float, v_ego: float) -> float:
+  return float(path_offset * np.interp(v_ego, *CarControllerParams.C0_GAIN))
+
+
 def get_ford_canfd_c1_lookahead(v_ego: float, d_look: float, curvature_last: float, curvature_target: float, limit_status: int) -> float:
   lookahead = d_look
   if abs(curvature_target) < abs(curvature_last) or curvature_target * curvature_last < 0:
@@ -207,6 +211,7 @@ class CarController(CarControllerBase):
 
             d_c0 = get_ford_canfd_c0_lookahead(v_ego, d_look)
             path_offset = float(np.interp(d_c0, x_pts, np.array(self.model.position.y)))
+            path_offset = scale_ford_canfd_path_offset(path_offset, v_ego)
             path_offset = apply_hysteresis(path_offset, self.path_offset_last, CarControllerParams.C0_HYSTERESIS)
             path_offset = apply_std_steer_angle_limits(
               path_offset, self.path_offset_last, v_ego, 0., canfd_lat_active, CarControllerParams.C0_RATE_LIMITS)

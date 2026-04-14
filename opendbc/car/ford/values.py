@@ -37,11 +37,12 @@ class CarControllerParams:
   # Rate limits for c0 (path_offset) in meter space — keeps offset as a cleanup term only.
   C0_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
     2.5,
-    ([5, 15, 25], [0.25, 0.18, 0.10]),
-    ([5, 15, 25], [0.35, 0.24, 0.12]),
+    ([5, 15, 25], [0.30, 0.22, 0.12]),
+    ([5, 15, 25], [0.40, 0.28, 0.15]),
   )
-  C0_MAX = ([5., 15., 25.], [2.5, 1.25, 0.75])
-  C0_HYSTERESIS = 0.04
+  C0_MAX = ([5., 15., 25.], [2.8, 1.4, 0.85])
+  C0_GAIN = ([5., 15., 25.], [1.30, 1.20, 1.10])
+  C0_HYSTERESIS = 0.02
 
   # Rate limits for c1 (path_angle) in radian space.
   C1_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
