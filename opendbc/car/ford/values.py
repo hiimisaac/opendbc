@@ -42,11 +42,6 @@ class CarControllerParams:
   )
   C0_MAX = ([5., 15., 25.], [2.5, 1.25, 0.75])
   C0_HYSTERESIS = 0.04
-  C0_TRIM_TAU = 1.0
-  C0_TRIM_GAIN = ([5., 15., 25.], [0.22, 0.16, 0.10])
-  C0_TRIM_MAX = ([5., 15., 25.], [0.28, 0.16, 0.09])
-  C0_TRIM_PATH_ANGLE_MAX = ([5., 15., 25.], [0.060, 0.040, 0.028])
-  C0_TRIM_CURVATURE_MAX = ([5., 15., 25.], [0.0025, 0.0015, 0.0008])
 
   # Rate limits for c1 (path_angle) in radian space.
   C1_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
@@ -57,6 +52,11 @@ class CarControllerParams:
   C1_EXIT_LOOKAHEAD_FACTOR = ([5., 15., 25.], [0.85, 0.72, 0.58])
   C1_LIMIT_LOOKAHEAD_FACTOR = ([0., 1., 2., 3.], [1.0, 0.92, 0.84, 0.76])
   C1_LOOKAHEAD_MIN = 4.0
+  C1_CENTERING_BIAS_TAU = 0.9
+  C1_CENTERING_BIAS_GAIN = ([5., 15., 25.], [0.030, 0.022, 0.015])
+  C1_CENTERING_BIAS_MAX = ([5., 15., 25.], [0.018, 0.012, 0.008])
+  C1_CENTERING_BIAS_PATH_ANGLE_MAX = ([5., 15., 25.], [0.060, 0.040, 0.028])
+  C1_CENTERING_BIAS_CURVATURE_MAX = ([5., 15., 25.], [0.0025, 0.0015, 0.0008])
 
   C2_WINDUP_TAU = 0.35
   C2_UNWIND_TAU = 0.14

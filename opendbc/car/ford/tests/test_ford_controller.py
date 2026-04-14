@@ -4,7 +4,7 @@ from opendbc.car.ford.carcontroller import (
   get_ford_canfd_c0_lookahead,
   get_ford_canfd_c1_lookahead,
   get_ford_canfd_mode,
-  get_ford_canfd_path_offset_trim,
+  get_ford_canfd_path_angle_bias,
   get_ford_curvature_filter_tau,
   shape_ford_canfd_curvature,
   suppress_curvature_sign_flip,
@@ -35,14 +35,14 @@ class TestFordCanfdControllerHelpers(unittest.TestCase):
     self.assertAlmostEqual(get_ford_canfd_c0_lookahead(14.0, 14.0), 6.0)
     self.assertAlmostEqual(get_ford_canfd_c0_lookahead(25.0, 25.0), 4.0)
 
-  def test_c0_trim_builds_near_center(self):
-    trim = get_ford_canfd_path_offset_trim(0.5, 0.01, 0.0005, 0.0, 15.0, True)
-    self.assertGreater(trim, 0.0)
-    self.assertLess(trim, 0.1)
+  def test_c1_centering_bias_builds_near_center(self):
+    bias = get_ford_canfd_path_angle_bias(0.5, 0.01, 0.0005, 0.0, 15.0, True)
+    self.assertGreater(bias, 0.0)
+    self.assertLess(bias, 0.02)
 
-  def test_c0_trim_stays_off_in_turning(self):
-    trim = get_ford_canfd_path_offset_trim(0.5, 0.08, 0.002, 0.05, 15.0, True)
-    self.assertLess(trim, 0.05)
+  def test_c1_centering_bias_stays_off_in_turning(self):
+    bias = get_ford_canfd_path_angle_bias(0.5, 0.08, 0.002, 0.01, 15.0, True)
+    self.assertLess(bias, 0.01)
 
   def test_c1_lookahead_shrinks_on_exit(self):
     unwind_lookahead = get_ford_canfd_c1_lookahead(20.0, 20.0, 0.004, 0.002, 0)
