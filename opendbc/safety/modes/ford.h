@@ -267,9 +267,9 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
   // Safety check for LateralMotionControl2 action
   if (msg->addr == FORD_LateralMotionControl2) {
-    // CAN FD: c1/c0 control steering, c2=0 always. Disable curvature error check
-    // since desired curvature won't match measured when c1/c0 are doing the steering.
-    // ISO lateral accel limit still enforced on c2 range.
+    // CAN FD: c1/c0 can dominate steering response, so skip the driver curvature
+    // error check used on the legacy path. Still enforce ISO lateral accel limits
+    // and message-range checks on c2, while keeping c3 inactive.
     static const AngleSteeringLimits FORD_CANFD_STEERING_LIMITS = FORD_LIMITS(true, false);
 
     // Signal: LatCtl_D2_Rq
