@@ -19,6 +19,9 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+    self.lat_ctl_ste_status = 0
+    self.lat_ctl_limit_status = 0
+    self.lat_ctl_capability_status = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -54,7 +57,11 @@ class CarState(CarStateBase):
 
     if self.CP.flags & FordFlags.CANFD:
       # this signal is always 0 on non-CAN FD cars
-      ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
+      lat_ctl_status = cp.vl["Lane_Assist_Data3_FD1"]
+      self.lat_ctl_ste_status = lat_ctl_status["LatCtlSte_D_Stat"]
+      self.lat_ctl_limit_status = lat_ctl_status["LatCtlLim_D_Stat"]
+      self.lat_ctl_capability_status = lat_ctl_status["LatCtlCpblty_D_Stat"]
+      ret.steerFaultTemporary |= self.lat_ctl_ste_status not in (1, 2, 3)
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False

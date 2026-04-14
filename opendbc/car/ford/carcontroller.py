@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from numpy import clip, interp
+from numpy import clip
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
@@ -51,6 +51,60 @@ def apply_ford_curvature_limits(apply_curvature, apply_curvature_last, current_c
   return apply_curvature
 
 
+def first_order_filter(val: float, val_last: float, tau: float) -> float:
+  dt = DT_CTRL * CarControllerParams.STEER_STEP
+  alpha = 1 - np.exp(-dt / tau) if tau > 0 else 1.0
+  return float(alpha * val + (1.0 - alpha) * val_last)
+
+
+def suppress_curvature_sign_flip(curvature: float, curvature_last: float, deadband: float) -> float:
+  if abs(curvature) < deadband:
+    return 0.0
+  if curvature * curvature_last < 0 and abs(curvature) < 2.0 * deadband:
+    return 0.0
+  return curvature
+
+
+def get_ford_canfd_mode(lat_active: bool, capability_status: int) -> int:
+  if not lat_active:
+    return 0
+  if capability_status >= 2:
+    return 2
+  if capability_status == 1:
+    return 1
+  return 0
+
+
+def get_ford_canfd_c0_lookahead(v_ego: float, d_look: float) -> float:
+  c0_lookahead = np.interp(v_ego, [8.0, 14.0, 25.0], [8.0, 6.0, 4.0])
+  return float(min(d_look, c0_lookahead))
+
+
+def get_ford_canfd_c1_lookahead(v_ego: float, d_look: float, curvature_last: float, curvature_target: float, limit_status: int) -> float:
+  lookahead = d_look
+  if abs(curvature_target) < abs(curvature_last) or curvature_target * curvature_last < 0:
+    lookahead *= float(np.interp(v_ego, *CarControllerParams.C1_EXIT_LOOKAHEAD_FACTOR))
+  lookahead *= float(np.interp(float(limit_status), *CarControllerParams.C1_LIMIT_LOOKAHEAD_FACTOR))
+  return float(np.clip(lookahead, CarControllerParams.C1_LOOKAHEAD_MIN, d_look))
+
+
+def get_ford_curvature_filter_tau(curvature: float, curvature_last: float) -> float:
+  if curvature * curvature_last < 0:
+    return CarControllerParams.C2_CROSSOVER_TAU
+  if abs(curvature) > abs(curvature_last):
+    return CarControllerParams.C2_WINDUP_TAU
+  return CarControllerParams.C2_UNWIND_TAU
+
+
+def shape_ford_canfd_curvature(curvature: float, curvature_last: float, limit_status: int, capability_status: int) -> float:
+  # When the PSCM reports limited/near-limit, back off new wind-up but preserve fast unwind.
+  if abs(curvature) > abs(curvature_last):
+    curvature *= float(np.interp(float(limit_status), *CarControllerParams.C2_LIMIT_FACTOR))
+    if capability_status == 1:
+      curvature *= CarControllerParams.C2_LIMITED_MODE_FACTOR
+  return curvature
+
+
 def apply_creep_compensation(accel: float, v_ego: float) -> float:
   creep_accel = np.interp(v_ego, [1., 3.], [0.6, 0.])
   creep_accel = np.interp(accel, [0., 0.2], [creep_accel, 0.])
@@ -67,6 +121,8 @@ class CarController(CarControllerBase):
     self.apply_curvature_last = 0
     self.anti_overshoot_curvature_last = 0
     self.path_angle_last = 0.0
+    self.path_offset_last = 0.0
+    self.curvature_target_last = 0.0
 
     try:
       import cereal.messaging as messaging
@@ -118,34 +174,52 @@ class CarController(CarControllerBase):
     apply_curvature = 0.0
     path_angle = 0.0
     path_offset = 0.0
+    curvature_target = 0.0
     curvature_rate = 0.0
     ramp_type = 0
 
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
+      canfd_capability_status = getattr(CS, "lat_ctl_capability_status", 2)
+      canfd_limit_status = getattr(CS, "lat_ctl_limit_status", 0)
+      canfd_mode = get_ford_canfd_mode(CC.latActive, canfd_capability_status) if self.CP.flags & FordFlags.CANFD else 0
+      canfd_lat_active = canfd_mode != 0
+
       if CC.latActive:
         v_ego = CS.out.vEgoRaw
         desired_curvature = actuators.curvature
 
-        apply_curvature = 0.0
+        if self.CP.flags & FordFlags.CANFD:
+          current_curvature = -CS.out.yawRate / max(v_ego, 0.1)
+          curvature_deadband = float(np.interp(v_ego, *CarControllerParams.C2_SIGN_FLIP_DEADBAND))
+          curvature_target = desired_curvature if canfd_lat_active else 0.0
+          curvature_target = suppress_curvature_sign_flip(curvature_target, self.apply_curvature_last, curvature_deadband)
+          curvature_target = shape_ford_canfd_curvature(curvature_target, self.curvature_target_last, canfd_limit_status, canfd_capability_status)
+          curvature_tau = get_ford_curvature_filter_tau(curvature_target, self.curvature_target_last)
+          curvature_target = first_order_filter(curvature_target, self.curvature_target_last, curvature_tau)
+          apply_curvature = apply_ford_curvature_limits(curvature_target, self.apply_curvature_last, current_curvature,
+                                                        v_ego, 0., canfd_lat_active, self.CP)
 
-        if self.CP.flags & FordFlags.CANFD and self.model is not None and len(self.model.orientation.z) > 0:
-          d_look = max(v_ego * 1.0, 7.0)
-          x_pts = np.array(self.model.position.x)
-          path_angle = float(np.interp(d_look, x_pts, np.array(self.model.orientation.z)))
-          # c0: shorter lookahead at speed to prevent early curve entry
-          # Low speed: c0 at d_look (full authority for tight turns)
-          # High speed: c0 at 6m (near-term centering only)
-          d_c0 = float(np.interp(v_ego, [11., 14.], [d_look, 6.0]))
-          path_offset = float(np.interp(d_c0, x_pts, np.array(self.model.position.y)))
+          if self.model is not None and len(self.model.position.x) > 0 and len(self.model.position.y) > 0 and len(self.model.orientation.z) > 0:
+            x_pts = np.array(self.model.position.x)
+            d_look = max(v_ego * 1.0, 7.0)
+            d_c1 = get_ford_canfd_c1_lookahead(v_ego, d_look, self.curvature_target_last, curvature_target, canfd_limit_status)
+            path_angle = float(np.interp(d_c1, x_pts, np.array(self.model.orientation.z)))
 
-          path_angle = apply_std_steer_angle_limits(
-            path_angle, self.path_angle_last, v_ego, 0., CC.latActive, CarControllerParams.C1_RATE_LIMITS)
+            d_c0 = get_ford_canfd_c0_lookahead(v_ego, d_look)
+            path_offset = float(np.interp(d_c0, x_pts, np.array(self.model.position.y)))
+            path_offset = apply_hysteresis(path_offset, self.path_offset_last, CarControllerParams.C0_HYSTERESIS)
+            path_offset = apply_std_steer_angle_limits(
+              path_offset, self.path_offset_last, v_ego, 0., canfd_lat_active, CarControllerParams.C0_RATE_LIMITS)
 
-          ramp_type = 3
+            path_angle = apply_std_steer_angle_limits(
+              path_angle, self.path_angle_last, v_ego, 0., canfd_lat_active, CarControllerParams.C1_RATE_LIMITS)
 
-          apply_curvature = float(clip(apply_curvature, -0.02, 0.02))
-          path_offset = float(clip(path_offset, -4.61, 4.60))
-          path_angle = float(clip(path_angle, -0.475, 0.497))
+            ramp_type = 3
+
+            path_offset_limit = float(np.interp(v_ego, *CarControllerParams.C0_MAX))
+            path_offset = float(clip(path_offset, -path_offset_limit, path_offset_limit))
+            path_offset = float(clip(path_offset, -4.61, 4.60))
+            path_angle = float(clip(path_angle, -0.475, 0.497))
         else:
           # Non-CAN FD: curvature-only control (unchanged from upstream)
           # Bronco and some other cars consistently overshoot curv requests
@@ -162,13 +236,14 @@ class CarController(CarControllerBase):
                                                         CS.out.vEgoRaw, 0., CC.latActive, self.CP)
 
       self.path_angle_last = path_angle
+      self.path_offset_last = path_offset
+      self.curvature_target_last = curvature_target
       self.apply_curvature_last = apply_curvature
 
       if self.CP.flags & FordFlags.CANFD:
-        mode = 2 if CC.latActive else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(
-          self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,
+          self.packer, self.CAN, canfd_mode, ramp_type, 1, -path_offset, -path_angle,
           -apply_curvature, -curvature_rate, counter
         ))
       else:

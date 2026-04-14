@@ -34,14 +34,31 @@ class CarControllerParams:
   )
   CURVATURE_ERROR = 0.002  # ~6 degrees at 10 m/s, ~10 degrees at 35 m/s
 
-  # Rate limits for c1 (path_angle) in radian space — used with apply_std_steer_angle_limits
-  C1_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
-    0.5,  # Max path_angle magnitude (DBC range is [-0.5, 0.5235])
-    # Wind-up — uncapped, PSCM rate-limits internally
-    ([5, 25], [0.50, 0.50]),
-    # Unwind — uncapped
-    ([5, 25], [0.50, 0.50]),
+  # Rate limits for c0 (path_offset) in meter space — keeps offset as a cleanup term only.
+  C0_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
+    2.5,
+    ([5, 15, 25], [0.25, 0.18, 0.10]),
+    ([5, 15, 25], [0.35, 0.24, 0.12]),
   )
+  C0_MAX = ([5., 15., 25.], [2.5, 1.25, 0.75])
+  C0_HYSTERESIS = 0.04
+
+  # Rate limits for c1 (path_angle) in radian space.
+  C1_RATE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
+    0.4,
+    ([5, 15, 25], [0.03, 0.02, 0.01]),
+    ([5, 15, 25], [0.04, 0.025, 0.012]),
+  )
+  C1_EXIT_LOOKAHEAD_FACTOR = ([5., 15., 25.], [0.85, 0.72, 0.58])
+  C1_LIMIT_LOOKAHEAD_FACTOR = ([0., 1., 2., 3.], [1.0, 0.92, 0.84, 0.76])
+  C1_LOOKAHEAD_MIN = 4.0
+
+  C2_WINDUP_TAU = 0.35
+  C2_UNWIND_TAU = 0.14
+  C2_CROSSOVER_TAU = 0.08
+  C2_SIGN_FLIP_DEADBAND = ([5., 25.], [5e-4, 1.5e-4])
+  C2_LIMIT_FACTOR = ([0., 1., 2., 3.], [1.0, 0.94, 0.88, 0.80])
+  C2_LIMITED_MODE_FACTOR = 0.92
 
   ACCEL_MAX = 2.0               # m/s^2 max acceleration
   ACCEL_MIN = -3.5              # m/s^2 max deceleration
