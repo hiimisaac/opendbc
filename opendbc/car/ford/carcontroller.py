@@ -80,8 +80,18 @@ def get_ford_canfd_c0_lookahead(v_ego: float, d_look: float) -> float:
   return float(min(d_look, c0_lookahead))
 
 
-def scale_ford_canfd_path_offset(path_offset: float, v_ego: float) -> float:
-  return float(path_offset * np.interp(v_ego, *CarControllerParams.C0_GAIN))
+def get_ford_canfd_path_offset_trim(path_offset: float, path_angle: float, curvature_target: float,
+                                    path_offset_trim_last: float, v_ego: float, lat_active: bool) -> float:
+  trim_target = 0.0
+  if lat_active:
+    path_angle_limit = float(np.interp(v_ego, *CarControllerParams.C0_TRIM_PATH_ANGLE_MAX))
+    curvature_limit = float(np.interp(v_ego, *CarControllerParams.C0_TRIM_CURVATURE_MAX))
+    if abs(path_angle) < path_angle_limit and abs(curvature_target) < curvature_limit:
+      trim_gain = float(np.interp(v_ego, *CarControllerParams.C0_TRIM_GAIN))
+      trim_max = float(np.interp(v_ego, *CarControllerParams.C0_TRIM_MAX))
+      trim_target = float(np.clip(path_offset * trim_gain, -trim_max, trim_max))
+
+  return first_order_filter(trim_target, path_offset_trim_last, CarControllerParams.C0_TRIM_TAU)
 
 
 def get_ford_canfd_c1_lookahead(v_ego: float, d_look: float, curvature_last: float, curvature_target: float, limit_status: int) -> float:
@@ -126,6 +136,7 @@ class CarController(CarControllerBase):
     self.anti_overshoot_curvature_last = 0
     self.path_angle_last = 0.0
     self.path_offset_last = 0.0
+    self.path_offset_trim_last = 0.0
     self.curvature_target_last = 0.0
 
     try:
@@ -178,6 +189,8 @@ class CarController(CarControllerBase):
     apply_curvature = 0.0
     path_angle = 0.0
     path_offset = 0.0
+    path_offset_trim = 0.0
+    path_offset_trim_updated = False
     curvature_target = 0.0
     curvature_rate = 0.0
     ramp_type = 0
@@ -211,7 +224,10 @@ class CarController(CarControllerBase):
 
             d_c0 = get_ford_canfd_c0_lookahead(v_ego, d_look)
             path_offset = float(np.interp(d_c0, x_pts, np.array(self.model.position.y)))
-            path_offset = scale_ford_canfd_path_offset(path_offset, v_ego)
+            path_offset_trim = get_ford_canfd_path_offset_trim(path_offset, path_angle, curvature_target,
+                                                               self.path_offset_trim_last, v_ego, canfd_lat_active)
+            path_offset_trim_updated = True
+            path_offset = float(path_offset + path_offset_trim)
             path_offset = apply_hysteresis(path_offset, self.path_offset_last, CarControllerParams.C0_HYSTERESIS)
             path_offset = apply_std_steer_angle_limits(
               path_offset, self.path_offset_last, v_ego, 0., canfd_lat_active, CarControllerParams.C0_RATE_LIMITS)
@@ -242,6 +258,10 @@ class CarController(CarControllerBase):
 
       self.path_angle_last = path_angle
       self.path_offset_last = path_offset
+      if path_offset_trim_updated:
+        self.path_offset_trim_last = path_offset_trim
+      else:
+        self.path_offset_trim_last = first_order_filter(0.0, self.path_offset_trim_last, CarControllerParams.C0_TRIM_TAU)
       self.curvature_target_last = curvature_target
       self.apply_curvature_last = apply_curvature
 
