@@ -64,6 +64,27 @@ FORD_BAL_LC0 = 5.11    # m
 FORD_BAL_LC1 = 0.5235  # rad
 FORD_BAL_LC2 = 0.02    # 1/m
 
+# ─── WBal allocation (ported from sp-dev-c3, identified on this Lightning) ────
+# c1-DOMINANT (well-damped path-angle) + a SMALL low-speed c0 (offset) centering
+# trim, sized by MEASURED per-channel gains (act per unit oriented wire) so
+# realized ≈ desk. c2 dropped (sticky accumulator). Gains from a 12-agent gain-
+# identification over a 626K-frame pool + current-firmware run, cross-validated
+# and reproducing the field over/under outcomes. Two field fixes baked ON:
+#   - g_c1 overshoot trim (cancels the slight low-speed sustained over-delivery)
+#   - c0 straight deadband (silences the offset channel on near-straight desk,
+#     where its tiny g_c0 divisor amplifies noise into a slow ping-pong weave)
+FORD_WBAL_V_BP       = (4.0, 8.0, 12.0)
+FORD_WBAL_C0_FRAC    = (0.30, 0.18, 0.05)   # c0 delivery share; ~off by 12 m/s
+FORD_WBAL_GC0_V      = (3.0, 5.0, 8.0, 12.0, 18.0)
+FORD_WBAL_GC0        = (0.0040, 0.0035, 0.0010, 0.0004, 0.00015)
+FORD_WBAL_GC1_V      = (3.0, 5.0, 8.0, 12.0, 18.0)
+FORD_WBAL_GC1        = (0.125, 0.139, 0.102, 0.078, 0.057)
+FORD_WBAL_GC1_TRIM_V = (3.0, 5.0, 8.0)      # baked ON: raise g_c1 to kill overshoot
+FORD_WBAL_GC1_TRIM   = (1.08, 1.03, 1.00)
+FORD_WBAL_C0_DB_LO   = 0.004                # baked ON: c0 deadband fade range (1/m)
+FORD_WBAL_C0_DB_HI   = 0.008
+FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcontroller)
+
 # ─── Live estimator constants ─────────────────────────────────────────────────
 # Slow first-order filter on the live scalar, bounded ±25% from platform default.
 # Robustness layers modeled on selfdrive/locationd/torqued.py — including a
@@ -98,6 +119,19 @@ def _clip(x: float, lo: float, hi: float) -> float:
   return lo if x < lo else (hi if x > hi else x)
 
 
+def _interp(x: float, xs, ys) -> float:
+  """Plain-python 1-D linear interp (no numpy — keep lateral_bal a pure lib)."""
+  if x <= xs[0]:
+    return ys[0]
+  if x >= xs[-1]:
+    return ys[-1]
+  for i in range(1, len(xs)):
+    if x < xs[i]:
+      t = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+      return ys[i - 1] + t * (ys[i] - ys[i - 1])
+  return ys[-1]
+
+
 def pscm_response_at(v_ego: float, fingerprint: Optional[str],
                      live_scale: float = 1.0) -> Tuple[float, float, float]:
   """Return (α, β, γ) for the speed bin containing v_ego, with β and γ
@@ -119,36 +153,40 @@ def pscm_response_at(v_ego: float, fingerprint: Optional[str],
 def bal_encode(desired_curvature: float, v_ego: float,
                fingerprint: Optional[str], live_scale: float = 1.0
                ) -> Tuple[float, float, float]:
-  """Compute (c0, c1, c2) such that the PSCM polynomial delivers
-  desired_curvature at the wheels. Uses c1+c2 only at equal utilization
-  until u_c12 ≥ 1, then brings c0 into the budget as overflow.
+  """WBal: c1-DOMINANT + small low-speed c0 (offset) centering trim, sized by
+  MEASURED per-channel gains so realized ≈ desk (g_c0·c0 + g_c1·c1 = desk). c2=0.
+  Both field fixes baked ON (g_c1 overshoot trim, c0 straight deadband). Spills a
+  saturated channel's unmet delivery onto the other.
 
-  Returns the values in INTERNAL sign convention (positive desk → positive
-  c1). The carcontroller negates before packing onto CAN."""
-  a_v, b_v, g_v = pscm_response_at(v_ego, fingerprint, live_scale)
+  live_scale is IGNORED — WBal uses fixed measured gains, not the scaled
+  regression. fingerprint unused. Returns INTERNAL sign convention (positive
+  desk → positive c0/c1); the carcontroller negates before packing onto CAN."""
   if abs(desired_curvature) < 1e-9:
     return 0.0, 0.0, 0.0
   s = 1.0 if desired_curvature > 0.0 else -1.0
+  mag = abs(desired_curvature)
 
-  denom_c12 = ((b_v * FORD_BAL_LC1) if b_v > 0.0 else 0.0) + \
-              ((g_v * FORD_BAL_LC2) if g_v > 0.0 else 0.0)
-  if denom_c12 > 1e-9 and abs(desired_curvature) <= denom_c12:
-    u = abs(desired_curvature) / denom_c12
-    c1 = s * u * FORD_BAL_LC1 if b_v > 0.0 else 0.0
-    c2 = s * u * FORD_BAL_LC2 if g_v > 0.0 else 0.0
-    return 0.0, c1, c2
+  w0 = _interp(v_ego, FORD_WBAL_V_BP, FORD_WBAL_C0_FRAC)
+  # c0 straight deadband (baked ON): fade c0's delivery share to 0 as desk ->
+  # straight; c1 takes the slack so total delivery stays = desk (no step).
+  gate = (mag - FORD_WBAL_C0_DB_LO) / (FORD_WBAL_C0_DB_HI - FORD_WBAL_C0_DB_LO)
+  w0 *= _clip(gate, 0.0, 1.0)
 
-  # Overflow path: include c0 to extend authority at the ceiling
-  denom_full = ((a_v * FORD_BAL_LC0) if a_v > 0.0 else 0.0) + \
-               ((b_v * FORD_BAL_LC1) if b_v > 0.0 else 0.0) + \
-               ((g_v * FORD_BAL_LC2) if g_v > 0.0 else 0.0)
-  if denom_full <= 1e-9:
-    return 0.0, 0.0, 0.0
-  u = min(1.0, abs(desired_curvature) / denom_full)
-  c0 = s * u * FORD_BAL_LC0 if a_v > 0.0 else 0.0
-  c1 = s * u * FORD_BAL_LC1 if b_v > 0.0 else 0.0
-  c2 = s * u * FORD_BAL_LC2 if g_v > 0.0 else 0.0
-  return c0, c1, c2
+  g0 = max(_interp(v_ego, FORD_WBAL_GC0_V, FORD_WBAL_GC0), 1e-5)
+  g1 = max(_interp(v_ego, FORD_WBAL_GC1_V, FORD_WBAL_GC1), 1e-5)
+  g1 *= _interp(v_ego, FORD_WBAL_GC1_TRIM_V, FORD_WBAL_GC1_TRIM)  # overshoot trim ON
+
+  c0 = w0 * mag / g0            # g_c0·c0 = w0·mag
+  c1 = (1.0 - w0) * mag / g1    # g_c1·c1 = (1-w0)·mag
+  c0c = c0 if c0 < FORD_BAL_LC0 else FORD_BAL_LC0
+  c1c = c1 if c1 < FORD_BAL_LC1 else FORD_BAL_LC1
+  unmet = (c0 - c0c) * g0 + (c1 - c1c) * g1
+  if unmet > 1e-9:
+    if c1c < FORD_BAL_LC1:
+      c1c = min(FORD_BAL_LC1, c1c + unmet / g1)
+    elif c0c < FORD_BAL_LC0:
+      c0c = min(FORD_BAL_LC0, c0c + unmet / g0)
+  return s * c0c, s * c1c, 0.0
 
 
 class FordBalLiveScale:

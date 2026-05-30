@@ -4,7 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_bal import FordBalLiveScale, bal_encode
+from opendbc.car.ford.lateral_bal import FordBalLiveScale, bal_encode, FORD_WBAL_C0_RATE
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -147,6 +147,12 @@ class CarController(CarControllerBase):
 
           c0_int, c1_int, c2_int = bal_encode(desired_curvature, v_ego, fingerprint, live)
 
+          # c0 (offset) slew limit — anti-hunt. The offset channel wanders
+          # without c1 damping; ramp it to target instead of jumping.
+          c0_max_delta = FORD_WBAL_C0_RATE * (DT_CTRL * CarControllerParams.STEER_STEP)
+          c0_int = float(np.clip(c0_int, self.path_offset_last - c0_max_delta,
+                                 self.path_offset_last + c0_max_delta))
+
           path_offset    = float(np.clip(c0_int, FORD_PATH_C0_CLIP[0], FORD_PATH_C0_CLIP[1]))
           path_angle     = float(np.clip(c1_int, FORD_PATH_C1_CLIP[0], FORD_PATH_C1_CLIP[1]))
           apply_curvature = float(np.clip(c2_int, FORD_PATH_C2_CLIP[0], FORD_PATH_C2_CLIP[1]))
@@ -176,7 +182,7 @@ class CarController(CarControllerBase):
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(
           self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,
-          -apply_curvature, -curvature_rate, counter
+          -apply_curvature, 0., counter
         ))
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(
