@@ -89,6 +89,51 @@ FORD_WBAL_C0_DB_LO   = 0.004                # baked ON: c0 deadband fade range (
 FORD_WBAL_C0_DB_HI   = 0.008
 FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcontroller)
 
+# ─── Anticipator (phase lead) ─────────────────────────────────────────────────
+# Feed bal_encode `desk + tau*d(desk)/dt` instead of raw desk so the command
+# leads the PSCM's ~1 s highway lag. This adds phase margin and breaks the
+# ~0.6 Hz closed-loop limit cycle (the 45 mph "go wide then yank back" weave;
+# field-measured on route 6a9fbd805a, where realized act swung 1.7x more than
+# the steady command -> loop resonance, not planner jitter). It lifts the lead
+# without lowering steady gain, so it does NOT bring back the wide.
+# TAU is the proven sp-dev-c3 value; WINDOW/DT adapted to the port's 20 Hz call
+# rate (STEER_STEP=5 -> 50 ms/frame, vs 100 Hz on sp-dev-c3).
+FORD_BAL_DT                 = 0.05    # s per bal_encode call (STEER_STEP * DT_CTRL)
+FORD_BAL_ANTICIPATOR_TAU    = 0.10    # s of lookahead applied each frame
+FORD_BAL_ANTICIPATOR_WINDOW = 3       # samples for the smoothed derivative (100 ms span)
+
+
+class FordAnticipator:
+  """Stateful phase-lead on the commanded curvature.
+
+  update(desk, lat_active) returns `desk + tau * desk_dot` where desk_dot is a
+  smoothed derivative over the last WINDOW samples. A sign-flip guard caps the
+  output at 0 so the lead alone can never command an opposite-direction curve
+  (matters on fast unwind). History resets whenever lat is inactive so the
+  first re-engaged frame can't spike off a stale derivative.
+  """
+  def __init__(self, tau: float = FORD_BAL_ANTICIPATOR_TAU,
+               window: int = FORD_BAL_ANTICIPATOR_WINDOW, dt: float = FORD_BAL_DT):
+    self.tau = tau
+    self.window = window
+    self.dt = dt
+    self._hist: list[float] = []
+
+  def update(self, desk: float, lat_active: bool) -> float:
+    if not lat_active:
+      self._hist = []
+      return desk
+    self._hist.append(desk)
+    if len(self._hist) > self.window:
+      self._hist.pop(0)
+    if len(self._hist) < self.window:
+      return desk
+    desk_dot = (self._hist[-1] - self._hist[0]) / ((self.window - 1) * self.dt)
+    anticipated = desk + self.tau * desk_dot
+    if desk * anticipated < 0.0:   # sign-flip guard
+      return 0.0
+    return anticipated
+
 # ─── Live estimator constants ─────────────────────────────────────────────────
 # Slow first-order filter on the live scalar, bounded ±25% from platform default.
 # Robustness layers modeled on selfdrive/locationd/torqued.py — including a

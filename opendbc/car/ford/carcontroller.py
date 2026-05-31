@@ -4,7 +4,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_bal import FordBalLiveScale, bal_encode, FORD_WBAL_C0_RATE
+from opendbc.car.ford.lateral_bal import FordBalLiveScale, FordAnticipator, bal_encode, FORD_WBAL_C0_RATE
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -80,6 +80,9 @@ class CarController(CarControllerBase):
     # Soft-imports openpilot.common.params for persistence; runs in-memory
     # when Params isn't available (e.g. standalone opendbc tests).
     self.bal_live_scale = FordBalLiveScale()
+    # Phase-lead on the commanded curvature, fed to bal_encode to lead the
+    # PSCM's ~1 s highway lag and break the ~0.6 Hz closed-loop weave.
+    self.anticipator = FordAnticipator()
 
     self.accel = 0.0
     self.gas = 0.0
@@ -145,7 +148,11 @@ class CarController(CarControllerBase):
                                      CC.latActive, CS.out.steeringPressed)
           live = self.bal_live_scale.current_scale(fingerprint)
 
-          c0_int, c1_int, c2_int = bal_encode(desired_curvature, v_ego, fingerprint, live)
+          # Phase lead: bal_encode sees desk + tau*d(desk)/dt so the c0/c1
+          # command leads the PSCM lag (breaks the ~0.6 Hz weave). The learner
+          # and curvature_rate below still use the raw planner desk.
+          desk_lead = self.anticipator.update(desired_curvature, True)
+          c0_int, c1_int, c2_int = bal_encode(desk_lead, v_ego, fingerprint, live)
 
           # c0 (offset) slew limit — anti-hunt. The offset channel wanders
           # without c1 damping; ramp it to target instead of jumping.
@@ -171,6 +178,8 @@ class CarController(CarControllerBase):
           apply_curvature = desired_curvature
           apply_curvature = apply_ford_curvature_limits(apply_curvature, self.apply_curvature_last, current_curvature,
                                                         CS.out.vEgoRaw, 0., CC.latActive, self.CP)
+      else:
+        self.anticipator.update(0.0, False)  # reset lead history while disengaged
 
       self.path_angle_last = path_angle
       self.path_offset_last = path_offset
