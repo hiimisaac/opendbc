@@ -143,7 +143,7 @@ class CarController(CarControllerBase):
           act_k = -CS.out.yawRate / max(v_ego, 0.5)
           self.bal_live_scale.update(desired_curvature, act_k, v_ego,
                                      CC.latActive, CS.out.steeringPressed)
-          live = self.bal_live_scale.current_scale(fingerprint)
+          live = self.bal_live_scale.current_scale(v_ego, fingerprint)
 
           c0_int, c1_int, c2_int = bal_encode(desired_curvature, v_ego, fingerprint, live)
 

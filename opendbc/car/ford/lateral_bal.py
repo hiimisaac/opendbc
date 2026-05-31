@@ -96,14 +96,22 @@ FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcon
 # Robustness layers modeled on selfdrive/locationd/torqued.py — including a
 # ramping filter decay that converges fast initially and slows as data builds,
 # so single bad routes can't yank a well-converged value.
-FORD_BAL_LIVE_VERSION         = "v1"   # bump to invalidate persisted values
+FORD_BAL_LIVE_VERSION         = "v2"   # v2: per-speed-bucket scale (was single scalar)
 FORD_BAL_LIVE_BOUND_LOW       = 0.75   # ±25% from platform default
 FORD_BAL_LIVE_BOUND_HIGH      = 1.25
+# Target DELIVERY (act/desk) each bucket converges to. Deliberately just UNDER
+# unity: full delivery (1.0) sits the loop gain on the marginal-stability edge
+# where the sustained-curve weave lives, so we hold a hair below it.
+FORD_BAL_LIVE_TARGET          = 0.97
+# Per-bucket seed (len == #buckets). The field per-speed delivery on route
+# 6a9fbd805a was over at low/high speed, UNDER (~0.86) only in the mid band —
+# so seed only the mid bucket up (immediate wide relief) and let the learner
+# refine the rest from neutral. Buckets: [3-6),[6-10),[10-15),[15-22),[22-35).
+FORD_BAL_LIVE_SEED            = (1.0, 1.0, 1.05, 1.0, 1.0)
 FORD_BAL_LIVE_MIN_DECAY       = 50.0   # initial filter decay (alpha ≈ 0.02 — fast)
 FORD_BAL_LIVE_MAX_DECAY       = 500.0  # final filter decay   (alpha ≈ 0.002 — stable)
 FORD_BAL_LIVE_DECAY_STEP      = 1.0    # decay increment per successful update
-FORD_BAL_LIVE_MIN_FRAMES      = 300    # ~3 s @ 100 Hz before first update
-FORD_BAL_LIVE_BUCKET_MIN_PT   = 20     # frames per bucket before it counts
+FORD_BAL_LIVE_MIN_BUCKET_FRAMES = 100  # fresh samples in a bucket before it trims (clean estimate)
 FORD_BAL_LIVE_BUCKETS_V       = (3.0, 6.0, 10.0, 15.0, 22.0, 35.0)
 FORD_BAL_LIVE_DESK_MIN        = 0.003  # |desk| floor for inclusion
 FORD_BAL_LIVE_V_MIN           = 3.0    # m/s — exclude parking
@@ -164,8 +172,10 @@ def bal_encode(desired_curvature: float, v_ego: float,
   Both field fixes baked ON (g_c1 overshoot trim, c0 straight deadband). Spills a
   saturated channel's unmet delivery onto the other.
 
-  live_scale is IGNORED — WBal uses fixed measured gains, not the scaled
-  regression. fingerprint unused. Returns INTERNAL sign convention (positive
+  live_scale (RECONNECTED, per-speed): the bucket's delivery trim from
+  FordBalLiveScale.current_scale(v). >1 → the learner saw under-delivery at this
+  speed, so command proportionally MORE (and vice-versa). This self-corrects the
+  per-speed wide. fingerprint unused. Returns INTERNAL sign convention (positive
   desk → positive c0/c1); the carcontroller negates before packing onto CAN."""
   if abs(desired_curvature) < 1e-9:
     return 0.0, 0.0, 0.0
@@ -182,8 +192,9 @@ def bal_encode(desired_curvature: float, v_ego: float,
   g1 = max(_interp(v_ego, FORD_WBAL_GC1_V, FORD_WBAL_GC1), 1e-5)
   g1 *= _interp(v_ego, FORD_WBAL_GC1_TRIM_V, FORD_WBAL_GC1_TRIM)  # overshoot trim ON
 
-  c0 = w0 * mag / g0            # g_c0·c0 = w0·mag
-  c1 = (1.0 - w0) * mag / g1    # g_c1·c1 = (1-w0)·mag
+  ls = _clip(live_scale, FORD_BAL_LIVE_BOUND_LOW, FORD_BAL_LIVE_BOUND_HIGH)
+  c0 = w0 * mag / g0 * ls       # g_c0·c0 = w0·mag·live_scale
+  c1 = (1.0 - w0) * mag / g1 * ls  # g_c1·c1 = (1-w0)·mag·live_scale
   c0c = c0 if c0 < FORD_BAL_LC0 else FORD_BAL_LC0
   c1c = c1 if c1 < FORD_BAL_LC1 else FORD_BAL_LC1
   unmet = (c0 - c0c) * g0 + (c1 - c1c) * g1
@@ -196,36 +207,47 @@ def bal_encode(desired_curvature: float, v_ego: float,
 
 
 class FordBalLiveScale:
-  """Always-on online estimator. Observes (desk, act_κ) on stable curves,
-  accumulates per-speed-bucket gain estimates, and slowly nudges a live
-  multiplier toward 1/measured_gain. Bounded ±15% from the platform default.
+  """Per-SPEED online estimator. Each speed bucket observes (desk, act_κ) on
+  stable curves and slowly trims ITS OWN delivery multiplier toward
+  FORD_BAL_LIVE_TARGET / measured_gain, bounded ±25%. current_scale(v) returns
+  the per-speed trim, interpolated smoothly across bucket centers.
 
-  Persistence via openpilot Params if available; in-memory otherwise.
-  Restored on init keyed by (fingerprint, version) — value is discarded if
-  either changes."""
+  Why per-bucket: the field error is a per-SPEED shape (over at low/high, under
+  at mid). A single global multiplier averages those to ~1.0 and does nothing;
+  only an independent per-bucket trim can raise the mid band (kill the wide)
+  while leaving the low/high bands (already at/over unity) alone — so it does
+  NOT add the global loop gain that drives the weave.
+
+  Persistence via Params if available; in-memory otherwise. Payload:
+      "FINGERPRINT:VERSION:live0,live1,...:decay0,decay1,..."
+  Discarded on fingerprint or version change (v2 = per-bucket format)."""
   def __init__(self):
     self._params = Params() if _HAS_PARAMS else None
     self._fingerprint: Optional[str] = None
-    self._live = 1.0
-    # Ramping filter decay (torqued pattern): converges fast early, slows
-    # as data accumulates so a single bad route can't yank a converged value.
-    self._decay = FORD_BAL_LIVE_MIN_DECAY
-    n = len(FORD_BAL_LIVE_BUCKETS_V) - 1
-    self._bucket_act_sum = [0.0] * n
-    self._bucket_desk_sum = [0.0] * n
-    self._bucket_count = [0] * n
+    self._n = len(FORD_BAL_LIVE_BUCKETS_V) - 1
+    self._centers = [(FORD_BAL_LIVE_BUCKETS_V[i] + FORD_BAL_LIVE_BUCKETS_V[i + 1]) / 2.0
+                     for i in range(self._n)]
+    self._live = list(FORD_BAL_LIVE_SEED)
+    # Per-bucket ramping filter decay: converges fast early, slows as data builds.
+    self._decay = [FORD_BAL_LIVE_MIN_DECAY] * self._n
+    self._bucket_act_sum = [0.0] * self._n
+    self._bucket_desk_sum = [0.0] * self._n
+    self._bucket_count = [0] * self._n
     self._desk_buf: list[float] = []
     self._frame = 0
     self._persist_frame = 0
 
+  def _bucket(self, v: float) -> Optional[int]:
+    for i in range(self._n):
+      if FORD_BAL_LIVE_BUCKETS_V[i] <= v < FORD_BAL_LIVE_BUCKETS_V[i + 1]:
+        return i
+    return None
+
   # --- persistence ---------------------------------------------------------
   def _restore(self, fingerprint: str) -> None:
-    """Restore (live, decay) from Params. Payload format:
-        "FINGERPRINT:VERSION:LIVE_VALUE:DECAY"
-    Older 3-field payloads (no decay) are accepted; decay defaults to MIN."""
     self._fingerprint = fingerprint
-    self._live = 1.0
-    self._decay = FORD_BAL_LIVE_MIN_DECAY
+    self._live = list(FORD_BAL_LIVE_SEED)
+    self._decay = [FORD_BAL_LIVE_MIN_DECAY] * self._n
     if self._params is None:
       return
     try:
@@ -234,39 +256,37 @@ class FordBalLiveScale:
         return
       text = raw.decode() if isinstance(raw, bytes) else raw
       parts = text.split(":")
-      if len(parts) < 3:
+      if len(parts) < 3 or parts[0] != fingerprint or parts[1] != FORD_BAL_LIVE_VERSION:
         return
-      fp_s, ver_s, val_s = parts[0], parts[1], parts[2]
-      if fp_s != fingerprint or ver_s != FORD_BAL_LIVE_VERSION:
-        return
-      self._live = _clip(float(val_s),
-                         FORD_BAL_LIVE_BOUND_LOW,
-                         FORD_BAL_LIVE_BOUND_HIGH)
+      lv = [float(x) for x in parts[2].split(",")]
+      if len(lv) == self._n:
+        self._live = [_clip(x, FORD_BAL_LIVE_BOUND_LOW, FORD_BAL_LIVE_BOUND_HIGH) for x in lv]
       if len(parts) >= 4:
-        self._decay = _clip(float(parts[3]),
-                            FORD_BAL_LIVE_MIN_DECAY,
-                            FORD_BAL_LIVE_MAX_DECAY)
+        dv = [float(x) for x in parts[3].split(",")]
+        if len(dv) == self._n:
+          self._decay = [_clip(x, FORD_BAL_LIVE_MIN_DECAY, FORD_BAL_LIVE_MAX_DECAY) for x in dv]
     except Exception:
-      self._live = 1.0
-      self._decay = FORD_BAL_LIVE_MIN_DECAY
+      self._live = list(FORD_BAL_LIVE_SEED)
+      self._decay = [FORD_BAL_LIVE_MIN_DECAY] * self._n
 
   def _persist(self) -> None:
     if self._params is None or self._fingerprint is None:
       return
     try:
-      payload = (f"{self._fingerprint}:{FORD_BAL_LIVE_VERSION}:"
-                 f"{self._live:.4f}:{self._decay:.1f}")
-      self._params.put_nonblocking("FordBalLiveScale", payload)
+      lv = ",".join(f"{x:.4f}" for x in self._live)
+      dv = ",".join(f"{x:.1f}" for x in self._decay)
+      self._params.put_nonblocking("FordBalLiveScale",
+                                   f"{self._fingerprint}:{FORD_BAL_LIVE_VERSION}:{lv}:{dv}")
     except Exception:
       # UnknownKeyName if host openpilot hasn't registered the key — that's
       # OK, the estimator continues running in-memory.
       pass
 
   # --- public ---------------------------------------------------------------
-  def current_scale(self, fingerprint: Optional[str]) -> float:
+  def current_scale(self, v: float, fingerprint: Optional[str] = None) -> float:
     if fingerprint is not None and fingerprint != self._fingerprint:
       self._restore(fingerprint)
-    return self._live
+    return _interp(float(v), self._centers, self._live)
 
   def update(self, desk: float, act_k: float, v: float,
              lat_active: bool, steering_pressed: bool) -> None:
@@ -277,8 +297,8 @@ class FordBalLiveScale:
     if len(self._desk_buf) > FORD_BAL_LIVE_DESK_BUF:
       self._desk_buf.pop(0)
 
-    # Persistence throttle always fires while running (independent of gate
-    # pass rate) so a value gets written even on routes with few curves.
+    # Persistence throttle always fires while running so a value gets written
+    # even on routes with few curves.
     if self._frame - self._persist_frame >= FORD_BAL_LIVE_PERSIST_FRAMES:
       self._persist_frame = self._frame
       self._persist()
@@ -292,51 +312,34 @@ class FordBalLiveScale:
       return
     if len(self._desk_buf) < FORD_BAL_LIVE_DESK_BUF:
       return
-    # Stdev gate — reject volatile desk (planner is hunting / lane change)
+    # Stdev gate — reject volatile desk (planner hunting / lane change). Note a
+    # mild weave passes (std ≪ MAX); its symmetric over/under averages out in
+    # the bucket sums, so the learner reads the true mean delivery.
     mean = sum(self._desk_buf) / len(self._desk_buf)
     var = sum((x - mean) ** 2 for x in self._desk_buf) / len(self._desk_buf)
     if var > FORD_BAL_LIVE_DESK_VAR_MAX * FORD_BAL_LIVE_DESK_VAR_MAX:
       return
 
-    # Bucket the sample
-    bucket = None
-    for i in range(len(FORD_BAL_LIVE_BUCKETS_V) - 1):
-      lo = FORD_BAL_LIVE_BUCKETS_V[i]
-      hi = FORD_BAL_LIVE_BUCKETS_V[i + 1]
-      if lo <= v < hi:
-        bucket = i
-        break
-    if bucket is None:
+    b = self._bucket(v)
+    if b is None:
       return
-    self._bucket_act_sum[bucket] += act_k * (1.0 if desk > 0 else -1.0)
-    self._bucket_desk_sum[bucket] += abs(desk)
-    self._bucket_count[bucket] += 1
+    self._bucket_act_sum[b] += act_k * (1.0 if desk > 0 else -1.0)
+    self._bucket_desk_sum[b] += abs(desk)
+    self._bucket_count[b] += 1
 
-    # Update the live scale when enough data has accumulated
-    total = sum(self._bucket_count)
-    populated = sum(1 for c in self._bucket_count if c >= FORD_BAL_LIVE_BUCKET_MIN_PT)
-    if total >= FORD_BAL_LIVE_MIN_FRAMES and populated >= 1:
-      gains = []
-      for i in range(len(self._bucket_count)):
-        if self._bucket_count[i] >= FORD_BAL_LIVE_BUCKET_MIN_PT and self._bucket_desk_sum[i] > 1e-6:
-          gains.append(self._bucket_act_sum[i] / self._bucket_desk_sum[i])
-      if gains:
-        mean_gain = sum(gains) / len(gains)
-        if 0.5 < mean_gain < 2.0:  # sanity
-          target = _clip(self._live / max(mean_gain, 0.5),
-                         FORD_BAL_LIVE_BOUND_LOW,
-                         FORD_BAL_LIVE_BOUND_HIGH)
-          # Ramping first-order filter: alpha = 1/decay, decay grows over
-          # time so each successive update moves the live value less.
-          alpha = 1.0 / self._decay
-          self._live = (1.0 - alpha) * self._live + alpha * target
-          self._live = _clip(self._live,
-                             FORD_BAL_LIVE_BOUND_LOW,
-                             FORD_BAL_LIVE_BOUND_HIGH)
-          self._decay = min(self._decay + FORD_BAL_LIVE_DECAY_STEP,
-                            FORD_BAL_LIVE_MAX_DECAY)
-        # Decay buckets 25% so stale data doesn't dominate
-        for i in range(len(self._bucket_count)):
-          self._bucket_act_sum[i] *= 0.75
-          self._bucket_desk_sum[i] *= 0.75
-          self._bucket_count[i] = int(self._bucket_count[i] * 0.75)
+    # Per-bucket trim: when THIS bucket has enough fresh data, nudge ITS scale
+    # toward the value that would make its delivery == TARGET. Independent of
+    # every other bucket — that's the whole point.
+    if self._bucket_count[b] >= FORD_BAL_LIVE_MIN_BUCKET_FRAMES and self._bucket_desk_sum[b] > 1e-6:
+      gain = self._bucket_act_sum[b] / self._bucket_desk_sum[b]  # observed delivery (incl. current scale)
+      if 0.3 < gain < 3.0:  # sanity
+        target = _clip(FORD_BAL_LIVE_TARGET * self._live[b] / gain,
+                       FORD_BAL_LIVE_BOUND_LOW, FORD_BAL_LIVE_BOUND_HIGH)
+        alpha = 1.0 / self._decay[b]
+        self._live[b] = _clip((1.0 - alpha) * self._live[b] + alpha * target,
+                              FORD_BAL_LIVE_BOUND_LOW, FORD_BAL_LIVE_BOUND_HIGH)
+        self._decay[b] = min(self._decay[b] + FORD_BAL_LIVE_DECAY_STEP, FORD_BAL_LIVE_MAX_DECAY)
+      # Decay this bucket's accumulators so stale data fades.
+      self._bucket_act_sum[b] *= 0.75
+      self._bucket_desk_sum[b] *= 0.75
+      self._bucket_count[b] = int(self._bucket_count[b] * 0.75)
