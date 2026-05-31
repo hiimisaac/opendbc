@@ -78,11 +78,13 @@ FORD_WBAL_C0_FRAC    = (0.30, 0.18, 0.05)   # c0 delivery share; ~off by 12 m/s
 FORD_WBAL_GC0_V      = (3.0, 5.0, 8.0, 12.0, 18.0)
 FORD_WBAL_GC0        = (0.0040, 0.0035, 0.0010, 0.0004, 0.00015)
 FORD_WBAL_GC1_V      = (3.0, 5.0, 8.0, 12.0, 18.0)
-# Scaled ×0.92 from the workflow values to cancel a uniform ~8% under-delivery
-# (going-wide/understeer) measured in the field on route fefc9502e0 (act/desk
-# 0.89-0.95 across speeds). Smaller g_c1 -> larger c1 command -> ~9% more
-# delivery -> act/desk ~1.0. Field-measured, not a guess.
-FORD_WBAL_GC1        = (0.115, 0.128, 0.094, 0.072, 0.052)
+# Workflow-identified values. NOTE: a ×0.92 boost (smaller g_c1 = more c1 per
+# desk = more loop gain) was tried to cancel ~8% under-delivery, but the 12-cycle
+# analysis of route 6a9fbd805a showed the sustained-curve weave is a high-gain
+# closed-loop limit cycle (act LEADS desk by 0.54s; wheel slams ±15deg on a tiny
+# desk ripple) and the boost made it WORSE. Reverted to the identified values to
+# drop the loop gain back. The residual ~8% wide is the lesser evil vs the weave.
+FORD_WBAL_GC1        = (0.125, 0.139, 0.102, 0.078, 0.057)
 FORD_WBAL_GC1_TRIM_V = (3.0, 5.0, 8.0)      # baked ON: raise g_c1 to kill overshoot
 FORD_WBAL_GC1_TRIM   = (1.08, 1.03, 1.00)
 FORD_WBAL_C0_DB_LO   = 0.004                # baked ON: c0 deadband fade range (1/m)
