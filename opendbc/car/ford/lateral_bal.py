@@ -99,15 +99,18 @@ FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcon
 FORD_BAL_LIVE_VERSION         = "v2"   # v2: per-speed-bucket scale (was single scalar)
 FORD_BAL_LIVE_BOUND_LOW       = 0.75   # ±25% from platform default
 FORD_BAL_LIVE_BOUND_HIGH      = 1.25
-# Target DELIVERY (act/desk) each bucket converges to. Deliberately just UNDER
-# unity: full delivery (1.0) sits the loop gain on the marginal-stability edge
-# where the sustained-curve weave lives, so we hold a hair below it.
-FORD_BAL_LIVE_TARGET          = 0.97
-# Per-bucket seed (len == #buckets). The field per-speed delivery on route
-# 6a9fbd805a was over at low/high speed, UNDER (~0.86) only in the mid band —
-# so seed only the mid bucket up (immediate wide relief) and let the learner
-# refine the rest from neutral. Buckets: [3-6),[6-10),[10-15),[15-22),[22-35).
-FORD_BAL_LIVE_SEED            = (1.0, 1.0, 1.05, 1.0, 1.0)
+# Target DELIVERY (act/desk) each bucket converges to. Full delivery (1.0) kills
+# understeer but sits the loop gain on the marginal-stability edge where the
+# weave lives — the per-speed structure + heartbeat let us back off any single
+# bucket that rings, so we aim for full and watch.
+FORD_BAL_LIVE_TARGET          = 1.0
+# Per-bucket seed (len == #buckets). Day-1 head start (and, until persistence
+# accumulates, effectively the operating point). Field per-speed delivery on
+# route 6a9fbd805a (reverted gain): ~0.88 UNDER in the mid band, ~1.0 elsewhere
+# — so seed the mid bucket hardest and give a gentle uniform lift for residual
+# under. Buckets: [3-6),[6-10),[10-15),[15-22),[22-35).
+FORD_BAL_LIVE_SEED            = (1.05, 1.05, 1.13, 1.03, 1.0)
+FORD_BAL_LIVE_LOG_FRAMES      = 100    # heartbeat every ~5 s @ 20 Hz (grep "FordBalLiveScale")
 FORD_BAL_LIVE_MIN_DECAY       = 50.0   # initial filter decay (alpha ≈ 0.02 — fast)
 FORD_BAL_LIVE_MAX_DECAY       = 500.0  # final filter decay   (alpha ≈ 0.002 — stable)
 FORD_BAL_LIVE_DECAY_STEP      = 1.0    # decay increment per successful update
@@ -127,6 +130,12 @@ try:
 except Exception:
   Params = None  # type: ignore
   _HAS_PARAMS = False
+
+# Soft import for the diagnostic heartbeat (grep "FordBalLiveScale" in logs).
+try:
+  from openpilot.common.swaglog import cloudlog as _cloudlog  # type: ignore
+except Exception:
+  _cloudlog = None  # type: ignore
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
@@ -302,6 +311,16 @@ class FordBalLiveScale:
     if self._frame - self._persist_frame >= FORD_BAL_LIVE_PERSIST_FRAMES:
       self._persist_frame = self._frame
       self._persist()
+
+    # Diagnostic heartbeat: bin, per-bucket learned gains, current scale, and
+    # the instantaneous delivery (act/desk). grep "FordBalLiveScale" in the log.
+    if _cloudlog is not None and self._frame % FORD_BAL_LIVE_LOG_FRAMES == 0:
+      b = self._bucket(v)
+      deliv = act_k / desk if abs(desk) > FORD_BAL_LIVE_DESK_MIN else float("nan")
+      _cloudlog.info(
+        "FordBalLiveScale bin=%s v=%.1f scale=%.3f live=[%s] cnt=%s desk=%.4f act=%.4f deliv=%.2f" % (
+          b, v, self.current_scale(v), ",".join("%.3f" % x for x in self._live),
+          self._bucket_count, desk, act_k, deliv))
 
     # Frame gates
     if not lat_active or steering_pressed:

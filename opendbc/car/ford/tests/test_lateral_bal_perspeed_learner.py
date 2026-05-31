@@ -27,12 +27,12 @@ def _drive(ls, v, delivery, n, desk=0.02):
     ls.update(desk, delivery * desk, v, True, False)
 
 
-def test_seed_targets_mid_speed_wide_only():
-  """Fresh learner is seeded to give the under-delivering mid-speed band a head
-  start, leaving low/high speed neutral (~1.0)."""
+def test_seed_boosts_most_in_mid_band():
+  """Fresh learner is seeded to lift delivery (kill understeer), boosting the
+  under-delivering mid-speed band hardest."""
   ls = FordBalLiveScale()
-  assert ls.current_scale(MID_V) > 1.0          # mid seeded up (fix wide)
-  assert abs(ls.current_scale(5.0) - 1.0) < 1e-6  # low speed neutral
+  assert ls.current_scale(MID_V) > 1.0                       # mid lifted (worst wide)
+  assert ls.current_scale(MID_V) > ls.current_scale(5.0)     # mid lifted most
 
 
 def test_learns_per_bucket_independently():
