@@ -99,22 +99,20 @@ FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcon
 FORD_BAL_LIVE_VERSION         = "v2"   # v2: per-speed-bucket scale (was single scalar)
 FORD_BAL_LIVE_BOUND_LOW       = 0.75   # ±25% from platform default
 FORD_BAL_LIVE_BOUND_HIGH      = 1.25
-# Target DELIVERY (act/desk) each bucket converges to. Full delivery (1.0) kills
-# understeer but sits the loop gain on the marginal-stability edge where the
-# weave lives — the per-speed structure + heartbeat let us back off any single
-# bucket that rings, so we aim for full and watch.
-FORD_BAL_LIVE_TARGET          = 1.0
-# Per-bucket seed (len == #buckets). Day-1 head start (and, until persistence
-# accumulates, effectively the operating point). Field per-speed delivery on
-# route 6a9fbd805a (reverted gain): ~0.88 UNDER in the mid band, ~1.0 elsewhere
-# — so seed the mid bucket hardest and give a gentle uniform lift for residual
-# under. Buckets: [3-6),[6-10),[10-15),[15-22),[22-35).
-FORD_BAL_LIVE_SEED            = (1.05, 1.05, 1.13, 1.03, 1.0)
+# Target DELIVERY (act/desk) each bucket converges to. Held just UNDER unity:
+# delivery 1.0 sat the loop on the weave edge (route 8ca82c9a5a: ~10 m/s went
+# to ~1.18 delivery and the weave returned), so 0.98 = a hair wide but stable.
+FORD_BAL_LIVE_TARGET          = 0.98
+# Per-bucket seed (len == #buckets). NEUTRAL — measured delivery varies by route
+# and speed band (8-12 m/s ran HOT on both logged routes; a hand-picked seed
+# boosting it overshot into oversteer+weave), so we don't bake a guess. The
+# now-persisting learner calibrates each bucket from real data across drives.
+FORD_BAL_LIVE_SEED            = (1.0, 1.0, 1.0, 1.0, 1.0)
 FORD_BAL_LIVE_LOG_FRAMES      = 100    # heartbeat every ~5 s @ 20 Hz (grep "FordBalLiveScale")
-FORD_BAL_LIVE_MIN_DECAY       = 50.0   # initial filter decay (alpha ≈ 0.02 — fast)
+FORD_BAL_LIVE_MIN_DECAY       = 25.0   # initial filter decay (alpha ≈ 0.04 — converges in ~1-2 drives)
 FORD_BAL_LIVE_MAX_DECAY       = 500.0  # final filter decay   (alpha ≈ 0.002 — stable)
 FORD_BAL_LIVE_DECAY_STEP      = 1.0    # decay increment per successful update
-FORD_BAL_LIVE_MIN_BUCKET_FRAMES = 100  # fresh samples in a bucket before it trims (clean estimate)
+FORD_BAL_LIVE_MIN_BUCKET_FRAMES = 50   # fresh samples in a bucket before it trims (clean estimate)
 FORD_BAL_LIVE_BUCKETS_V       = (3.0, 6.0, 10.0, 15.0, 22.0, 35.0)
 FORD_BAL_LIVE_DESK_MIN        = 0.003  # |desk| floor for inclusion
 FORD_BAL_LIVE_V_MIN           = 3.0    # m/s — exclude parking
