@@ -89,6 +89,14 @@ FORD_WBAL_GC1_TRIM_V = (3.0, 5.0, 8.0)      # baked ON: raise g_c1 to kill overs
 FORD_WBAL_GC1_TRIM   = (1.08, 1.03, 1.00)
 FORD_WBAL_C0_DB_LO   = 0.004                # baked ON: c0 deadband fade range (1/m)
 FORD_WBAL_C0_DB_HI   = 0.008
+# Cut the offset channel above highway-ish speed: c0 is the UNDAMPED/hunting
+# channel and our tiny g0 makes its VALUE large (~0.3 m on curves at 13 m/s).
+# In the sustained-curve bounce, act swings ~3x more than c1 can deliver through
+# the (attenuating) plant — amplification consistent with c0 resonating near the
+# ~0.5 Hz bounce. c1 alone drives curves cleanly, so above this ramp the curve
+# rides on c1 only and the undamped offset is removed.
+FORD_WBAL_C0_VRAMP   = 8.0    # m/s — c0 share starts fading
+FORD_WBAL_C0_VMAX    = 10.0   # m/s — c0 share fully off at/above this
 FORD_WBAL_C0_RATE    = 6.0                  # m/s — c0 slew (applied in carcontroller)
 
 # ─── Live estimator constants ─────────────────────────────────────────────────
@@ -194,6 +202,9 @@ def bal_encode(desired_curvature: float, v_ego: float,
   # straight; c1 takes the slack so total delivery stays = desk (no step).
   gate = (mag - FORD_WBAL_C0_DB_LO) / (FORD_WBAL_C0_DB_HI - FORD_WBAL_C0_DB_LO)
   w0 *= _clip(gate, 0.0, 1.0)
+  # Speed gate: fade c0 out by FORD_WBAL_C0_VMAX (kill the undamped offset on
+  # highway-speed curves -> sustained curve rides on the well-damped c1 alone).
+  w0 *= _clip((FORD_WBAL_C0_VMAX - v_ego) / (FORD_WBAL_C0_VMAX - FORD_WBAL_C0_VRAMP), 0.0, 1.0)
 
   g0 = max(_interp(v_ego, FORD_WBAL_GC0_V, FORD_WBAL_GC0), 1e-5)
   g1 = max(_interp(v_ego, FORD_WBAL_GC1_V, FORD_WBAL_GC1), 1e-5)
