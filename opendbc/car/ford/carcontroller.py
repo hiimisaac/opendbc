@@ -120,7 +120,13 @@ class CarController(CarControllerBase):
           path_offset, path_angle = lightweight_path_from_model(
             self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive
           )
-          apply_curvature = 0.0
+          apply_curvature = desired_curvature
+          if CS.out.vEgoRaw > 9:
+            apply_curvature = float(np.clip(apply_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
+                                            current_curvature + CarControllerParams.CURVATURE_ERROR))
+          apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(apply_curvature, self.apply_curvature_last,
+                                                                              CS.out.vEgoRaw, current_curvature, CC.latActive,
+                                                                              CarControllerParams.STEER_STEP)
           curvature_rate = 0.0
           ramp_type = 3
         else:

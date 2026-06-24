@@ -1,14 +1,18 @@
 import random
 import unittest
+from types import SimpleNamespace
 
+from opendbc.can.parser import CANParser
 from hypothesis import settings, given, strategies as st
 
 from opendbc.can import CANPacker
+from opendbc.car import Bus, structs
+from opendbc.car.ford.carcontroller import CarController
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.radar_interface import RadarInterface
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
-from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, FordFlags, RADAR, get_platform_codes
+from opendbc.car.ford.values import CAR, DBC, FW_QUERY_CONFIG, FW_PATTERN, FordFlags, RADAR, CarControllerParams, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -186,3 +190,36 @@ class TestFordRadar(unittest.TestCase):
     assert all(radar_data is not None for radar_data in updates)
     assert len(updates[3].points) > 0
     assert [len(radar_data.points) for radar_data in updates[4:]] == [len(updates[3].points)] * 4
+
+
+class TestFordCanfdLateral(unittest.TestCase):
+  def test_canfd_lateral_motion_control_keeps_desired_curvature(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    CC = structs.CarControl()
+    CC.latActive = True
+    CC.actuators.curvature = 0.002
+    CC.hudControl.leadDistanceBars = 1
+
+    CS_out = structs.CarState()
+    CS_out.vEgo = 12.0
+    CS_out.vEgoRaw = 12.0
+    CS_out.cruiseState.available = True
+    CS = SimpleNamespace(
+      out=CS_out.as_reader(),
+      buttons_stock_values={},
+      acc_tja_status_stock_values={"Tja_D_Stat": 0},
+      lkas_status_stock_values={},
+    )
+
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    controller.frame = CarControllerParams.STEER_STEP
+    controller.main_on_last = True
+    controller.lkas_enabled_last = True
+    controller.lead_distance_bars_last = 1
+
+    _, can_sends = controller.update(CC.as_reader(), CS, 0)
+
+    parser = CANParser(DBC[CP.carFingerprint][Bus.pt], [("LateralMotionControl2", 20)], 0)
+    parser.update([0, can_sends])
+
+    self.assertGreater(abs(parser.vl["LateralMotionControl2"]["LatCtlCurv_No_Actl"]), 0.0)
