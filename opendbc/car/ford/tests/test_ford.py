@@ -193,7 +193,7 @@ class TestFordRadar(unittest.TestCase):
 
 
 class TestFordCanfdLateral(unittest.TestCase):
-  def test_canfd_lateral_motion_control_keeps_desired_curvature(self):
+  def test_canfd_lateral_motion_control_keeps_desired_curvature_in_path(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     CC = structs.CarControl()
     CC.latActive = True
@@ -222,4 +222,7 @@ class TestFordCanfdLateral(unittest.TestCase):
     parser = CANParser(DBC[CP.carFingerprint][Bus.pt], [("LateralMotionControl2", 20)], 0)
     parser.update([0, can_sends])
 
-    self.assertGreater(abs(parser.vl["LateralMotionControl2"]["LatCtlCurv_No_Actl"]), 0.0)
+    values = parser.vl["LateralMotionControl2"]
+    self.assertGreater(abs(values["LatCtlPathOffst_L_Actl"]), 0.0)
+    self.assertGreater(abs(values["LatCtlPath_An_Actl"]), 0.0)
+    self.assertEqual(values["LatCtlCurv_No_Actl"], 0.0)

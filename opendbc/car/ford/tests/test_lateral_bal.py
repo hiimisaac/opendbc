@@ -27,28 +27,28 @@ def test_lightweight_path_rate_limits_large_c1_reversal():
   assert math.isclose(path_angle, -0.003)
 
 
-def test_lightweight_path_uses_model_c0_and_c1():
+def test_lightweight_path_keeps_model_c0_and_c1_when_curvature_matches():
   model = SimpleNamespace(
     position=SimpleNamespace(x=[0.0, 10.0, 20.0], y=[0.0, 1.0, 2.0]),
     orientation=SimpleNamespace(z=[0.0, 0.1, 0.2]),
   )
 
-  path_offset, path_angle = lightweight_path_from_model(model, 0.002, 0.002, 20.0, 0.0, True)
+  path_offset, path_angle = lightweight_path_from_model(model, 0.01, 0.002, 20.0, 0.0, True)
 
   assert math.isclose(path_angle, 0.2)
   assert math.isclose(path_offset, 0.6)
 
 
-def test_lightweight_path_adds_curvature_error_feedback():
+def test_lightweight_path_folds_desired_curvature_into_path():
   model = SimpleNamespace(
     position=SimpleNamespace(x=[0.0, 10.0, 20.0], y=[0.0, 0.0, 0.0]),
     orientation=SimpleNamespace(z=[0.0, 0.0, 0.0]),
   )
 
-  path_offset, path_angle = lightweight_path_from_model(model, 0.004, 0.0, 20.0, 0.0, True)
+  path_offset, path_angle = lightweight_path_from_model(model, 0.004, 0.004, 20.0, 0.0, True)
 
-  assert math.isclose(path_angle, 0.004 * (5.0 + (20.0 - 15.0) * (6.0 - 5.0) / (30.0 - 15.0)))
-  assert math.isclose(path_offset, 0.004 * (60.0 + (20.0 - 15.0) * (100.0 - 60.0) / (30.0 - 15.0)))
+  assert math.isclose(path_angle, 0.004 * 20.0)
+  assert math.isclose(path_offset, 0.5 * 0.004 * 6.0 * 6.0)
 
 
 def test_lightweight_path_falls_back_to_curvature_without_model():
