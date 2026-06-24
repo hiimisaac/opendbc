@@ -178,10 +178,11 @@ class TestFordRadar(unittest.TestCase):
     RI = RadarInterface(CP)
     packer = CANPacker(RADAR.DELPHI_MRR_CANFD)
 
-    radar_data = None
-    for frame, scan_index in enumerate((0, 1, 2, 3), start=1):
+    updates = []
+    for frame, scan_index in enumerate((0, 1, 2, 3, 0, 1, 2, 3), start=1):
       frames = self._canfd_radar_frames(packer, scan_index, RI.rcp.bus)
-      radar_data = RI.update([(frame * 50_000_000, frames)]) or radar_data
+      updates.append(RI.update([(frame * 50_000_000, frames)]))
 
-    assert radar_data is not None
-    assert len(radar_data.points) > 0
+    assert all(radar_data is not None for radar_data in updates)
+    assert len(updates[3].points) > 0
+    assert [len(radar_data.points) for radar_data in updates[4:]] == [len(updates[3].points)] * 4

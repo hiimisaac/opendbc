@@ -188,6 +188,8 @@ class RadarInterface(RadarInterfaceBase):
           del self.pts[ii]
 
   def _update_delphi_mrr(self, ret: structs.RadarData):
+    publish_intermediate_scan = self.radar == RADAR.DELPHI_MRR_CANFD and self.rcp.can_valid
+
     if self.radar == RADAR.DELPHI_MRR_CANFD:
       first_msg_idx, first_suffix = self.mrr_detection_slots[0]
       headerScanIndex = int(self.rcp.vl[f"MRR_Detection_{first_msg_idx:03d}"][f"CAN_SCAN_INDEX_2LSB_{first_suffix}"])
@@ -210,7 +212,7 @@ class RadarInterface(RadarInterfaceBase):
 
     # Use points with Doppler coverage of +-60 m/s, reduces similar points
     if headerScanIndex not in (2, 3):
-      return False
+      return publish_intermediate_scan
 
     if self.radar != RADAR.DELPHI_MRR_CANFD and \
        DELPHI_MRR_RADAR_RANGE_COVERAGE[headerScanIndex] != int(self.rcp.vl["MRR_Header_SensorCoverage"]["CAN_RANGE_COVERAGE"]):
@@ -251,7 +253,7 @@ class RadarInterface(RadarInterfaceBase):
 
     # Cluster and publish using stored points once we've cycled through all 4 scan modes
     if headerScanIndex != 3:
-      return False
+      return publish_intermediate_scan
 
     # Cluster points from this cycle against the centroids from the previous cycle
     prev_keys = [[p.dRel, p.yRel * 2, p.vRel * 2] for p in self.clusters]
