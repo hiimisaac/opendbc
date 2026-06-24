@@ -15,6 +15,8 @@ DELPHI_ESR_RADAR_MSGS = list(range(0x500, 0x540))
 DELPHI_MRR_RADAR_START_ADDR = 0x120
 DELPHI_MRR_RADAR_HEADER_ADDR = 0x174  # MRR_Header_SensorCoverage
 DELPHI_MRR_RADAR_MSG_COUNT = 64
+DELPHI_MRR_CANFD_RADAR_MSG_COUNT = 22
+DELPHI_MRR_CANFD_RADAR_LAST_ADDR = DELPHI_MRR_RADAR_START_ADDR + DELPHI_MRR_CANFD_RADAR_MSG_COUNT - 1
 
 DELPHI_MRR_RADAR_RANGE_COVERAGE = {0: 42, 1: 164, 2: 45, 3: 175}  # scan index to detection range (m)
 DELPHI_MRR_MIN_LONG_RANGE_DIST = 30  # meters
@@ -76,17 +78,33 @@ def _create_delphi_esr_radar_can_parser(CP) -> CANParser:
   return CANParser(RADAR.DELPHI_ESR, messages, CanBus(CP).radar)
 
 
-def _create_delphi_mrr_radar_can_parser(CP) -> CANParser:
-  messages = [
-    ("MRR_Header_InformationDetections", 33),
-    ("MRR_Header_SensorCoverage", 33),
-  ]
+def _delphi_mrr_detection_slots(radar: str) -> list[tuple[int, str]]:
+  if radar == RADAR.DELPHI_MRR_CANFD:
+    slots = []
+    for i in range(1, DELPHI_MRR_CANFD_RADAR_MSG_COUNT + 1):
+      detections = 3 if i == DELPHI_MRR_CANFD_RADAR_MSG_COUNT else 6
+      slots.extend((i, f"{i:02d}_{j:02d}") for j in range(1, detections + 1))
+    return slots
 
-  for i in range(1, DELPHI_MRR_RADAR_MSG_COUNT + 1):
+  return [(i, f"{i:02d}") for i in range(1, DELPHI_MRR_RADAR_MSG_COUNT + 1)]
+
+
+def _create_delphi_mrr_radar_can_parser(CP, radar: str) -> CANParser:
+  messages = []
+  if radar != RADAR.DELPHI_MRR_CANFD:
+    messages += [
+      ("MRR_Header_InformationDetections", 33),
+      ("MRR_Header_SensorCoverage", 33),
+    ]
+
+  msg_count = DELPHI_MRR_CANFD_RADAR_MSG_COUNT if radar == RADAR.DELPHI_MRR_CANFD else DELPHI_MRR_RADAR_MSG_COUNT
+  msg_freq = 20 if radar == RADAR.DELPHI_MRR_CANFD else 33
+
+  for i in range(1, msg_count + 1):
     msg = f"MRR_Detection_{i:03d}"
-    messages += [(msg, 33)]
+    messages += [(msg, msg_freq)]
 
-  return CANParser(RADAR.DELPHI_MRR, messages, CanBus(CP).radar)
+  return CANParser(radar, messages, CanBus(CP).radar)
 
 
 class RadarInterface(RadarInterfaceBase):
@@ -108,9 +126,10 @@ class RadarInterface(RadarInterfaceBase):
       self.rcp = _create_delphi_esr_radar_can_parser(CP)
       self.trigger_msg = DELPHI_ESR_RADAR_MSGS[-1]
       self.valid_cnt = {key: 0 for key in DELPHI_ESR_RADAR_MSGS}
-    elif self.radar == RADAR.DELPHI_MRR:
-      self.rcp = _create_delphi_mrr_radar_can_parser(CP)
-      self.trigger_msg = DELPHI_MRR_RADAR_HEADER_ADDR
+    elif self.radar in (RADAR.DELPHI_MRR, RADAR.DELPHI_MRR_CANFD):
+      self.rcp = _create_delphi_mrr_radar_can_parser(CP, self.radar)
+      self.trigger_msg = DELPHI_MRR_CANFD_RADAR_LAST_ADDR if self.radar == RADAR.DELPHI_MRR_CANFD else DELPHI_MRR_RADAR_HEADER_ADDR
+      self.mrr_detection_slots = _delphi_mrr_detection_slots(self.radar)
     else:
       raise ValueError(f"Unsupported radar: {self.radar}")
 
@@ -131,7 +150,7 @@ class RadarInterface(RadarInterfaceBase):
 
     if self.radar == RADAR.DELPHI_ESR:
       self._update_delphi_esr()
-    elif self.radar == RADAR.DELPHI_MRR:
+    elif self.radar in (RADAR.DELPHI_MRR, RADAR.DELPHI_MRR_CANFD):
       _update = self._update_delphi_mrr(ret)
       if not _update:
         return None
@@ -169,7 +188,11 @@ class RadarInterface(RadarInterfaceBase):
           del self.pts[ii]
 
   def _update_delphi_mrr(self, ret: structs.RadarData):
-    headerScanIndex = int(self.rcp.vl["MRR_Header_InformationDetections"]['CAN_SCAN_INDEX']) & 0b11
+    if self.radar == RADAR.DELPHI_MRR_CANFD:
+      first_msg_idx, first_suffix = self.mrr_detection_slots[0]
+      headerScanIndex = int(self.rcp.vl[f"MRR_Detection_{first_msg_idx:03d}"][f"CAN_SCAN_INDEX_2LSB_{first_suffix}"])
+    else:
+      headerScanIndex = int(self.rcp.vl["MRR_Header_InformationDetections"]['CAN_SCAN_INDEX']) & 0b11
 
     # In reverse, the radar continually sends the last messages. Mark this as invalid
     if (self.prev_headerScanIndex + 1) % 4 != headerScanIndex:
@@ -189,7 +212,8 @@ class RadarInterface(RadarInterfaceBase):
     if headerScanIndex not in (2, 3):
       return False
 
-    if DELPHI_MRR_RADAR_RANGE_COVERAGE[headerScanIndex] != int(self.rcp.vl["MRR_Header_SensorCoverage"]["CAN_RANGE_COVERAGE"]):
+    if self.radar != RADAR.DELPHI_MRR_CANFD and \
+       DELPHI_MRR_RADAR_RANGE_COVERAGE[headerScanIndex] != int(self.rcp.vl["MRR_Header_SensorCoverage"]["CAN_RANGE_COVERAGE"]):
       self.scan_index_invalid_cnt += 1
     else:
       self.scan_index_invalid_cnt = 0
@@ -198,28 +222,28 @@ class RadarInterface(RadarInterfaceBase):
     if self.scan_index_invalid_cnt >= 5:
       ret.errors.wrongConfig = True
 
-    for ii in range(1, DELPHI_MRR_RADAR_MSG_COUNT + 1):
+    for ii, suffix in self.mrr_detection_slots:
       msg = self.rcp.vl[f"MRR_Detection_{ii:03d}"]
 
       # SCAN_INDEX rotates through 0..3 on each message for different measurement modes
       # Indexes 0 and 2 have a max range of ~40m, 1 and 3 are ~170m (MRR_Header_SensorCoverage->CAN_RANGE_COVERAGE)
       # Indexes 0 and 1 have a Doppler coverage of +-71 m/s, 2 and 3 have +-60 m/s
-      scanIndex = msg[f"CAN_SCAN_INDEX_2LSB_{ii:02d}"]
+      scanIndex = msg[f"CAN_SCAN_INDEX_2LSB_{suffix}"]
 
       # Throw out old measurements. Very unlikely to happen, but is proper behavior
       if scanIndex != headerScanIndex:
         continue
 
-      valid = bool(msg[f"CAN_DET_VALID_LEVEL_{ii:02d}"])
+      valid = bool(msg[f"CAN_DET_VALID_LEVEL_{suffix}"])
 
       # Long range measurement mode is more sensitive and can detect the road surface
-      dist = msg[f"CAN_DET_RANGE_{ii:02d}"]  # m [0|255.984]
+      dist = msg[f"CAN_DET_RANGE_{suffix}"]  # m [0|255.984]
       if scanIndex in (1, 3) and dist < DELPHI_MRR_MIN_LONG_RANGE_DIST:
         valid = False
 
       if valid:
-        azimuth = msg[f"CAN_DET_AZIMUTH_{ii:02d}"]              # rad [-3.1416|3.13964]
-        distRate = msg[f"CAN_DET_RANGE_RATE_{ii:02d}"]          # m/s [-128|127.984]
+        azimuth = msg[f"CAN_DET_AZIMUTH_{suffix}"]              # rad [-3.1416|3.13964]
+        distRate = msg[f"CAN_DET_RANGE_RATE_{suffix}"]          # m/s [-128|127.984]
         dRel = cos(azimuth) * dist                              # m from front of car
         yRel = -sin(azimuth) * dist                             # in car frame's y axis, left is positive
 

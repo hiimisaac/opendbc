@@ -52,6 +52,7 @@ class FordFlags(IntFlag):
 class RADAR:
   DELPHI_ESR = 'ford_fusion_2018_adas'
   DELPHI_MRR = 'FORD_CADS'
+  DELPHI_MRR_CANFD = 'FORD_CADS_64'
 
 
 class Footnote(Enum):
@@ -100,6 +101,7 @@ class FordPlatformConfig(PlatformConfig):
 class FordCANFDPlatformConfig(FordPlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {
     Bus.pt: 'ford_lincoln_base_pt',
+    Bus.radar: RADAR.DELPHI_MRR_CANFD,
   })
 
   def init(self):

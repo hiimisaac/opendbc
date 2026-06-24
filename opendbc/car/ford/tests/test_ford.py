@@ -3,9 +3,12 @@ import unittest
 
 from hypothesis import settings, given, strategies as st
 
+from opendbc.can import CANPacker
+from opendbc.car.ford.interface import CarInterface
+from opendbc.car.ford.radar_interface import RadarInterface
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
-from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
+from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, FordFlags, RADAR, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -140,3 +143,45 @@ class TestFordFW(unittest.TestCase):
     live_fw[(0x760, None)] = {b"M1MC-2D053-XX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"}
     candidates = FW_QUERY_CONFIG.match_fw_to_car_fuzzy(live_fw, '', {expected_fingerprint: offline_fw})
     assert len(candidates) == 0, "Should not match new model year hint"
+
+
+class TestFordRadar(unittest.TestCase):
+  def test_canfd_platforms_have_radar(self):
+    for platform in CAR.with_flags(FordFlags.CANFD):
+      CP = CarInterface.get_non_essential_params(platform)
+      assert not CP.radarUnavailable
+      self.assertAlmostEqual(CP.radarDelay, 0.1)
+
+  @staticmethod
+  def _canfd_radar_frames(packer: CANPacker, scan_index: int, bus: int):
+    frames = []
+    for msg_idx in range(1, 23):
+      slots = 3 if msg_idx == 22 else 6
+      values = {
+        f"CAN_SCAN_INDEX_2LSB_{msg_idx:02d}_{slot_idx:02d}": scan_index
+        for slot_idx in range(1, slots + 1)
+      }
+
+      if msg_idx == 1:
+        values |= {
+          "CAN_DET_VALID_LEVEL_01_01": 1,
+          "CAN_DET_RANGE_01_01": 40.0 + scan_index,
+          "CAN_DET_RANGE_RATE_01_01": -1.0,
+          "CAN_DET_AZIMUTH_01_01": 0.0,
+        }
+
+      frames.append(packer.make_can_msg(f"MRR_Detection_{msg_idx:03d}", bus, values))
+    return frames
+
+  def test_canfd_radar_interface_updates(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    RI = RadarInterface(CP)
+    packer = CANPacker(RADAR.DELPHI_MRR_CANFD)
+
+    radar_data = None
+    for frame, scan_index in enumerate((0, 1, 2, 3), start=1):
+      frames = self._canfd_radar_frames(packer, scan_index, RI.rcp.bus)
+      radar_data = RI.update([(frame * 50_000_000, frames)]) or radar_data
+
+    assert radar_data is not None
+    assert len(radar_data.points) > 0
