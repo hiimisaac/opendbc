@@ -13,11 +13,18 @@ FORD_MODEL_DLOOK_TIME = 1.0
 FORD_MODEL_DLOOK_MIN = 7.0
 FORD_MODEL_C0_HIGH_SPEED_LOOKAHEAD = 6.0
 FORD_MODEL_C0_SPEED_BP = (11.0, 14.0)
+FORD_MODEL_WINDOW_START_SCALE = 0.65
+FORD_MODEL_WINDOW_END_TIME = 1.6
+FORD_MODEL_WINDOW_MIN_EXTRA = 4.0
+FORD_MODEL_WINDOW_MAX_EXTRA = 22.0
+FORD_MODEL_WINDOW_PERCENTILE = 0.60
 
 FORD_PATH_FEEDBACK_SPEED_BP = (0.0, 5.0, 15.0, 30.0)
 FORD_PATH_C1_FEEDBACK = (0.0, 2.0, 5.0, 6.0)
 FORD_PATH_C0_FEEDBACK = (0.0, 20.0, 60.0, 100.0)
 FORD_PATH_CURVATURE_ERROR = 0.006
+FORD_PATH_C1_WINDOW_LEAD_GAIN = 0.25
+FORD_PATH_C1_WINDOW_LEAD_CLIP = 0.006
 
 FORD_PATH_C1_RATE_BP = (5.0, 25.0)
 FORD_PATH_C1_RATE = (0.50, 0.50)
@@ -51,6 +58,34 @@ def _valid_model_path(model) -> bool:
     return len(model.position.x) > 1 and len(model.position.x) == len(model.position.y) == len(model.orientation.z)
   except (AttributeError, TypeError):
     return False
+
+
+def _windowed_model_curvature(model, desired_curvature: float, v_ego: float, d_look: float) -> float | None:
+  x_pts = model.position.x
+  start = max(4.0, d_look * FORD_MODEL_WINDOW_START_SCALE)
+  end = min(x_pts[-1], max(d_look + FORD_MODEL_WINDOW_MIN_EXTRA,
+                           min(d_look + FORD_MODEL_WINDOW_MAX_EXTRA, v_ego * FORD_MODEL_WINDOW_END_TIME)))
+  if end <= start:
+    return None
+
+  curvatures: list[float] = []
+  for x, y, z in zip(x_pts, model.position.y, model.orientation.z, strict=False):
+    x = _finite(x)
+    if x < start or x > end or x < 1.0:
+      continue
+
+    heading_curvature = _finite(z) / x
+    lateral_curvature = 2.0 * _finite(y) / (x * x)
+    curvature = (0.7 * heading_curvature) + (0.3 * lateral_curvature)
+    if math.isfinite(curvature) and (abs(desired_curvature) < 1e-6 or curvature * desired_curvature >= 0.0):
+      curvatures.append(curvature)
+
+  if not curvatures:
+    return None
+
+  curvatures.sort(key=abs)
+  idx = round((len(curvatures) - 1) * FORD_MODEL_WINDOW_PERCENTILE)
+  return curvatures[idx]
 
 
 def lightweight_path_from_curvature(desired_curvature: float, v_ego: float,
@@ -110,6 +145,14 @@ def lightweight_path_from_model(model, desired_curvature: float, current_curvatu
   curvature_correction = _clip(desired_curvature - model_curvature, -FORD_PATH_CURVATURE_ERROR, FORD_PATH_CURVATURE_ERROR)
   path_angle += curvature_correction * d_look
   path_offset += 0.5 * curvature_correction * d_c0 * d_c0
+
+  window_curvature = _windowed_model_curvature(model, desired_curvature, v_ego, d_look)
+  commanded_curvature = path_angle / max(d_look, 1.0)
+  if window_curvature is not None:
+    lead_delta = window_curvature - commanded_curvature
+    if desired_curvature * lead_delta > 0.0 and abs(window_curvature) > abs(commanded_curvature):
+      lead_delta = _clip(lead_delta, -FORD_PATH_C1_WINDOW_LEAD_CLIP, FORD_PATH_C1_WINDOW_LEAD_CLIP)
+      path_angle += FORD_PATH_C1_WINDOW_LEAD_GAIN * lead_delta * d_look
 
   c1_rate = _interp(v_ego, FORD_PATH_C1_RATE_BP, FORD_PATH_C1_RATE)
   path_angle = _clip(path_angle, path_angle_last - c1_rate, path_angle_last + c1_rate)
