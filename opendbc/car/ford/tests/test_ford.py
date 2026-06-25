@@ -157,8 +157,13 @@ class TestFordRadar(unittest.TestCase):
       self.assertAlmostEqual(CP.radarDelay, 0.1)
 
   @staticmethod
-  def _canfd_radar_frames(packer: CANPacker, scan_index: int, bus: int):
+  def _canfd_radar_frames(packer: CANPacker, scan_index: int, bus: int, detections=None):
     frames = []
+    if detections is None:
+      detections = [
+        {"msg_idx": 1, "slot_idx": 1, "range": 40.0 + scan_index, "range_rate": -1.0, "azimuth": 0.0},
+      ]
+
     for msg_idx in range(1, 23):
       slots = 3 if msg_idx == 22 else 6
       values = {
@@ -166,12 +171,16 @@ class TestFordRadar(unittest.TestCase):
         for slot_idx in range(1, slots + 1)
       }
 
-      if msg_idx == 1:
+      for det in detections:
+        if det["msg_idx"] != msg_idx:
+          continue
+        slot_idx = det["slot_idx"]
         values |= {
-          "CAN_DET_VALID_LEVEL_01_01": 1,
-          "CAN_DET_RANGE_01_01": 40.0 + scan_index,
-          "CAN_DET_RANGE_RATE_01_01": -1.0,
-          "CAN_DET_AZIMUTH_01_01": 0.0,
+          f"CAN_DET_VALID_LEVEL_{msg_idx:02d}_{slot_idx:02d}": 1,
+          f"CAN_DET_RANGE_{msg_idx:02d}_{slot_idx:02d}": det["range"],
+          f"CAN_DET_RANGE_RATE_{msg_idx:02d}_{slot_idx:02d}": det["range_rate"],
+          f"CAN_DET_AZIMUTH_{msg_idx:02d}_{slot_idx:02d}": det["azimuth"],
+          f"CAN_DET_HOST_VEH_CLUTTER_{msg_idx:02d}_{slot_idx:02d}": int(det.get("host_veh_clutter", False)),
         }
 
       frames.append(packer.make_can_msg(f"MRR_Detection_{msg_idx:03d}", bus, values))
@@ -190,6 +199,63 @@ class TestFordRadar(unittest.TestCase):
     assert all(radar_data is not None for radar_data in updates)
     assert len(updates[3].points) > 0
     assert [len(radar_data.points) for radar_data in updates[4:]] == [len(updates[3].points)] * 4
+
+  def test_canfd_radar_clusters_nearby_detections(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    RI = RadarInterface(CP)
+    packer = CANPacker(RADAR.DELPHI_MRR_CANFD)
+    detections = [
+      {"msg_idx": 1, "slot_idx": 1, "range": 40.0, "range_rate": -1.0, "azimuth": 0.0},
+      {"msg_idx": 1, "slot_idx": 2, "range": 41.0, "range_rate": -1.1, "azimuth": 0.01},
+      {"msg_idx": 2, "slot_idx": 1, "range": 39.5, "range_rate": -0.9, "azimuth": -0.01},
+    ]
+
+    updates = []
+    for frame, scan_index in enumerate((0, 1, 2, 3), start=1):
+      frames = self._canfd_radar_frames(packer, scan_index, RI.rcp.bus, detections=detections)
+      updates.append(RI.update([(frame * 50_000_000, frames)]))
+
+    assert len(updates[-1].points) == 1
+
+  def test_canfd_radar_reuses_track_after_short_miss(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    RI = RadarInterface(CP)
+    packer = CANPacker(RADAR.DELPHI_MRR_CANFD)
+    detections = [
+      {"msg_idx": 1, "slot_idx": 1, "range": 40.0, "range_rate": -1.0, "azimuth": 0.0},
+      {"msg_idx": 1, "slot_idx": 2, "range": 40.5, "range_rate": -1.1, "azimuth": 0.01},
+    ]
+
+    frame = 1
+    track_id = None
+    for cycle_detections in (detections, [], detections):
+      radar_data = None
+      for scan_index in (0, 1, 2, 3):
+        frames = self._canfd_radar_frames(packer, scan_index, RI.rcp.bus, detections=cycle_detections)
+        radar_data = RI.update([(frame * 50_000_000, frames)])
+        frame += 1
+
+      if cycle_detections:
+        assert len(radar_data.points) == 1
+        if track_id is None:
+          track_id = radar_data.points[0].trackId
+        else:
+          assert radar_data.points[0].trackId == track_id
+
+  def test_canfd_radar_rejects_host_vehicle_clutter(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    RI = RadarInterface(CP)
+    packer = CANPacker(RADAR.DELPHI_MRR_CANFD)
+    detections = [
+      {"msg_idx": 1, "slot_idx": 1, "range": 8.0, "range_rate": -1.0, "azimuth": 0.0, "host_veh_clutter": True},
+    ]
+
+    radar_data = None
+    for frame, scan_index in enumerate((0, 1, 2, 3), start=1):
+      frames = self._canfd_radar_frames(packer, scan_index, RI.rcp.bus, detections=detections)
+      radar_data = RI.update([(frame * 50_000_000, frames)])
+
+    assert len(radar_data.points) == 0
 
 
 class TestFordCanfdLateral(unittest.TestCase):

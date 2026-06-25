@@ -21,6 +21,7 @@ DELPHI_MRR_CANFD_RADAR_LAST_ADDR = DELPHI_MRR_RADAR_START_ADDR + DELPHI_MRR_CANF
 DELPHI_MRR_RADAR_RANGE_COVERAGE = {0: 42, 1: 164, 2: 45, 3: 175}  # scan index to detection range (m)
 DELPHI_MRR_MIN_LONG_RANGE_DIST = 30  # meters
 DELPHI_MRR_CLUSTER_THRESHOLD = 5  # meters, lateral distance and relative velocity are weighted
+DELPHI_MRR_CANFD_CLUSTER_MISSES = 1
 
 
 @dataclass
@@ -29,6 +30,7 @@ class Cluster:
   yRel: float = 0.0
   vRel: float = 0.0
   trackId: int = 0
+  misses: int = 0
 
 
 def cluster_points(pts_l: list[list[float]], pts2_l: list[list[float]], max_dist: float) -> list[int]:
@@ -69,6 +71,28 @@ def cluster_points(pts_l: list[list[float]], pts2_l: list[list[float]], max_dist
   cluster_idxs = np.where(closest_dist_sq < max_dist_sq, closest_clusters, -1)
 
   return cast(list[int], cluster_idxs.tolist())
+
+
+def cluster_detections(pts_l: list[list[float]], max_dist: float) -> list[list[list[float]]]:
+  groups: list[list[list[float]]] = []
+  max_dist_sq = max_dist ** 2
+
+  for point in pts_l:
+    best_idx = -1
+    best_dist_sq = max_dist_sq
+    for idx, group in enumerate(groups):
+      center = [sum(p[i] for p in group) / len(group) for i in range(len(point))]
+      dist_sq = sum((point[i] - center[i]) ** 2 for i in range(len(point)))
+      if dist_sq < best_dist_sq:
+        best_idx = idx
+        best_dist_sq = dist_sq
+
+    if best_idx == -1:
+      groups.append([point])
+    else:
+      groups[best_idx].append(point)
+
+  return groups
 
 
 def _create_delphi_esr_radar_can_parser(CP) -> CANParser:
@@ -237,6 +261,8 @@ class RadarInterface(RadarInterfaceBase):
         continue
 
       valid = bool(msg[f"CAN_DET_VALID_LEVEL_{suffix}"])
+      if self.radar == RADAR.DELPHI_MRR_CANFD and bool(msg[f"CAN_DET_HOST_VEH_CLUTTER_{suffix}"]):
+        valid = False
 
       # Long range measurement mode is more sensitive and can detect the road surface
       dist = msg[f"CAN_DET_RANGE_{suffix}"]  # m [0|255.984]
@@ -255,16 +281,25 @@ class RadarInterface(RadarInterfaceBase):
     if headerScanIndex != 3:
       return publish_intermediate_scan
 
+    current_groups = [[point] for point in self.points]
+    if self.radar == RADAR.DELPHI_MRR_CANFD:
+      current_groups = cluster_detections(self.points, DELPHI_MRR_CLUSTER_THRESHOLD)
+
+    current_points = [[sum(p[i] for p in group) / len(group) for i in range(len(group[0]))] for group in current_groups]
+
     # Cluster points from this cycle against the centroids from the previous cycle
-    prev_keys = [[p.dRel, p.yRel * 2, p.vRel * 2] for p in self.clusters]
-    labels = cluster_points(prev_keys, self.points, DELPHI_MRR_CLUSTER_THRESHOLD)
+    prev_clusters = self.clusters
+    prev_keys = [[p.dRel, p.yRel * 2, p.vRel * 2] for p in prev_clusters]
+    labels = cluster_points(prev_keys, current_points, DELPHI_MRR_CLUSTER_THRESHOLD)
 
     points_by_track_id = defaultdict(list)
+    matched_prev_idxs = set()
     for idx, label in enumerate(labels):
       if label != -1:
-        points_by_track_id[self.clusters[label].trackId].append(self.points[idx])
+        points_by_track_id[prev_clusters[label].trackId].extend(current_groups[idx])
+        matched_prev_idxs.add(label)
       else:
-        points_by_track_id[self.track_id].append(self.points[idx])
+        points_by_track_id[self.track_id].extend(current_groups[idx])
         self.track_id += 1
 
     self.clusters = []
@@ -292,6 +327,12 @@ class RadarInterface(RadarInterfaceBase):
 
     for idx in range(len(points_by_track_id), len(self.pts)):
       del self.pts[idx]
+
+    if self.radar == RADAR.DELPHI_MRR_CANFD:
+      for idx, cluster in enumerate(prev_clusters):
+        if idx not in matched_prev_idxs and cluster.misses < DELPHI_MRR_CANFD_CLUSTER_MISSES:
+          self.clusters.append(Cluster(dRel=cluster.dRel, yRel=cluster.yRel, vRel=cluster.vRel,
+                                       trackId=cluster.trackId, misses=cluster.misses + 1))
 
     self.points = []
 
