@@ -3,7 +3,7 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_bal import lightweight_path_from_model
+from opendbc.car.ford.lateral_bal import c2_memory_step, lightweight_path_from_model
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -49,6 +49,7 @@ class CarController(CarControllerBase):
     self.anti_overshoot_curvature_last = 0
     self.path_angle_last = 0.0
     self.path_offset_last = 0.0
+    self.c2_memory = 0.0
     self.model = None
     self.sm = None
     if messaging is not None and CP.flags & FordFlags.CANFD:
@@ -117,10 +118,12 @@ class CarController(CarControllerBase):
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
 
         if self.CP.flags & FordFlags.CANFD:
+          c2_step = c2_memory_step(desired_curvature, current_curvature, self.c2_memory, CC.latActive)
+          apply_curvature = c2_step.command
+          self.c2_memory = c2_step.memory
           path_offset, path_angle = lightweight_path_from_model(
-            self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive
+            self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive, self.c2_memory
           )
-          apply_curvature = 0.0
           curvature_rate = 0.0
           ramp_type = 3
         else:
@@ -130,6 +133,8 @@ class CarController(CarControllerBase):
                                             current_curvature + CarControllerParams.CURVATURE_ERROR))
           apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(apply_curvature, self.apply_curvature_last, CS.out.vEgoRaw,
                                                                               0., CC.latActive, CarControllerParams.STEER_STEP)
+      elif self.CP.flags & FordFlags.CANFD:
+        self.c2_memory = 0.0
 
       self.path_angle_last = path_angle
       self.path_offset_last = path_offset

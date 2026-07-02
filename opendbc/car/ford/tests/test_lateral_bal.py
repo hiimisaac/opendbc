@@ -1,7 +1,12 @@
 import math
 from types import SimpleNamespace
 
-from opendbc.car.ford.lateral_bal import lightweight_path_from_curvature, lightweight_path_from_model
+from opendbc.car.ford.lateral_bal import (
+  FORD_C2_MEMORY_STACK_GAIN,
+  c2_memory_step,
+  lightweight_path_from_curvature,
+  lightweight_path_from_model,
+)
 
 
 def test_lightweight_path_uses_short_c0_lookahead_at_speed():
@@ -68,3 +73,58 @@ def test_lightweight_path_damps_model_c0_residual_more_at_speed():
 def test_lightweight_path_falls_back_to_curvature_without_model():
   assert lightweight_path_from_model(None, 0.002, 0.0, 20.0, 0.0, True) == \
          lightweight_path_from_curvature(0.002, 20.0, 0.0, True)
+
+
+def test_lightweight_path_from_curvature_subtracts_c2_memory():
+  path_offset, path_angle = lightweight_path_from_curvature(0.002, 20.0, 0.0, True, c2_memory=0.002)
+
+  assert math.isclose(path_angle, 0.0)
+  assert math.isclose(path_offset, 0.0)
+
+
+def test_lightweight_path_from_model_subtracts_c2_arc():
+  curvature = 0.002
+  model = SimpleNamespace(
+    position=SimpleNamespace(x=[0.0, 6.0, 20.0], y=[0.0, 0.5 * curvature * 6.0 ** 2, 0.5 * curvature * 20.0 ** 2]),
+    orientation=SimpleNamespace(z=[0.0, curvature * 6.0, curvature * 20.0]),
+  )
+
+  path_offset, path_angle = lightweight_path_from_model(model, curvature, curvature, 20.0, 0.0, True, c2_memory=curvature)
+
+  assert math.isclose(path_angle, 0.0)
+  assert math.isclose(path_offset, 0.0)
+
+
+def test_c2_memory_step_charges_toward_desired_curvature():
+  step = c2_memory_step(0.004, 0.002, 0.0, True)
+
+  assert math.isclose(step.command, 0.004)
+  assert math.isclose(step.memory, 0.004 * FORD_C2_MEMORY_STACK_GAIN)
+
+
+def test_c2_memory_step_stops_charging_when_memory_reaches_target():
+  step = c2_memory_step(0.004, 0.002, 0.0041, True)
+
+  assert math.isclose(step.command, 0.0)
+  assert 0.0 < step.memory < 0.0041
+
+
+def test_c2_memory_step_stops_charging_when_actual_curvature_is_holding_past_target():
+  step = c2_memory_step(0.002, 0.004, 0.0, True)
+
+  assert math.isclose(step.command, 0.0)
+  assert math.isclose(step.memory, 0.0)
+
+
+def test_c2_memory_step_does_not_reverse_pump_stale_memory():
+  step = c2_memory_step(-0.002, 0.0, 0.002, True)
+
+  assert math.isclose(step.command, 0.0)
+  assert step.memory > 0.0
+
+
+def test_c2_memory_step_resets_inactive():
+  step = c2_memory_step(0.004, 0.004, 0.004, False)
+
+  assert math.isclose(step.command, 0.0)
+  assert math.isclose(step.memory, 0.0)
