@@ -257,7 +257,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   def test_max_lateral_acceleration(self):
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      self.skipTest("CAN FD path mode keeps curvature inactive")
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
 
     # Ford CAN FD can achieve a higher max lateral acceleration than CAN so we limit curvature based on speed
     max_curvature_can = round(self.MAX_CURVATURE * self.DEG_TO_CAN)
@@ -295,16 +295,16 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   self._set_prev_desired_angle(curvature)
                   self._reset_curvature_measurement(curvature, speed)
 
-                  # CAN FD lightweight path mode allows c0/c1 only; non-CAN FD requires c0/c1/c3 inactive
+                  # CAN FD lightweight path mode allows bounded c0/c1/c2; non-CAN FD requires c0/c1/c3 inactive
                   if self.STEER_MESSAGE == MSG_LateralMotionControl2:
                     should_tx = -0.5 <= path_angle <= 0.5235
                     should_tx = should_tx and -5.12 <= path_offset <= 5.11
-                    should_tx = should_tx and curvature == 0
+                    should_tx = should_tx and -0.02 <= curvature <= 0.02
                     should_tx = should_tx and curvature_rate == 0
                     if steer_control_enabled:
                       should_tx = should_tx and controls_allowed
                     else:
-                      should_tx = should_tx and path_angle == 0 and path_offset == 0
+                      should_tx = should_tx and path_angle == 0 and path_offset == 0 and curvature == 0
                   else:
                     should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
 
@@ -333,8 +333,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
     self.safety.set_controls_allowed(True)
     self.assertFalse(self._tx(self._lat_ctl_msg(False, 0.5, 0.1, 0., 0., mode=0)))
-    # Lightweight path mode keeps c2/c3 inactive.
-    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0., 0., 0.01, 0., mode=2)))
+    # Lightweight path mode allows bounded c2 but keeps c3 inactive.
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., 0.01, 0., mode=2)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., -0.02, 0., mode=2)))
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0., 0., 0., 0.001, mode=2)))
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0., 0., 0.02094, 0., mode=2)))
     # non-zero c2/c3 must still be inactive when not enabled
@@ -344,7 +345,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
   def test_curvature_rate_limits(self):
     """Curvature command must satisfy the ISO 11270 lateral jerk limit per frame."""
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      self.skipTest("CAN FD path mode keeps curvature inactive")
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
     self.safety.set_controls_allowed(True)
     max_encoded_can = int(self.MAX_CURVATURE * self.DEG_TO_CAN)
 
@@ -369,7 +370,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   def test_curvature_error_limits(self):
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      self.skipTest("CAN FD path mode keeps curvature inactive")
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
 
     # above CURVATURE_ERROR_MIN_SPEED, command must be within max_curvature_error of measured, below the check is skipped
     self.safety.set_controls_allowed(True)
@@ -392,7 +393,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   def test_curvature_violation(self):
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      self.skipTest("CAN FD path mode keeps curvature inactive")
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
 
     # If violation occurs, curvature cmd is blocked until reset to 0
     self.safety.set_controls_allowed(True)
@@ -412,7 +413,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   def test_rt_limits(self):
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:
-      self.skipTest("CAN FD path mode keeps curvature inactive")
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
 
     # send rate is limited over a rolling 250ms window split into two half-interval buckets
     self.safety.set_controls_allowed(True)
