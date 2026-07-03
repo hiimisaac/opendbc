@@ -3,9 +3,15 @@ from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_bal import (
   FORD_C2_MEMORY_STACK_GAIN,
+  FORD_MANEUVER_CURV_THRESH,
+  blend_lateral_commands,
+  c2_authority_step,
   c2_memory_step,
+  cancel_c2_from_memory,
+  ford_lateral_step,
   lightweight_path_from_curvature,
   lightweight_path_from_model,
+  maneuver_score,
 )
 
 
@@ -128,3 +134,72 @@ def test_c2_memory_step_resets_inactive():
 
   assert math.isclose(step.command, 0.0)
   assert math.isclose(step.memory, 0.0)
+
+
+def test_maneuver_score_uses_max_of_magnitude_rate_and_error():
+  assert math.isclose(maneuver_score(FORD_MANEUVER_CURV_THRESH, 0.008, 0.0), 1.0)
+  assert math.isclose(maneuver_score(0.0, 0.008, 0.0), 1.0)
+  assert math.isclose(maneuver_score(0.0, 0.0, 0.010), 1.0)
+  assert maneuver_score(0.002, 0.002, 0.002) < 0.2
+
+
+def test_c2_authority_drops_faster_than_it_recovers():
+  drop_step = c2_authority_step(1.0, 1.0, True)
+  recover_step = c2_authority_step(0.0, drop_step.authority, True)
+
+  assert drop_step.authority < 1.0
+  assert recover_step.authority > drop_step.authority
+  assert recover_step.authority < 1.0
+
+
+def test_c2_authority_resets_inactive():
+  step = c2_authority_step(1.0, 0.2, False)
+
+  assert math.isclose(step.authority, 1.0)
+  assert math.isclose(step.maneuver_score, 0.0)
+
+
+def test_cancel_c2_from_memory_is_negative_of_memory():
+  assert math.isclose(cancel_c2_from_memory(0.004), -0.004)
+
+
+def test_blend_lateral_commands_uses_normal_terms_at_full_authority():
+  apply_curvature, path_offset, path_angle = blend_lateral_commands(
+    0.004, -0.004, 0.1, 0.2, 0.5, 0.6, 1.0,
+  )
+
+  assert math.isclose(apply_curvature, 0.004)
+  assert math.isclose(path_offset, 0.1)
+  assert math.isclose(path_angle, 0.2)
+
+
+def test_blend_lateral_commands_uses_maneuver_terms_when_suppressed():
+  apply_curvature, path_offset, path_angle = blend_lateral_commands(
+    0.004, -0.004, 0.1, 0.2, 0.5, 0.45, 0.0,
+  )
+
+  assert math.isclose(apply_curvature, -0.004)
+  assert math.isclose(path_offset, 0.5)
+  assert math.isclose(path_angle, 0.45)
+
+
+def test_ford_lateral_step_suppresses_c2_during_large_maneuver():
+  step = ford_lateral_step(
+    None, 0.016, 0.016, 0.0, 20.0, 0.0, 0.004, 0.0, True,
+  )
+
+  assert step.maneuver_score > 0.9
+  assert step.c2_authority < 0.5
+  assert abs(step.apply_curvature) < abs(c2_memory_step(0.016, 0.0, 0.004, True).command)
+
+
+def test_ford_lateral_step_keeps_normal_c2_during_small_request():
+  step = ford_lateral_step(
+    None, 0.002, 0.002, 0.002, 20.0, 0.0, 0.0, 1.0, True,
+  )
+  normal_c2 = c2_memory_step(0.002, 0.002, 0.0, True).command
+
+  assert step.maneuver_score < 0.2
+  assert step.c2_authority > 0.95
+  assert math.isclose(step.apply_curvature, normal_c2, rel_tol=0.1)
+  assert abs(step.path_offset) < abs(lightweight_path_from_curvature(0.002, 20.0, 0.0, True, 0.0)[0])

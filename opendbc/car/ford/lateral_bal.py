@@ -33,11 +33,36 @@ FORD_C2_HOLD_MARGIN = 0.0005
 FORD_C2_TARGET_DEADBAND = 0.0002
 FORD_C2_DT = 0.05  # LateralMotionControl2 runs at 20Hz.
 
+# No-state-machine c2 driving strategy: a continuous maneuver score suppresses c2
+# during large maneuvers and fades c0/c1 in, with asymmetric authority smoothing.
+FORD_MANEUVER_CURV_THRESH = 0.016
+FORD_MANEUVER_RATE_THRESH = 0.008
+FORD_MANEUVER_ERROR_THRESH = 0.010
+FORD_C2_AUTHORITY_DROP_TAU = 0.10
+FORD_C2_AUTHORITY_RECOVER_TAU = 2.0
+FORD_C2_CANCEL_GAIN = 1.0
+
 
 @dataclass(frozen=True)
 class C2MemoryStep:
   command: float
   memory: float
+
+
+@dataclass(frozen=True)
+class C2AuthorityStep:
+  maneuver_score: float
+  authority: float
+
+
+@dataclass(frozen=True)
+class FordLateralStep:
+  apply_curvature: float
+  path_offset: float
+  path_angle: float
+  c2_memory: float
+  c2_authority: float
+  maneuver_score: float
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -76,6 +101,93 @@ def _offset_from_path_angle(path_angle: float, d_c0: float, d_look: float) -> fl
 
 def _same_sign(a: float, b: float) -> bool:
   return a * b > 0.0
+
+
+def maneuver_score(desired_curvature: float, desired_curvature_last: float,
+                   current_curvature: float) -> float:
+  """Return a continuous 0..1 score from curvature magnitude, rate, and tracking error."""
+  desired_curvature = _finite(desired_curvature)
+  desired_curvature_last = _finite(desired_curvature_last)
+  current_curvature = _finite(current_curvature)
+
+  curv_mag = abs(desired_curvature) / FORD_MANEUVER_CURV_THRESH
+  curv_rate = abs(desired_curvature - desired_curvature_last) / FORD_MANEUVER_RATE_THRESH
+  curv_error = abs(desired_curvature - current_curvature) / FORD_MANEUVER_ERROR_THRESH
+  return _clip(max(curv_mag, curv_rate, curv_error), 0.0, 1.0)
+
+
+def c2_authority_step(maneuver_score_value: float, c2_authority_last: float,
+                      lat_active: bool) -> C2AuthorityStep:
+  """Smoothly map maneuver score to c2 authority with fast drop and slow recovery."""
+  if not lat_active:
+    return C2AuthorityStep(0.0, 1.0)
+
+  maneuver_score_value = _clip(_finite(maneuver_score_value), 0.0, 1.0)
+  c2_authority_last = _clip(_finite(c2_authority_last), 0.0, 1.0)
+  target_authority = 1.0 - maneuver_score_value
+
+  if target_authority < c2_authority_last:
+    tau = FORD_C2_AUTHORITY_DROP_TAU
+  else:
+    tau = FORD_C2_AUTHORITY_RECOVER_TAU
+
+  alpha = 1.0 - math.exp(-FORD_C2_DT / max(tau, 1e-3))
+  authority = alpha * target_authority + (1.0 - alpha) * c2_authority_last
+  return C2AuthorityStep(maneuver_score_value, _clip(authority, 0.0, 1.0))
+
+
+def cancel_c2_from_memory(c2_memory: float) -> float:
+  """Return the c2 cancellation term from stored c2 memory."""
+  return -FORD_C2_CANCEL_GAIN * _finite(c2_memory)
+
+
+def blend_lateral_commands(normal_c2: float, cancel_c2: float,
+                           normal_c0: float, normal_c1: float,
+                           maneuver_c0: float, maneuver_c1: float,
+                           c2_authority: float) -> tuple[float, float, float]:
+  """Blend normal c2 and residual c0/c1 with maneuver-path commands."""
+  c2_authority = _clip(_finite(c2_authority), 0.0, 1.0)
+  maneuver_weight = 1.0 - c2_authority
+
+  apply_curvature = c2_authority * _finite(normal_c2) + maneuver_weight * _finite(cancel_c2)
+  path_offset = c2_authority * _finite(normal_c0) + maneuver_weight * _finite(maneuver_c0)
+  path_angle = c2_authority * _finite(normal_c1) + maneuver_weight * _finite(maneuver_c1)
+  return (
+    _clip(apply_curvature, *FORD_PATH_C2_CAN_CLIP),
+    _clip(path_offset, *FORD_PATH_C0_CAN_CLIP),
+    _clip(path_angle, *FORD_PATH_C1_CAN_CLIP),
+  )
+
+
+def ford_lateral_step(model, desired_curvature: float, desired_curvature_last: float,
+                      current_curvature: float, v_ego: float, path_angle_last: float,
+                      c2_memory: float, c2_authority_last: float,
+                      lat_active: bool) -> FordLateralStep:
+  """Run one Ford CAN-FD lateral step with continuous c2 authority blending."""
+  if not lat_active:
+    return FordLateralStep(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+  score = maneuver_score(desired_curvature, desired_curvature_last, current_curvature)
+  authority_step = c2_authority_step(score, c2_authority_last, lat_active)
+  c2_step = c2_memory_step(desired_curvature, current_curvature, c2_memory, lat_active)
+
+  normal_path_offset, normal_path_angle = lightweight_path_from_model(
+    model, desired_curvature, current_curvature, v_ego, path_angle_last, lat_active, c2_step.memory
+  )
+  maneuver_path_offset, maneuver_path_angle = lightweight_path_from_model(
+    model, desired_curvature, current_curvature, v_ego, path_angle_last, lat_active, 0.0
+  )
+
+  apply_curvature, path_offset, path_angle = blend_lateral_commands(
+    c2_step.command, cancel_c2_from_memory(c2_step.memory),
+    normal_path_offset, normal_path_angle,
+    maneuver_path_offset, maneuver_path_angle,
+    authority_step.authority,
+  )
+  return FordLateralStep(
+    apply_curvature, path_offset, path_angle, c2_step.memory,
+    authority_step.authority, authority_step.maneuver_score,
+  )
 
 
 def c2_memory_step(desired_curvature: float, current_curvature: float, c2_memory: float,
