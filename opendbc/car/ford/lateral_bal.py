@@ -33,9 +33,7 @@ FORD_C2_HOLD_MARGIN = 0.0005
 FORD_C2_TARGET_DEADBAND = 0.0002
 FORD_C2_DT = 0.05  # LateralMotionControl2 runs at 20Hz.
 
-# openpilot actuators.curvature uses the opposite sign from the Ford LMC2
-# path/c2 convention used here (CAN TX applies a separate negation).
-FORD_PATH_DESIRED_CURVATURE_SIGN = -1.0
+# No-state-machine c2 driving strategy: a continuous maneuver score suppresses c2
 # during large maneuvers and fades c0/c1 in, with asymmetric authority smoothing.
 FORD_MANEUVER_CURV_THRESH = 0.016
 FORD_MANEUVER_RATE_THRESH = 0.008
