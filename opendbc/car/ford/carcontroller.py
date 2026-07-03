@@ -3,7 +3,7 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_bal import ford_lateral_step
+from opendbc.car.ford.lateral_bal import FORD_PATH_DESIRED_CURVATURE_SIGN, ford_lateral_step
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -110,6 +110,8 @@ class CarController(CarControllerBase):
       if CC.latActive:
         v_ego = CS.out.vEgoRaw
         desired_curvature = actuators.curvature
+        if self.CP.flags & FordFlags.CANFD:
+          desired_curvature *= FORD_PATH_DESIRED_CURVATURE_SIGN
 
         # Bronco and some other cars consistently overshoot curv requests.
         # Apply the same input shaping before either Ford lateral command path.
