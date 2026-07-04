@@ -292,16 +292,35 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   self._set_prev_desired_angle(curvature)
                   self._reset_curvature_measurement(curvature, speed)
 
-                  should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
+                  path_active = path_offset != 0 or path_angle != 0
+                  if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+                    should_tx = -0.5 <= path_angle <= 0.5235
+                    should_tx = should_tx and -5.12 <= path_offset <= 5.11
+                    should_tx = should_tx and curvature_rate == 0
+                    should_tx = should_tx and (not path_active or curvature == 0)
+                  else:
+                    should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
                   # when request bit is 0, only allow curvature of 0 since the signal range
                   # is not large enough to enforce it tracking measured
-                  should_tx = should_tx and (controls_allowed if steer_control_enabled else curvature == 0)
+                  should_tx = should_tx and (controls_allowed if steer_control_enabled else (curvature == 0 and not path_active))
                   should_tx = should_tx and abs(round(curvature * self.DEG_TO_CAN)) <= max_curvature_can
 
                   with self.subTest(controls_allowed=controls_allowed, steer_control_enabled=steer_control_enabled,
                                     path_offset=float(path_offset), path_angle=float(path_angle), curvature_rate=float(curvature_rate),
                                     curvature=float(curvature)):
                     self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(steer_control_enabled, path_offset, path_angle, curvature, curvature_rate)))
+
+  def test_canfd_path_fallback_requires_zero_c2(self):
+    if self.STEER_MESSAGE != MSG_LateralMotionControl2:
+      self.skipTest("CAN FD only")
+
+    self.safety.set_controls_allowed(True)
+    self._reset_curvature_measurement(0, 20.0)
+    self._set_prev_desired_angle(0.004)
+
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0.5, 0.1, 0.0, 0.0)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.5, 0.1, 0.001, 0.0)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.0, 0.0, 0.0, 0.001)))
 
   def test_curvature_rate_limits(self):
     """Curvature command must satisfy the ISO 11270 lateral jerk limit per frame."""
