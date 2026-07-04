@@ -3,7 +3,7 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_bal import c2_memory_step, lightweight_path_from_model
+from opendbc.car.ford.lateral_bal import ford_lateral_step
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -50,6 +50,10 @@ class CarController(CarControllerBase):
     self.path_angle_last = 0.0
     self.path_offset_last = 0.0
     self.c2_memory = 0.0
+    self.c2_authority = 1.0
+    self.desired_curvature_last = 0.0
+    self.maneuver_score_last = 0.0
+    self.maneuver_active = False
     self.model = None
     self.sm = None
     if messaging is not None and CP.flags & FordFlags.CANFD:
@@ -118,12 +122,19 @@ class CarController(CarControllerBase):
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
 
         if self.CP.flags & FordFlags.CANFD:
-          c2_step = c2_memory_step(desired_curvature, current_curvature, self.c2_memory, CC.latActive)
-          apply_curvature = c2_step.command
-          self.c2_memory = c2_step.memory
-          path_offset, path_angle = lightweight_path_from_model(
-            self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive, self.c2_memory
+          lateral_step = ford_lateral_step(
+            self.model, desired_curvature, self.desired_curvature_last, current_curvature,
+            v_ego, self.path_angle_last, self.c2_memory, self.c2_authority,
+            self.maneuver_score_last, self.maneuver_active, CC.latActive,
           )
+          apply_curvature = lateral_step.apply_curvature
+          path_offset = lateral_step.path_offset
+          path_angle = lateral_step.path_angle
+          self.c2_memory = lateral_step.c2_memory
+          self.c2_authority = lateral_step.c2_authority
+          self.maneuver_score_last = lateral_step.maneuver_score
+          self.maneuver_active = lateral_step.maneuver_active
+          self.desired_curvature_last = desired_curvature
           curvature_rate = 0.0
           ramp_type = 3
         else:
@@ -135,6 +146,10 @@ class CarController(CarControllerBase):
                                                                               0., CC.latActive, CarControllerParams.STEER_STEP)
       elif self.CP.flags & FordFlags.CANFD:
         self.c2_memory = 0.0
+        self.c2_authority = 1.0
+        self.desired_curvature_last = 0.0
+        self.maneuver_score_last = 0.0
+        self.maneuver_active = False
 
       self.path_angle_last = path_angle
       self.path_offset_last = path_offset
