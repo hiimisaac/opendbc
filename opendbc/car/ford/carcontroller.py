@@ -7,7 +7,7 @@ from opendbc.car.ford.lateral_bal import (
   c2_memory_decay_step,
   c2_memory_step,
   lightweight_path_from_model,
-  should_use_c0c1_path,
+  should_zero_c2_for_path,
 )
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
@@ -130,15 +130,14 @@ class CarController(CarControllerBase):
             desired_curvature_rate = (desired_curvature - self.desired_curvature_last) / (DT_CTRL * CarControllerParams.STEER_STEP)
           self.desired_curvature_initialized = True
 
-          use_c0c1_path = should_use_c0c1_path(desired_curvature, desired_curvature_rate, self.c2_memory, CC.latActive)
-          c2_step = c2_memory_decay_step(self.c2_memory, CC.latActive) if use_c0c1_path else \
+          zero_c2_for_path = should_zero_c2_for_path(desired_curvature, desired_curvature_rate, self.c2_memory, CC.latActive)
+          c2_step = c2_memory_decay_step(self.c2_memory, CC.latActive) if zero_c2_for_path else \
                     c2_memory_step(desired_curvature, current_curvature, self.c2_memory, CC.latActive)
           apply_curvature = c2_step.command
           self.c2_memory = c2_step.memory
-          if use_c0c1_path:
-            path_offset, path_angle = lightweight_path_from_model(
-              self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive, self.c2_memory
-            )
+          path_offset, path_angle = lightweight_path_from_model(
+            self.model, desired_curvature, current_curvature, v_ego, self.path_angle_last, CC.latActive, self.c2_memory
+          )
           curvature_rate = 0.0
           ramp_type = 3
         else:
