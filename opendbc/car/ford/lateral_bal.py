@@ -33,6 +33,10 @@ FORD_C2_HOLD_MARGIN = 0.0005
 FORD_C2_TARGET_DEADBAND = 0.0002
 FORD_C2_DT = 0.05  # LateralMotionControl2 runs at 20Hz.
 
+FORD_C2_PATH_CURVATURE_THRESHOLD = 0.0040
+FORD_C2_PATH_CURVATURE_RATE_THRESHOLD = 0.020
+FORD_C2_PATH_MEMORY_OVERSHOOT = 0.0007
+
 
 @dataclass(frozen=True)
 class C2MemoryStep:
@@ -78,6 +82,33 @@ def _same_sign(a: float, b: float) -> bool:
   return a * b > 0.0
 
 
+def should_use_c0c1_path(desired_curvature: float, desired_curvature_rate: float,
+                         c2_memory: float, lat_active: bool) -> bool:
+  """Transiently move authority from c2 to c0/c1 when c2 is likely to lag."""
+  if not lat_active:
+    return False
+
+  desired_curvature = _finite(desired_curvature)
+  desired_curvature_rate = _finite(desired_curvature_rate)
+  c2_memory = _finite(c2_memory)
+
+  large_curvature = abs(desired_curvature) >= FORD_C2_PATH_CURVATURE_THRESHOLD
+  rapid_curvature_change = abs(desired_curvature_rate) >= FORD_C2_PATH_CURVATURE_RATE_THRESHOLD
+  c2_overshot_target = abs(c2_memory) > abs(desired_curvature) + FORD_C2_PATH_MEMORY_OVERSHOOT
+  c2_wrong_direction = _same_sign(c2_memory, -desired_curvature) and abs(c2_memory) > FORD_C2_PATH_MEMORY_OVERSHOOT
+
+  return large_curvature or rapid_curvature_change or c2_overshot_target or c2_wrong_direction
+
+
+def c2_memory_decay_step(c2_memory: float, lat_active: bool) -> C2MemoryStep:
+  if not lat_active:
+    return C2MemoryStep(0.0, 0.0)
+
+  c2_memory = _finite(c2_memory)
+  decay = math.exp(-FORD_C2_DT / FORD_C2_MEMORY_DECAY_TAU)
+  return C2MemoryStep(0.0, _clip(c2_memory * decay, -FORD_C2_MEMORY_LIMIT, FORD_C2_MEMORY_LIMIT))
+
+
 def c2_memory_step(desired_curvature: float, current_curvature: float, c2_memory: float,
                    lat_active: bool) -> C2MemoryStep:
   """Return the next c2 pump command and estimated stored c2 curvature.
@@ -95,8 +126,7 @@ def c2_memory_step(desired_curvature: float, current_curvature: float, c2_memory
   current_curvature = _finite(current_curvature)
   c2_memory = _finite(c2_memory)
 
-  decay = math.exp(-FORD_C2_DT / FORD_C2_MEMORY_DECAY_TAU)
-  decayed_memory = c2_memory * decay
+  decayed_memory = c2_memory_decay_step(c2_memory, lat_active).memory
   target = _clip(desired_curvature, -FORD_C2_MEMORY_LIMIT, FORD_C2_MEMORY_LIMIT)
 
   holding_past_target = abs(current_curvature) > abs(target) + FORD_C2_HOLD_MARGIN and \

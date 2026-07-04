@@ -3,9 +3,11 @@ from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_bal import (
   FORD_C2_MEMORY_STACK_GAIN,
+  c2_memory_decay_step,
   c2_memory_step,
   lightweight_path_from_curvature,
   lightweight_path_from_model,
+  should_use_c0c1_path,
 )
 
 
@@ -128,3 +130,31 @@ def test_c2_memory_step_resets_inactive():
 
   assert math.isclose(step.command, 0.0)
   assert math.isclose(step.memory, 0.0)
+
+
+def test_c2_memory_decay_step_zeroes_command_and_decays_memory():
+  step = c2_memory_decay_step(0.004, True)
+
+  assert math.isclose(step.command, 0.0)
+  assert 0.0 < step.memory < 0.004
+
+
+def test_should_use_c0c1_path_leaves_small_steady_curvature_on_c2():
+  assert not should_use_c0c1_path(0.002, 0.0, 0.0, True)
+
+
+def test_should_use_c0c1_path_for_large_curvature():
+  assert should_use_c0c1_path(0.0041, 0.0, 0.0, True)
+
+
+def test_should_use_c0c1_path_for_rapid_curvature_change():
+  assert should_use_c0c1_path(0.001, 0.021, 0.0, True)
+
+
+def test_should_use_c0c1_path_while_c2_memory_unwinds():
+  assert should_use_c0c1_path(0.001, 0.0, 0.003, True)
+  assert should_use_c0c1_path(-0.002, 0.0, 0.002, True)
+
+
+def test_should_use_c0c1_path_resets_inactive():
+  assert not should_use_c0c1_path(0.01, 1.0, 0.01, False)
