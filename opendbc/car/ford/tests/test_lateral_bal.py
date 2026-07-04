@@ -7,7 +7,7 @@ from opendbc.car.ford.lateral_bal import (
   c2_memory_step,
   lightweight_path_from_curvature,
   lightweight_path_from_model,
-  should_use_c0c1_path,
+  should_zero_c2_for_path,
 )
 
 
@@ -139,22 +139,35 @@ def test_c2_memory_decay_step_zeroes_command_and_decays_memory():
   assert 0.0 < step.memory < 0.004
 
 
-def test_should_use_c0c1_path_leaves_small_steady_curvature_on_c2():
-  assert not should_use_c0c1_path(0.002, 0.0, 0.0, True)
+def test_should_zero_c2_for_path_leaves_small_steady_curvature_on_c2():
+  assert not should_zero_c2_for_path(0.002, 0.0, 0.0, True)
 
 
-def test_should_use_c0c1_path_for_large_curvature():
-  assert should_use_c0c1_path(0.0041, 0.0, 0.0, True)
+def test_small_steady_curvature_still_uses_model_path():
+  model = SimpleNamespace(
+    position=SimpleNamespace(x=[0.0, 10.0, 20.0], y=[0.0, 0.1, 0.2]),
+    orientation=SimpleNamespace(z=[0.0, 0.01, 0.02]),
+  )
+
+  assert not should_zero_c2_for_path(0.002, 0.0, 0.0, True)
+  path_offset, path_angle = lightweight_path_from_model(model, 0.002, 0.002, 20.0, 0.0, True, c2_memory=0.0)
+
+  assert path_offset > 0.0
+  assert path_angle > 0.0
 
 
-def test_should_use_c0c1_path_for_rapid_curvature_change():
-  assert should_use_c0c1_path(0.001, 0.021, 0.0, True)
+def test_should_zero_c2_for_path_for_large_curvature():
+  assert should_zero_c2_for_path(0.0041, 0.0, 0.0, True)
 
 
-def test_should_use_c0c1_path_while_c2_memory_unwinds():
-  assert should_use_c0c1_path(0.001, 0.0, 0.003, True)
-  assert should_use_c0c1_path(-0.002, 0.0, 0.002, True)
+def test_should_zero_c2_for_path_for_rapid_curvature_change():
+  assert should_zero_c2_for_path(0.001, 0.021, 0.0, True)
 
 
-def test_should_use_c0c1_path_resets_inactive():
-  assert not should_use_c0c1_path(0.01, 1.0, 0.01, False)
+def test_should_zero_c2_for_path_while_c2_memory_unwinds():
+  assert should_zero_c2_for_path(0.001, 0.0, 0.003, True)
+  assert should_zero_c2_for_path(-0.002, 0.0, 0.002, True)
+
+
+def test_should_zero_c2_for_path_resets_inactive():
+  assert not should_zero_c2_for_path(0.01, 1.0, 0.01, False)

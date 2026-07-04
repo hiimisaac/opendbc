@@ -82,9 +82,9 @@ def _same_sign(a: float, b: float) -> bool:
   return a * b > 0.0
 
 
-def should_use_c0c1_path(desired_curvature: float, desired_curvature_rate: float,
-                         c2_memory: float, lat_active: bool) -> bool:
-  """Transiently move authority from c2 to c0/c1 when c2 is likely to lag."""
+def should_zero_c2_for_path(desired_curvature: float, desired_curvature_rate: float,
+                            c2_memory: float, lat_active: bool) -> bool:
+  """Transiently stop pumping c2 when the path residual should carry the maneuver."""
   if not lat_active:
     return False
 
