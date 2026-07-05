@@ -131,7 +131,7 @@ class CarController(CarControllerBase):
         self.desired_curvature_initialized = CC.latActive
         self.desired_curvature_last = desired_curvature if CC.latActive else 0.0
 
-        use_path_fallback = should_use_path_fallback(desired_curvature, desired_curvature_rate, self.c2_memory, CC.latActive)
+        use_path_fallback = should_use_path_fallback(desired_curvature, desired_curvature_rate, CC.latActive)
         if use_path_fallback:
           c2_step = c2_memory_decay_step(self.c2_memory, CC.latActive)
           apply_curvature = c2_step.command
