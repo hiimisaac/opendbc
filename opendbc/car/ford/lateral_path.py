@@ -35,9 +35,13 @@ FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
 FORD_PATH_RESIDUAL_SPEED_BP = (2.0, 5.0)  # m/s, fade measured-curvature residual in
 FORD_PATH_C1_DEADZONE = 0.0005       # 1/m, yaw-noise floor on the c1 curvature error
-FORD_PATH_TRIM_KI = 0.2       # 1/s, integral trim rate toward (desired - measured)
-FORD_PATH_TRIM_CLIP = 0.004   # 1/m, bounds bias + crown correction
-FORD_PATH_TRIM_MAX_CURVATURE = 0.01  # 1/m, don't learn trim mid-turn
+# Trim is a bias estimator, not a transient chaser: it learns only near-straight
+# with a tens-of-seconds time constant. A hot trim charges on turn-entry lag and
+# discharges as a pull on the next straight (observed on the first drive).
+FORD_PATH_TRIM_KI = 0.05      # 1/s, integral trim rate toward (desired - measured)
+FORD_PATH_TRIM_CLIP = 0.0015  # 1/m, measured DC bias is ~0.0003-0.001
+FORD_PATH_TRIM_ERR_CLIP = 0.002      # 1/m, bounds the learning step
+FORD_PATH_TRIM_MAX_CURVATURE = 0.0015  # 1/m, learn on straights only
 FORD_PATH_TRIM_MIN_SPEED = 5.0       # m/s
 FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
 
@@ -110,7 +114,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   c2_railed = c2 != c2_raw
   if v_ego > FORD_PATH_TRIM_MIN_SPEED and not steering_pressed and not c2_railed and \
      abs(desired_curvature) < FORD_PATH_TRIM_MAX_CURVATURE:
-    trim = _clip(trim + FORD_PATH_TRIM_KI * (desired_curvature - k_meas_filt) * FORD_PATH_DT,
+    trim_err = _clip(desired_curvature - k_meas_filt, -FORD_PATH_TRIM_ERR_CLIP, FORD_PATH_TRIM_ERR_CLIP)
+    trim = _clip(trim + FORD_PATH_TRIM_KI * trim_err * FORD_PATH_DT,
                  -FORD_PATH_TRIM_CLIP, FORD_PATH_TRIM_CLIP)
 
   # c0/c1: model path geometry minus the arc already being delivered. The

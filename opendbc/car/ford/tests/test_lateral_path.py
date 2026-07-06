@@ -8,6 +8,7 @@ from opendbc.car.ford.lateral_path import (
   FORD_PATH_DT,
   FORD_PATH_K_MEAS_TAU,
   FORD_PATH_TRIM_CLIP,
+  FORD_PATH_TRIM_ERR_CLIP,
   FORD_PATH_TRIM_KI,
   lateral_path_command,
 )
@@ -21,13 +22,13 @@ def arc_model(curvature, xs=(0.0, 7.0, 20.0)):
 
 
 def test_inactive_zeros_command_and_preserves_trim():
-  cmd = lateral_path_command(None, 0.01, 0.002, 20.0, 0.005, 0.003, False, False)
+  cmd = lateral_path_command(None, 0.01, 0.002, 20.0, 0.005, 0.001, False, False)
 
   assert cmd.curvature == 0.0
   assert cmd.path_angle == 0.0
   assert cmd.path_offset == 0.0
   assert cmd.k_meas_filt == 0.002
-  assert cmd.trim == 0.003
+  assert cmd.trim == 0.001
 
 
 def test_steady_state_arc_idles_c0_c1():
@@ -92,7 +93,7 @@ def test_trim_frozen_when_pressed_slow_or_turning():
   frozen_cases = [
     dict(desired=0.001, v_ego=20.0, pressed=True),
     dict(desired=0.001, v_ego=3.0, pressed=False),
-    dict(desired=0.02, v_ego=20.0, pressed=False),
+    dict(desired=0.005, v_ego=20.0, pressed=False),  # a normal curve: never learn mid-turn
   ]
   for case in frozen_cases:
     cmd = lateral_path_command(arc_model(case["desired"]), case["desired"], 0.0,
@@ -101,16 +102,22 @@ def test_trim_frozen_when_pressed_slow_or_turning():
 
 
 def test_trim_frozen_when_c2_railed():
-  cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 20.0, 0.0, 0.004, True, False)
+  cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 20.0, 0.0, 0.001, True, False)
 
   assert cmd.curvature == FORD_PATH_C2_CAN_CLIP[1]
-  assert cmd.trim == 0.004
+  assert cmd.trim == 0.001
 
 
 def test_trim_clipped():
   cmd = lateral_path_command(None, 0.005, 0.005, 20.0, 0.005, 1.0, True, False)
 
   assert cmd.trim <= FORD_PATH_TRIM_CLIP
+
+
+def test_trim_learning_step_is_bounded():
+  cmd = lateral_path_command(None, 0.001, -0.02, 20.0, -0.02, 0.0, True, False)
+
+  assert math.isclose(cmd.trim, FORD_PATH_TRIM_KI * FORD_PATH_TRIM_ERR_CLIP * FORD_PATH_DT)
 
 
 def test_k_meas_filter_tracks_measurement():
