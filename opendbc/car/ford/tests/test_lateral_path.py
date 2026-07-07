@@ -59,10 +59,25 @@ def test_c2_rails_and_c1_carries_remainder():
   assert math.isclose(cmd.path_angle, (k - k_held - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
-def test_c1_clips_to_can_range():
+def test_governor_paces_c1_ask():
+  # at cruise the ask beyond measured curvature is bounded, not railed to CAN max
   cmd = lateral_path_command(None, 0.06, 0.0, 20.0, 0.0, 0.0, True, False)
 
-  assert cmd.path_angle == FORD_PATH_C1_CAN_CLIP[1]
+  assert math.isclose(cmd.path_angle, 0.015 * 20.0)
+  assert cmd.path_angle < FORD_PATH_C1_CAN_CLIP[1]
+
+
+def test_governor_paces_c2_to_measured():
+  cmd = lateral_path_command(arc_model(0.019), 0.019, 0.0, 20.0, 0.0, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature, 0.015)
+
+
+def test_governor_window_follows_measured_curvature():
+  # once the truck is turning, the same ask passes through
+  cmd = lateral_path_command(arc_model(0.019), 0.019, 0.018, 20.0, 0.018, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature, 0.019)
 
 
 def test_fallback_path_without_model():
@@ -104,7 +119,7 @@ def test_trim_frozen_when_pressed_slow_or_turning():
 def test_trim_frozen_when_c2_railed():
   cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 20.0, 0.0, 0.001, True, False)
 
-  assert cmd.curvature == FORD_PATH_C2_CAN_CLIP[1]
+  assert math.isclose(cmd.curvature, 0.015)  # CAN-railed for trim freeze, then governor-paced
   assert cmd.trim == 0.001
 
 

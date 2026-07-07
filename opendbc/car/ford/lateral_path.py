@@ -31,6 +31,13 @@ FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 
+# Command governor: never ask the PSCM for more curvature than it is currently
+# delivering plus this budget. A sustained ask-vs-achieved gap (railed commands
+# through a tight turn) winds up the PSCM's internal torque integrator, which
+# discharges as a pull for seconds afterward.
+FORD_PATH_GOV_SPEED_BP = (5.0, 15.0)
+FORD_PATH_GOV_ERROR = (0.05, 0.015)  # 1/m, max ask beyond measured curvature
+
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
 FORD_PATH_RESIDUAL_SPEED_BP = (2.0, 5.0)  # m/s, fade measured-curvature residual in
@@ -131,11 +138,17 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     path_offset_raw = 0.5 * desired_curvature * d_c0 * d_c0
 
   k_residual = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0))
+  gov = _interp(v_ego, FORD_PATH_GOV_SPEED_BP, FORD_PATH_GOV_ERROR)
 
   c1_error = path_angle_raw / d_look - k_residual
   c1_error = math.copysign(max(abs(c1_error) - FORD_PATH_C1_DEADZONE, 0.0), c1_error)
+  c1_error = _clip(c1_error, -gov, gov)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
-  path_offset = _clip(path_offset_raw - 0.5 * k_residual * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
+  offset_residual = _clip(path_offset_raw - 0.5 * k_residual * d_c0 * d_c0, -gov * d_c0 * d_c0, gov * d_c0 * d_c0)
+  path_offset = _clip(offset_residual, *FORD_PATH_C0_CAN_CLIP)
+
+  if v_ego > FORD_PATH_TRIM_MIN_SPEED:
+    c2 = _clip(c2, k_meas_filt - gov, k_meas_filt + gov)
 
   # Don't command a path against the driver's hands: the PSCM integrates the
   # torque fight and discharges it as a pull for seconds after release.
