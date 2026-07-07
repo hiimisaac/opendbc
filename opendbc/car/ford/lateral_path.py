@@ -137,4 +137,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
   path_offset = _clip(path_offset_raw - 0.5 * k_residual * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
 
+  # Don't command a path against the driver's hands: the PSCM integrates the
+  # torque fight and discharges it as a pull for seconds after release.
+  if steering_pressed:
+    path_angle = 0.0
+    path_offset = 0.0
+
   return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt, trim)
