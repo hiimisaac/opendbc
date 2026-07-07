@@ -49,14 +49,28 @@ def test_transient_residual_covers_undelivered_curvature():
   assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
 
 
-def test_c2_rails_and_c1_carries_remainder():
+def test_c2_fades_out_of_maneuvers_and_c1_carries():
   k = 0.06
-  k_held = 0.02  # PSCM already delivering its c2 max
+  k_held = 0.02
   cmd = lateral_path_command(arc_model(k), k, k_held, 5.0, k_held, 0.0, True, False)
 
-  assert cmd.curvature == FORD_PATH_C2_CAN_CLIP[1]
-  # d_look floors at 7m; residual heading past the held arc stays on c1
+  assert cmd.curvature == 0.0  # maneuver curvature: c2 confined to cruise duty
+  # d_look floors at 7m; heading past the held arc stays on c1
   assert math.isclose(cmd.path_angle, (k - k_held - FORD_PATH_C1_DEADZONE) * 7.0)
+
+
+def test_c2_full_strength_on_gentle_curvature():
+  k = 0.002
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature, k)
+
+
+def test_c2_fade_is_continuous():
+  k = 0.0045  # midpoint of the fade band
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature, k * 0.5)
 
 
 def test_c1_clips_to_can_range():
@@ -104,7 +118,7 @@ def test_trim_frozen_when_pressed_slow_or_turning():
 def test_trim_frozen_when_c2_railed():
   cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 20.0, 0.0, 0.001, True, False)
 
-  assert cmd.curvature == FORD_PATH_C2_CAN_CLIP[1]
+  assert cmd.curvature == 0.0  # faded out of the maneuver entirely
   assert cmd.trim == 0.001
 
 

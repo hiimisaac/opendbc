@@ -31,6 +31,12 @@ FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 
+# Large sustained c2 charges a slow-unwinding state in the PSCM that discharges
+# as a pull after the maneuver (observed after every large-c2 turn; absent in
+# c2=0 maneuver eras). Confine c2 to cruise/centering duty: full strength on
+# gentle curvature, faded to zero in real maneuvers, which c1/c0 carry entirely.
+FORD_PATH_C2_FADE_BP = (0.003, 0.006)  # 1/m of desired curvature
+
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
 FORD_PATH_RESIDUAL_SPEED_BP = (2.0, 5.0)  # m/s, fade measured-curvature residual in
@@ -117,6 +123,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     trim_err = _clip(desired_curvature - k_meas_filt, -FORD_PATH_TRIM_ERR_CLIP, FORD_PATH_TRIM_ERR_CLIP)
     trim = _clip(trim + FORD_PATH_TRIM_KI * trim_err * FORD_PATH_DT,
                  -FORD_PATH_TRIM_CLIP, FORD_PATH_TRIM_CLIP)
+
+  c2 *= _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
 
   # c0/c1: model path geometry minus the arc already being delivered. The
   # measured-curvature residual fades out at low speed, where yaw/v is garbage
