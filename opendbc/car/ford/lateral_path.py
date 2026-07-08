@@ -40,11 +40,11 @@ FORD_PATH_C2_FADE_BP = (0.003, 0.006)  # 1/m of desired curvature
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
 FORD_PATH_RESIDUAL_SPEED_BP = (2.0, 5.0)  # m/s, fade measured-curvature residual in
-FORD_PATH_C1_DEADZONE = 0.0005       # 1/m, yaw-noise floor on the c1 curvature error
+FORD_PATH_C1_DEADZONE = 0.0003       # 1/m, filtered yaw-noise floor on the c1 curvature error
 # Trim is a bias estimator, not a transient chaser: it learns only near-straight
 # with a tens-of-seconds time constant. A hot trim charges on turn-entry lag and
 # discharges as a pull on the next straight (observed on the first drive).
-FORD_PATH_TRIM_KI = 0.05      # 1/s, integral trim rate toward (desired - measured)
+FORD_PATH_TRIM_KI = 0.1       # 1/s, integral trim rate toward (desired - measured)
 FORD_PATH_TRIM_CLIP = 0.0015  # 1/m, measured DC bias is ~0.0003-0.001
 FORD_PATH_TRIM_ERR_CLIP = 0.002      # 1/m, bounds the learning step
 FORD_PATH_TRIM_MAX_CURVATURE = 0.0015  # 1/m, learn on straights only
