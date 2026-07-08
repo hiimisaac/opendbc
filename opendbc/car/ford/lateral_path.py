@@ -41,6 +41,10 @@ FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
 FORD_PATH_RESIDUAL_SPEED_BP = (2.0, 5.0)  # m/s, fade measured-curvature residual in
 FORD_PATH_C1_DEADZONE = 0.0003       # 1/m, filtered yaw-noise floor on the c1 curvature error
+# At full c2 share, c1's only job is covering real transients: widen its deadzone
+# so it does not transmit model plan wiggle the slow c2 channel would filter.
+# (measured: straight-road weave amplification 1.85 with c1 active vs 1.30 silent)
+FORD_PATH_C1_CRUISE_DEADZONE = 0.0007  # 1/m, added at full c2 share
 # Trim is a bias estimator, not a transient chaser: it learns only near-straight
 # with a tens-of-seconds time constant. A hot trim charges on turn-entry lag and
 # discharges as a pull on the next straight (observed on the first drive).
@@ -145,7 +149,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   k_residual = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0)) * c2_share
 
   c1_error = path_angle_raw / d_look - k_residual
-  c1_error = math.copysign(max(abs(c1_error) - FORD_PATH_C1_DEADZONE, 0.0), c1_error)
+  c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
+  c1_error = math.copysign(max(abs(c1_error) - c1_deadzone, 0.0), c1_error)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
   path_offset = _clip(path_offset_raw - 0.5 * k_residual * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
 

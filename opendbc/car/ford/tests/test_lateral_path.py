@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C1_CAN_CLIP,
+  FORD_PATH_C1_CRUISE_DEADZONE,
   FORD_PATH_C1_DEADZONE,
   FORD_PATH_C2_CAN_CLIP,
   FORD_PATH_DT,
@@ -45,7 +46,7 @@ def test_transient_residual_covers_undelivered_curvature():
   k = 0.003
   cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, 0.0, True, False)
 
-  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 20.0)
+  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
   assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
 
 
@@ -74,7 +75,7 @@ def test_mid_fade_splits_arc_between_c2_and_c1():
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
 
   assert math.isclose(cmd.curvature, k * 0.5)
-  assert math.isclose(cmd.path_angle, (k * 0.5 - FORD_PATH_C1_DEADZONE) * 20.0)
+  assert math.isclose(cmd.path_angle, (k * 0.5 - FORD_PATH_C1_DEADZONE - 0.5 * FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
 
 
 def test_c2_full_strength_on_gentle_curvature():
@@ -101,7 +102,7 @@ def test_fallback_path_without_model():
   k = 0.002
   cmd = lateral_path_command(None, k, 0.0, 20.0, 0.0, 0.0, True, False)
 
-  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 20.0)
+  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
   assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
 
 
