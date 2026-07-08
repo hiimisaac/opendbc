@@ -63,7 +63,7 @@ def test_c2_fades_out_of_maneuvers_and_c1_carries():
 def test_c1_holds_arc_mid_maneuver():
   # car already at the turn's curvature with c2 faded out: c1 must NOT collapse,
   # or the polynomial reads "straight" and the turn unwinds early
-  k = 0.01
+  k = 0.02
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
 
   assert cmd.curvature == 0.0
@@ -71,7 +71,7 @@ def test_c1_holds_arc_mid_maneuver():
 
 
 def test_mid_fade_splits_arc_between_c2_and_c1():
-  k = 0.0045  # fade midpoint: c2 carries half, c1 sustains the other half
+  k = 0.009  # fade midpoint: c2 carries half, c1 sustains the other half
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
 
   assert math.isclose(cmd.curvature, k * 0.5)
@@ -86,7 +86,7 @@ def test_c2_full_strength_on_gentle_curvature():
 
 
 def test_c2_fade_is_continuous():
-  k = 0.0045  # midpoint of the fade band
+  k = 0.009  # midpoint of the fade band
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
 
   assert math.isclose(cmd.curvature, k * 0.5)
@@ -108,11 +108,11 @@ def test_fallback_path_without_model():
 
 def test_low_speed_ignores_yaw_curvature():
   # yaw/v curvature is garbage at crawl speed: filter frozen, residual faded out
-  cmd = lateral_path_command(None, 0.01, 0.5, 0.5, 0.0, 0.0, True, False)
+  cmd = lateral_path_command(None, 0.02, 0.5, 0.5, 0.0, 0.0, True, False)
 
   assert cmd.k_meas_filt == 0.0
-  assert math.isclose(cmd.path_angle, (0.01 - FORD_PATH_C1_DEADZONE) * 7.0)
-  assert math.isclose(cmd.path_offset, 0.5 * 0.01 * 7.0 * 7.0)
+  assert math.isclose(cmd.path_angle, (0.02 - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_offset, 0.5 * 0.02 * 7.0 * 7.0)
 
 
 def test_trim_integrates_persistent_error():
