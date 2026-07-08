@@ -55,8 +55,26 @@ def test_c2_fades_out_of_maneuvers_and_c1_carries():
   cmd = lateral_path_command(arc_model(k), k, k_held, 5.0, k_held, 0.0, True, False)
 
   assert cmd.curvature == 0.0  # maneuver curvature: c2 confined to cruise duty
-  # d_look floors at 7m; heading past the held arc stays on c1
-  assert math.isclose(cmd.path_angle, (k - k_held - FORD_PATH_C1_DEADZONE) * 7.0)
+  # c2 carries nothing, so c1 holds the full arc heading (no delivered-curvature subtraction)
+  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 7.0)
+
+
+def test_c1_holds_arc_mid_maneuver():
+  # car already at the turn's curvature with c2 faded out: c1 must NOT collapse,
+  # or the polynomial reads "straight" and the turn unwinds early
+  k = 0.01
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
+
+  assert cmd.curvature == 0.0
+  assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 20.0)
+
+
+def test_mid_fade_splits_arc_between_c2_and_c1():
+  k = 0.0045  # fade midpoint: c2 carries half, c1 sustains the other half
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature, k * 0.5)
+  assert math.isclose(cmd.path_angle, (k * 0.5 - FORD_PATH_C1_DEADZONE) * 20.0)
 
 
 def test_c2_full_strength_on_gentle_curvature():

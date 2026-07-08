@@ -124,7 +124,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     trim = _clip(trim + FORD_PATH_TRIM_KI * trim_err * FORD_PATH_DT,
                  -FORD_PATH_TRIM_CLIP, FORD_PATH_TRIM_CLIP)
 
-  c2 *= _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
+  c2_share = _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
+  c2 *= c2_share
 
   # c0/c1: model path geometry minus the arc already being delivered. The
   # measured-curvature residual fades out at low speed, where yaw/v is garbage
@@ -138,7 +139,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     path_angle_raw = desired_curvature * d_look
     path_offset_raw = 0.5 * desired_curvature * d_c0 * d_c0
 
-  k_residual = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0))
+  # Subtract delivered curvature only in proportion to the share c2 carries:
+  # when c2 is faded out of a maneuver, c1 must hold the arc as an absolute
+  # chase heading, or the polynomial reads "straight" mid-turn and unwinds early.
+  k_residual = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0)) * c2_share
 
   c1_error = path_angle_raw / d_look - k_residual
   c1_error = math.copysign(max(abs(c1_error) - FORD_PATH_C1_DEADZONE, 0.0), c1_error)
