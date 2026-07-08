@@ -35,7 +35,10 @@ FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 # as a pull after the maneuver (observed after every large-c2 turn; absent in
 # c2=0 maneuver eras). Confine c2 to cruise/centering duty: full strength on
 # gentle curvature, faded to zero in real maneuvers, which c1/c0 carry entirely.
-FORD_PATH_C2_FADE_BP = (0.003, 0.006)  # 1/m of desired curvature
+# Band placement bisects the charging threshold: 0.003 was proven safe but
+# under-delivered 0.6 m/s^2 in moderate curve tails (lane excursion); 0.02
+# sustained provably charges. This tests <=0.006 at full strength.
+FORD_PATH_C2_FADE_BP = (0.006, 0.012)  # 1/m of desired curvature
 
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
