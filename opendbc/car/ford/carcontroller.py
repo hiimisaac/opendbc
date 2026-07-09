@@ -48,7 +48,6 @@ class CarController(CarControllerBase):
     self.apply_curvature_last = 0
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
-    self.c2_trim = 0.0
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -119,10 +118,9 @@ class CarController(CarControllerBase):
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
         cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
-                                   self.k_meas_filt, self.c2_trim, CC.latActive, CS.out.steeringPressed,
+                                   self.k_meas_filt, CC.latActive, CS.out.steeringPressed,
                                    c2_last=self.apply_curvature_last)
         self.k_meas_filt = cmd.k_meas_filt
-        self.c2_trim = cmd.trim
         apply_curvature = cmd.curvature
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
