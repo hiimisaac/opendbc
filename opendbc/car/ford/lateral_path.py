@@ -162,7 +162,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
   c1_error = math.copysign(max(abs(c1_error) - c1_deadzone, 0.0), c1_error)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
-  path_offset = _clip(path_offset_raw - 0.5 * k_residual * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
+  # c0 is maneuver-only: at full c2 share it dithers centimeter position commands
+  # into the PSCM's offset servo (measured standing left-pull); gated by share it
+  # is exactly zero on straights and full authority where turns need it.
+  path_offset = _clip((path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * (1.0 - c2_share), *FORD_PATH_C0_CAN_CLIP)
 
   # Don't command a path against the driver's hands: the PSCM integrates the
   # torque fight and discharges it as a jump the moment they release. Zero the

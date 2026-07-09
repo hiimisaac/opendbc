@@ -125,9 +125,7 @@ class CarController(CarControllerBase):
         self.c2_trim = cmd.trim
         apply_curvature = cmd.curvature
         path_angle = cmd.path_angle
-        # c0 disabled: c2-only in mode 2 proved glassy while composed pulled,
-        # and c0 (never deadzoned) was the only path channel live on straights.
-        path_offset = 0.0
+        path_offset = cmd.path_offset
         curvature_rate = 0.0
         ramp_type = 3
       elif CC.latActive:

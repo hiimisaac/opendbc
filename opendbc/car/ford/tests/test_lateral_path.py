@@ -47,7 +47,7 @@ def test_transient_residual_covers_undelivered_curvature():
   cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, 0.0, True, False)
 
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
-  assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
+  assert cmd.path_offset == 0.0  # c0 is maneuver-only
 
 
 def test_c2_fades_out_of_maneuvers_and_c1_carries():
@@ -58,6 +58,7 @@ def test_c2_fades_out_of_maneuvers_and_c1_carries():
   assert cmd.curvature == 0.0  # maneuver curvature: c2 confined to cruise duty
   # c2 carries nothing, so c1 holds the full arc heading (no delivered-curvature subtraction)
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)  # full c0 authority in maneuvers
 
 
 def test_c1_holds_arc_mid_maneuver():
@@ -103,7 +104,7 @@ def test_fallback_path_without_model():
   cmd = lateral_path_command(None, k, 0.0, 20.0, 0.0, 0.0, True, False)
 
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
-  assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
+  assert cmd.path_offset == 0.0  # c0 is maneuver-only
 
 
 def test_low_speed_ignores_yaw_curvature():
