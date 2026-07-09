@@ -39,6 +39,10 @@ FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 # under-delivered 0.6 m/s^2 in moderate curve tails (lane excursion); 0.02
 # sustained provably charges. This tests <=0.006 at full strength.
 FORD_PATH_C2_FADE_BP = (0.006, 0.012)  # 1/m of desired curvature
+# Stock's wire c2 is heavily rate-limited (p99 step ~1.6e-4/frame); ours carried
+# share-transition and engage steps up to 1.3e-3/frame, which read as wheel
+# busyness (measured 1.8x stock steering-wheel micro-activity on straights).
+FORD_PATH_C2_SLEW = 0.0002    # 1/m per 20Hz frame
 
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
@@ -100,7 +104,7 @@ def _valid_model_path(model) -> bool:
 
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, trim: float, lat_active: bool,
-                         steering_pressed: bool) -> LateralPathCommand:
+                         steering_pressed: bool, c2_last: float | None = None) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is the
@@ -133,6 +137,9 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   c2_share = _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
   c2 *= c2_share
+  if c2_last is not None:
+    c2_last = _finite(c2_last)
+    c2 = _clip(c2, c2_last - FORD_PATH_C2_SLEW, c2_last + FORD_PATH_C2_SLEW)
 
   # c0/c1: model path geometry minus the arc already being delivered. The
   # measured-curvature residual fades out at low speed, where yaw/v is garbage
