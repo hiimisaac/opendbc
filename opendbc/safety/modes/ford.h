@@ -90,6 +90,8 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
 #define FORD_MIN_PATH_ANGLE -1000  // -0.5 rad
 #define FORD_MAX_PATH_OFFSET 511   // 5.11 m
 #define FORD_MIN_PATH_OFFSET -512  // -5.12 m
+#define FORD_MAX_CURVATURE_RATE 1023   // 0.001023 1/m^2
+#define FORD_MIN_CURVATURE_RATE -1024  // -0.001024 1/m^2
 
 static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
   .max_curvature = 1000,              // 0.02 rad/m * curvature_to_can
@@ -266,16 +268,16 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
     int desired_curvature_rate = raw_curvature_rate - FORD_CANFD_INACTIVE_CURVATURE_RATE;
 
-    // CAN FD lightweight path steering uses mode 2 with bounded c0/c1, plus
-    // c2 as a memory-bearing curvature pump. c3 remains inactive.
+    // CAN FD composed path steering uses mode 2 with bounded c0/c1/c2, plus
+    // c3 clothoid feedforward within its CAN range.
     violation |= (lat_ctl_mode != 0U) && !steer_control_enabled;
     violation |= safety_max_limit_check(desired_path_angle, FORD_MAX_PATH_ANGLE, FORD_MIN_PATH_ANGLE);
     violation |= safety_max_limit_check(desired_path_offset, FORD_MAX_PATH_OFFSET, FORD_MIN_PATH_OFFSET);
     violation |= safety_max_limit_check(desired_curvature, FORD_STEERING_LIMITS.max_curvature, -FORD_STEERING_LIMITS.max_curvature);
-    violation |= desired_curvature_rate != 0;
+    violation |= safety_max_limit_check(desired_curvature_rate, FORD_MAX_CURVATURE_RATE, FORD_MIN_CURVATURE_RATE);
 
     if (!steer_control_enabled) {
-      violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0);
+      violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0) || (desired_curvature_rate != 0);
     }
     violation |= steer_control_enabled && !controls_allowed;
 

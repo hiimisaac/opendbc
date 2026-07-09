@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C1_CAN_CLIP,
+  FORD_PATH_C3_CAN_CLIP,
+  FORD_PATH_C3_DEADZONE,
   FORD_PATH_C1_CRUISE_DEADZONE,
   FORD_PATH_C1_DEADZONE,
   FORD_PATH_C2_CAN_CLIP,
@@ -191,3 +193,30 @@ def test_non_finite_inputs_are_safe():
   assert math.isfinite(cmd.curvature)
   assert math.isfinite(cmd.path_angle)
   assert math.isfinite(cmd.path_offset)
+
+
+def clothoid_model(gamma, xs=(0.0, 4.0, 10.0, 14.0, 25.0)):
+  # heading of a clothoid: oz(x) = 0.5*gamma*x^2, so k(x) = gamma*x and dk/dx = gamma
+  return SimpleNamespace(
+    position=SimpleNamespace(x=list(xs), y=[0.0 for _ in xs]),
+    orientation=SimpleNamespace(z=[0.5 * gamma * x * x for x in xs]),
+  )
+
+
+def test_c3_zero_on_pure_arc():
+  cmd = lateral_path_command(arc_model(0.003, xs=(0.0, 4.0, 10.0, 14.0, 25.0)), 0.003, 0.003, 20.0, 0.003, 0.0, True, False)
+
+  assert cmd.curvature_rate == 0.0
+
+
+def test_c3_reads_clothoid_rate():
+  gamma = 0.0005
+  cmd = lateral_path_command(clothoid_model(gamma), 0.002, 0.002, 20.0, 0.002, 0.0, True, False)
+
+  assert math.isclose(cmd.curvature_rate, gamma - FORD_PATH_C3_DEADZONE)
+
+
+def test_c3_clips_to_can_range():
+  cmd = lateral_path_command(clothoid_model(0.01), 0.002, 0.002, 20.0, 0.002, 0.0, True, False)
+
+  assert cmd.curvature_rate == FORD_PATH_C3_CAN_CLIP[1]

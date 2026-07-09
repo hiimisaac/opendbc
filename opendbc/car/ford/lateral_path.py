@@ -26,6 +26,14 @@ import math
 FORD_PATH_C0_CAN_CLIP = (-4.61, 4.60)
 FORD_PATH_C1_CAN_CLIP = (-0.475, 0.497)
 FORD_PATH_C2_CAN_CLIP = (-0.02, 0.02)
+FORD_PATH_C3_CAN_CLIP = (-0.001024, 0.001023)
+
+# c3 clothoid feedforward: curvature rate along the model path, from the change
+# in local path curvature between a near and a far window. Zero on arcs and
+# straights by construction; nonzero only through curve entries/exits.
+FORD_PATH_C3_NEAR = (4.0, 10.0)   # m, near local-curvature window
+FORD_PATH_C3_FAR = (14.0, 25.0)   # m, far local-curvature window
+FORD_PATH_C3_DEADZONE = 0.0001    # 1/m^2, model-noise floor
 
 FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
@@ -68,6 +76,7 @@ class LateralPathCommand:
   curvature: float    # c2
   path_angle: float   # c1
   path_offset: float  # c0
+  curvature_rate: float  # c3
   k_meas_filt: float
   trim: float
 
@@ -118,7 +127,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   trim = _clip(_finite(trim), -FORD_PATH_TRIM_CLIP, FORD_PATH_TRIM_CLIP)
 
   if not lat_active:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas, trim)
+    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, trim)
 
   k_meas_filt = _finite(k_meas_filt)
   if v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
@@ -169,6 +178,19 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # whole command so the carcontroller can drop to mode 0 (stock-style relent);
   # the c2 slew then re-engages gently from zero on release.
   if steering_pressed:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas_filt, trim)
+    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas_filt, trim)
 
-  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt, trim)
+  curvature_rate = 0.0
+  if _valid_model_path(model):
+    near_lo, near_hi = FORD_PATH_C3_NEAR
+    far_lo, far_hi = FORD_PATH_C3_FAR
+    k_near = (_interp(near_hi, model.position.x, model.orientation.z) -
+              _interp(near_lo, model.position.x, model.orientation.z)) / (near_hi - near_lo)
+    k_far = (_interp(far_hi, model.position.x, model.orientation.z) -
+             _interp(far_lo, model.position.x, model.orientation.z)) / (far_hi - far_lo)
+    d_span = (far_lo + far_hi) / 2.0 - (near_lo + near_hi) / 2.0
+    c3_raw = (k_far - k_near) / d_span
+    c3_raw = math.copysign(max(abs(c3_raw) - FORD_PATH_C3_DEADZONE, 0.0), c3_raw)
+    curvature_rate = _clip(c3_raw, *FORD_PATH_C3_CAN_CLIP)
+
+  return LateralPathCommand(c2, path_angle, path_offset, curvature_rate, k_meas_filt, trim)

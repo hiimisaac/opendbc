@@ -128,7 +128,7 @@ class CarController(CarControllerBase):
         # c0 disabled: c2-only in mode 2 proved glassy while composed pulled,
         # and c0 (never deadzoned) was the only path channel live on straights.
         path_offset = 0.0
-        curvature_rate = 0.0
+        curvature_rate = cmd.curvature_rate
         ramp_type = 3
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)

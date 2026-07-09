@@ -295,16 +295,16 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   self._set_prev_desired_angle(curvature)
                   self._reset_curvature_measurement(curvature, speed)
 
-                  # CAN FD lightweight path mode allows bounded c0/c1/c2; non-CAN FD requires c0/c1/c3 inactive
+                  # CAN FD composed path mode allows bounded c0/c1/c2/c3; non-CAN FD requires c0/c1/c3 inactive
                   if self.STEER_MESSAGE == MSG_LateralMotionControl2:
                     should_tx = -0.5 <= path_angle <= 0.5235
                     should_tx = should_tx and -5.12 <= path_offset <= 5.11
                     should_tx = should_tx and -0.02 <= curvature <= 0.02
-                    should_tx = should_tx and curvature_rate == 0
+                    should_tx = should_tx and -0.001024 <= curvature_rate <= 0.001023
                     if steer_control_enabled:
                       should_tx = should_tx and controls_allowed
                     else:
-                      should_tx = should_tx and path_angle == 0 and path_offset == 0 and curvature == 0
+                      should_tx = should_tx and path_angle == 0 and path_offset == 0 and curvature == 0 and curvature_rate == 0
                   else:
                     should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
 
