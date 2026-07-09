@@ -124,8 +124,10 @@ class CarController(CarControllerBase):
         self.k_meas_filt = cmd.k_meas_filt
         self.c2_trim = cmd.trim
         apply_curvature = cmd.curvature
-        path_angle = cmd.path_angle
-        path_offset = cmd.path_offset
+        # A/B discriminator: c2-only in mode 2 — isolates mode-2 behavior from
+        # the c0/c1 path channels (c2-only was validated fine in modes 0 and 1)
+        path_angle = 0.0
+        path_offset = 0.0
         curvature_rate = 0.0
         ramp_type = 3
       elif CC.latActive:
