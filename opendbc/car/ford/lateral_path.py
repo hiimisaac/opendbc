@@ -30,6 +30,7 @@ FORD_PATH_C2_CAN_CLIP = (-0.02, 0.02)
 FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
+FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
 
 # Large sustained c2 charges a slow-unwinding state in the PSCM that discharges
 # as a pull after the maneuver (observed after every large-c2 turn; absent in
@@ -162,10 +163,12 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
   c1_error = math.copysign(max(abs(c1_error) - c1_deadzone, 0.0), c1_error)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
-  # c0 is maneuver-only: at full c2 share it dithers centimeter position commands
-  # into the PSCM's offset servo (measured standing left-pull); gated by share it
-  # is exactly zero on straights and full authority where turns need it.
-  path_offset = _clip((path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * (1.0 - c2_share), *FORD_PATH_C0_CAN_CLIP)
+  # c0 is maneuver-only: on straights it dithers centimeter position commands
+  # into the PSCM's offset servo (measured standing left-pull), so it is exactly
+  # zero there. Its gate reaches full strength by 0.006 so turn entries get the
+  # full offset authority (the 1-share gate withheld 55% through the corridor).
+  c0_gain = _interp(abs(desired_curvature), FORD_PATH_C0_GATE_BP, (0.0, 1.0))
+  path_offset = _clip((path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain, *FORD_PATH_C0_CAN_CLIP)
 
   # Don't command a path against the driver's hands: the PSCM integrates the
   # torque fight and discharges it as a jump the moment they release. Zero the
