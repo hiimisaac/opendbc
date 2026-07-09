@@ -192,3 +192,12 @@ def test_non_finite_inputs_are_safe():
   assert math.isfinite(cmd.curvature)
   assert math.isfinite(cmd.path_angle)
   assert math.isfinite(cmd.path_offset)
+
+
+def test_c0_full_strength_through_turn_entry():
+  # by the time c2 starts fading (0.006), c0 must be at full authority
+  k = 0.009
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False)
+
+  expected = 0.5 * k * 7.0 * 7.0 - 0.5 * (k * 0.5) * 7.0 * 7.0  # share=0.5 residual, gain=1.0
+  assert math.isclose(cmd.path_offset, expected)
