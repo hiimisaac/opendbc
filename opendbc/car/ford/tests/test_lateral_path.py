@@ -163,6 +163,20 @@ def test_pressed_zeros_path_but_keeps_c2():
   assert cmd.trim == 0.001  # no learning while pressed
 
 
+def test_c2_slew_limits_wire_steps():
+  k = 0.003
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.curvature, 0.0002)  # one slew step toward target
+
+
+def test_c2_slew_passes_small_tracking():
+  k = 0.003
+  cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, 0.0, True, False, c2_last=0.0028)
+
+  assert math.isclose(cmd.curvature, k)
+
+
 def test_k_meas_filter_tracks_measurement():
   alpha = 1.0 - math.exp(-FORD_PATH_DT / FORD_PATH_K_MEAS_TAU)
   cmd = lateral_path_command(None, 0.0, 0.01, 20.0, 0.0, 0.0, True, False)
