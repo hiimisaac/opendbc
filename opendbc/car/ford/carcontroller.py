@@ -140,7 +140,7 @@ class CarController(CarControllerBase):
       self.apply_curvature_last = apply_curvature
 
       if self.CP.flags & FordFlags.CANFD:
-        mode = 2 if CC.latActive else 0
+        mode = 2 if CC.latActive and not CS.out.steeringPressed else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(
           self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,

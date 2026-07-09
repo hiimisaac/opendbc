@@ -153,13 +153,14 @@ def test_trim_learning_step_is_bounded():
   assert math.isclose(cmd.trim, FORD_PATH_TRIM_KI * FORD_PATH_TRIM_ERR_CLIP * FORD_PATH_DT)
 
 
-def test_pressed_zeros_path_but_keeps_c2():
+def test_pressed_zeros_entire_command():
+  # full relent: the carcontroller drops to mode 0, so nothing may be commanded
   k = 0.003
   cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, 0.001, True, True)
 
+  assert cmd.curvature == 0.0
   assert cmd.path_angle == 0.0
   assert cmd.path_offset == 0.0
-  assert math.isclose(cmd.curvature, k + 0.001)
   assert cmd.trim == 0.001  # no learning while pressed
 
 
