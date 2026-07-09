@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path import (
+  FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
   FORD_PATH_C1_CRUISE_DEADZONE,
   FORD_PATH_C1_DEADZONE,
@@ -53,7 +54,8 @@ def test_c2_fades_out_of_maneuvers_and_c1_carries():
   assert cmd.curvature == 0.0  # maneuver curvature: c2 confined to cruise duty
   # c2 carries nothing, so c1 holds the full arc heading (no delivered-curvature subtraction)
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 7.0)
-  assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)  # full c0 authority in maneuvers
+  expected_c0_curvature = k + FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT
+  assert math.isclose(cmd.path_offset, 0.5 * expected_c0_curvature * 7.0 * 7.0)
 
 
 def test_c1_holds_arc_mid_maneuver():
@@ -181,10 +183,35 @@ def test_tight_maneuver_path_has_upstream_action_authority():
   # Once c2 fades out, c0/c1 must still encode at least the requested arc.
   for sign in (-1.0, 1.0):
     desired = sign * 0.02
-    cmd = lateral_path_command(arc_model(sign * 0.01), desired, 0.0, 5.0,
-                               0.0, True, False, c2_last=0.0)
+    cmd = lateral_path_command(arc_model(sign * 0.01), desired, desired, 5.0,
+                               desired, True, False, c2_last=0.0)
 
     assert cmd.curvature == 0.0
     assert math.isclose(cmd.path_offset, 0.5 * desired * 7.0 * 7.0)
     expected_angle = sign * (abs(desired) - FORD_PATH_C1_DEADZONE) * 7.0
     assert math.isclose(cmd.path_angle, expected_angle)
+
+
+def test_tight_maneuver_c0_assists_undertracking():
+  desired = 0.03
+  measured = 0.015
+  cmd = lateral_path_command(arc_model(desired), desired, measured, 7.0,
+                             measured, True, False, c2_last=0.0)
+
+  requested_offset = 0.5 * desired * 7.0 * 7.0
+  missing_offset = 0.5 * (desired - measured) * 7.0 * 7.0
+  assert math.isclose(cmd.path_offset, requested_offset + missing_offset)
+
+
+def test_c0_undertracking_assist_is_bounded_to_useful_state():
+  desired = 0.03
+  requested_offset = 0.5 * desired * 7.0 * 7.0
+  cases = [
+    (0.04, 7.0),   # already tracking beyond the request
+    (0.015, 1.5),  # yaw/v is unreliable at crawl speed
+    (0.015, 15.0), # avoid exciting high-speed c0 hunting
+  ]
+  for measured, v_ego in cases:
+    cmd = lateral_path_command(arc_model(desired), desired, measured, v_ego,
+                               measured, True, False, c2_last=0.0)
+    assert math.isclose(cmd.path_offset, requested_offset), (measured, v_ego)

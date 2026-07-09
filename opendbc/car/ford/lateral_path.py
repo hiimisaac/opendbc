@@ -31,6 +31,9 @@ FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
+FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT = 0.02  # 1/m, bounds added offset authority
+FORD_PATH_C0_UNDERTRACK_SPEED_BP = (2.0, 5.0, 10.0, 15.0)  # m/s
+FORD_PATH_C0_UNDERTRACK_SPEED_GAIN = (0.0, 1.0, 1.0, 0.0)
 
 # Large sustained c2 charges a slow-unwinding state in the PSCM that discharges
 # as a pull after the maneuver (observed after every large-c2 turn; absent in
@@ -167,7 +170,22 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # zero there. Its gate reaches full strength by 0.006 so turn entries get the
   # full offset authority (the 1-share gate withheld 55% through the corridor).
   c0_gain = _interp(abs(desired_curvature), FORD_PATH_C0_GATE_BP, (0.0, 1.0))
-  path_offset = _clip((path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain, *FORD_PATH_C0_CAN_CLIP)
+  path_offset = (path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain
+
+  # On logged tight turns, the model/action floor entered path mode correctly
+  # but plateaued wide until the driver intervened. Add one bounded c0 arc for
+  # the curvature still missing from the truck. This is maneuver-only, fades as
+  # measured curvature catches up, and is disabled where yaw/v is unreliable or
+  # high-speed c0 is prone to hunting.
+  undertrack_error = desired_curvature - k_meas_filt
+  if undertrack_error * desired_curvature > 0.0:
+    undertrack_error = _clip(undertrack_error, -FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
+                             FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT)
+    path_share = 1.0 - c2_share
+    speed_gain = _interp(v_ego, FORD_PATH_C0_UNDERTRACK_SPEED_BP, FORD_PATH_C0_UNDERTRACK_SPEED_GAIN)
+    path_offset += 0.5 * undertrack_error * d_c0 * d_c0 * path_share * speed_gain
+
+  path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
 
   # Don't command a path against the driver's hands: the PSCM integrates the
   # torque fight and discharges it as a jump the moment they release. Zero the
