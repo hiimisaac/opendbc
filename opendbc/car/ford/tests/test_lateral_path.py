@@ -174,3 +174,17 @@ def test_c0_full_strength_through_turn_entry():
 
   expected = 0.5 * k * 7.0 * 7.0 - 0.5 * (k * 0.5) * 7.0 * 7.0  # share=0.5 residual, gain=1.0
   assert math.isclose(cmd.path_offset, expected)
+
+
+def test_tight_maneuver_path_has_upstream_action_authority():
+  # The legacy model path can be weaker than the lag-adjusted upstream action.
+  # Once c2 fades out, c0/c1 must still encode at least the requested arc.
+  for sign in (-1.0, 1.0):
+    desired = sign * 0.02
+    cmd = lateral_path_command(arc_model(sign * 0.01), desired, 0.0, 5.0,
+                               0.0, True, False, c2_last=0.0)
+
+    assert cmd.curvature == 0.0
+    assert math.isclose(cmd.path_offset, 0.5 * desired * 7.0 * 7.0)
+    expected_angle = sign * (abs(desired) - FORD_PATH_C1_DEADZONE) * 7.0
+    assert math.isclose(cmd.path_angle, expected_angle)

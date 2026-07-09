@@ -85,6 +85,13 @@ def _finite(value: float, fallback: float = 0.0) -> float:
   return float(value) if math.isfinite(value) else fallback
 
 
+def _authority_floor(path_value: float, requested_value: float) -> float:
+  """Keep stronger same-direction model geometry, otherwise honor the action."""
+  if path_value * requested_value <= 0.0 or abs(path_value) < abs(requested_value):
+    return requested_value
+  return path_value
+
+
 def _valid_model_path(model) -> bool:
   if model is None:
     return False
@@ -137,6 +144,14 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   else:
     path_angle_raw = desired_curvature * d_look
     path_offset_raw = 0.5 * desired_curvature * d_c0 * d_c0
+
+  # modelV2's legacy path geometry can be weaker than its lag-adjusted action.
+  # While c2 owns lane following, preserve the model residual as-is. Once c2
+  # starts fading for a maneuver, require c0/c1 to encode at least the action's
+  # constant-curvature arc; keep stronger same-direction model anticipation.
+  if c2_share < 1.0:
+    path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
+    path_offset_raw = _authority_floor(path_offset_raw, 0.5 * desired_curvature * d_c0 * d_c0)
 
   # Subtract delivered curvature only in proportion to the share c2 carries:
   # when c2 is faded out of a maneuver, c1 must hold the arc as an absolute
