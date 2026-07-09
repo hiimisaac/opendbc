@@ -127,7 +127,7 @@ class CarController(CarControllerBase):
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
         curvature_rate = 0.0
-        ramp_type = 3
+        ramp_type = 0
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         apply_curvature = desired_curvature
