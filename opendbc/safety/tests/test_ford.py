@@ -339,6 +339,14 @@ class TestFordSafetyBase(common.CarSafetyTest):
     self.assertFalse(self._tx(self._lat_ctl_msg(False, 0., 0., 0.01, 0., mode=0)))
     self.assertFalse(self._tx(self._lat_ctl_msg(False, 0., 0., 0., 0.001, mode=0)))
 
+  def test_canfd_path_mode_mads_lateral_only(self):
+    if self.STEER_MESSAGE != MSG_LateralMotionControl2:
+      self.skipTest("CAN FD only")
+
+    self.safety.set_controls_allowed(False)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0.5, 0.1, 0., 0., mode=2)))
+
   def test_curvature_rate_limits(self):
     """Curvature command must satisfy the ISO 11270 lateral jerk limit per frame."""
     if self.STEER_MESSAGE == MSG_LateralMotionControl2:

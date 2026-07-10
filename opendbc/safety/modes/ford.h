@@ -275,7 +275,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     if (!steer_control_enabled) {
       violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0);
     }
-    violation |= steer_control_enabled && !controls_allowed;
+    violation |= steer_control_enabled && !(controls_allowed || controls_allowed_lateral);
 
     if (violation) {
       tx = false;
