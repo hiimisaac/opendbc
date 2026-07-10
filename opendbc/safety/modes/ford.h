@@ -289,7 +289,6 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     if (lateral_allowed && steer_control_enabled) {
       violation |= rt_curvature_rate_limit_check(FORD_STEERING_LIMITS);
     }
-
     if (violation) {
       tx = false;
     }
