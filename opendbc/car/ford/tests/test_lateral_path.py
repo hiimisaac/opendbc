@@ -8,6 +8,7 @@ from opendbc.car.ford.lateral_path import (
   FORD_PATH_C1_DEADZONE,
   FORD_PATH_DT,
   FORD_PATH_K_MEAS_TAU,
+  driver_steering_opposes_command,
   lateral_path_command,
 )
 
@@ -130,7 +131,7 @@ def test_yaw_bias_does_not_create_c2_lane_following_bias():
   assert cmd.path_offset == 0.0
 
 
-def test_pressed_zeros_entire_command():
+def test_driver_override_zeros_entire_command():
   # full relent: the carcontroller drops to mode 0, so nothing may be commanded
   k = 0.003
   cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, True, True)
@@ -138,6 +139,36 @@ def test_pressed_zeros_entire_command():
   assert cmd.curvature == 0.0
   assert cmd.path_angle == 0.0
   assert cmd.path_offset == 0.0
+
+
+def test_helping_driver_does_not_override_path_command():
+  # Logged failed right turn: both request and driver torque were negative.
+  driver_override = driver_steering_opposes_command(True, -1.125, -0.013)
+  assert not driver_override
+  assert not driver_steering_opposes_command(True, 1.125, 0.013)
+
+  cmd = lateral_path_command(arc_model(-0.013), -0.013, 0.0, 4.1, 0.0,
+                             True, driver_override, c2_last=0.0)
+  assert cmd.path_angle < 0.0
+  assert cmd.path_offset < 0.0
+
+
+def test_opposing_driver_overrides_path_command():
+  assert driver_steering_opposes_command(True, 1.125, -0.013)
+  assert driver_steering_opposes_command(True, -1.125, 0.013)
+
+
+def test_pressed_driver_overrides_when_there_is_no_path_command():
+  assert driver_steering_opposes_command(True, 1.125, 0.0)
+
+
+def test_zero_torque_during_pressed_release_does_not_interrupt_handoff():
+  # steeringPressed is debounced and remains true briefly after torque release.
+  assert not driver_steering_opposes_command(True, 0.0, -0.013)
+
+
+def test_unpressed_driver_never_overrides_path_command():
+  assert not driver_steering_opposes_command(False, -1.125, 0.013)
 
 
 def test_c2_slew_limits_wire_steps():

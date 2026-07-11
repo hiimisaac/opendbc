@@ -3,7 +3,7 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import lateral_path_command
+from opendbc.car.ford.lateral_path import driver_steering_opposes_command, lateral_path_command
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
@@ -101,6 +101,7 @@ class CarController(CarControllerBase):
     path_offset = 0.0
     curvature_rate = 0.0
     ramp_type = 0
+    driver_override = False
 
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
       desired_curvature = 0.0
@@ -117,8 +118,10 @@ class CarController(CarControllerBase):
       if self.CP.flags & FordFlags.CANFD:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
+        driver_override = driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
+                                                          desired_curvature)
         cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
-                                   self.k_meas_filt, CC.latActive, CS.out.steeringPressed,
+                                   self.k_meas_filt, CC.latActive, driver_override,
                                    c2_last=self.apply_curvature_last)
         self.k_meas_filt = cmd.k_meas_filt
         apply_curvature = cmd.curvature
@@ -138,7 +141,7 @@ class CarController(CarControllerBase):
       self.apply_curvature_last = apply_curvature
 
       if self.CP.flags & FordFlags.CANFD:
-        mode = 2 if CC.latActive and not CS.out.steeringPressed else 0
+        mode = 2 if CC.latActive and not driver_override else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(
           self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,
