@@ -174,10 +174,19 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
     path_offset_raw = _authority_floor(path_offset_raw, 0.5 * desired_curvature * d_c0 * d_c0)
 
-  # Subtract delivered curvature only in proportion to the share c2 carries:
-  # when c2 is faded out of a maneuver, c1 must hold the arc as an absolute
+  # Subtract only the measured curvature already delivering this path. Bounding
+  # it to the path's direction and magnitude makes c0/c1 one-sided: they fill
+  # missing authority, but never actively countersteer merely because the truck
+  # is still unwinding the previous arc. C2 remains the smooth absolute request.
+  path_curvature = path_angle_raw / d_look
+  delivered_curvature = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0))
+  if delivered_curvature * path_curvature > 0.0:
+    delivered_curvature = math.copysign(min(abs(delivered_curvature), abs(path_curvature)), path_curvature)
+  else:
+    delivered_curvature = 0.0
+  # When c2 is faded out of a maneuver, c1 must hold the arc as an absolute
   # chase heading, or the polynomial reads "straight" mid-turn and unwinds early.
-  k_residual = k_meas_filt * _interp(v_ego, FORD_PATH_RESIDUAL_SPEED_BP, (0.0, 1.0)) * c2_share
+  k_residual = delivered_curvature * c2_share
 
   c1_error = path_angle_raw / d_look - k_residual
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
