@@ -1,6 +1,7 @@
 import math
 from types import SimpleNamespace
 
+from opendbc.car.ford.carcontroller import _load_messaging, lmc2_ramp_type
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
@@ -45,6 +46,24 @@ def test_transient_residual_covers_undelivered_curvature():
 
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0)
   assert cmd.path_offset == 0.0  # c0 is maneuver-only
+
+
+def test_residual_does_not_accelerate_unwind_when_car_exceeds_path_curvature():
+  k = 0.004
+  cmd = lateral_path_command(arc_model(k), k, 0.01, 20.0, 0.01, True, False)
+
+  assert cmd.path_angle == 0.0
+  assert math.isclose(cmd.path_offset, 0.0, abs_tol=1e-9)
+
+
+def test_residual_does_not_double_command_during_curvature_reversal():
+  k = 0.004
+  cmd = lateral_path_command(arc_model(k), k, -0.01, 20.0, -0.01, True, False)
+
+  expected_angle = (k - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 20.0
+  expected_offset = 0.5 * k * 7.0 * 7.0 * ((k - 0.003) / (0.006 - 0.003))
+  assert math.isclose(cmd.path_angle, expected_angle)
+  assert math.isclose(cmd.path_offset, expected_offset)
 
 
 def test_c2_fades_out_of_maneuvers_and_c1_carries():
@@ -171,6 +190,48 @@ def test_unpressed_driver_never_overrides_path_command():
   assert not driver_steering_opposes_command(False, -1.125, 0.013)
 
 
+def test_sunnypilot_messaging_namespace_is_preferred():
+  sentinel = object()
+  imports = []
+
+  def fake_import(name):
+    imports.append(name)
+    if name == "cereal.messaging":
+      return sentinel
+    raise ImportError(name)
+
+  assert _load_messaging(fake_import) is sentinel
+  assert imports == ["cereal.messaging"]
+
+
+def test_upstream_messaging_namespace_is_the_fallback():
+  sentinel = object()
+  imports = []
+
+  def fake_import(name):
+    imports.append(name)
+    if name == "openpilot.cereal.messaging":
+      return sentinel
+    raise ImportError(name)
+
+  assert _load_messaging(fake_import) is sentinel
+  assert imports == ["cereal.messaging", "openpilot.cereal.messaging"]
+
+
+def test_missing_messaging_namespaces_disable_model_subscription():
+  def fake_import(name):
+    raise ImportError(name)
+
+  assert _load_messaging(fake_import) is None
+
+
+def test_lmc2_uses_native_slow_ramp_on_driver_override_release():
+  assert lmc2_ramp_type(driver_override=False, driver_override_last=True) == 0
+  assert lmc2_ramp_type(driver_override=False, driver_override_last=False) == 3
+  assert lmc2_ramp_type(driver_override=True, driver_override_last=False) == 3
+  assert lmc2_ramp_type(driver_override=True, driver_override_last=True) == 3
+
+
 def test_c2_slew_limits_wire_steps():
   k = 0.003
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, True, False, c2_last=0.0)
@@ -221,6 +282,16 @@ def test_tight_maneuver_path_has_upstream_action_authority():
     assert math.isclose(cmd.path_offset, 0.5 * desired * 7.0 * 7.0)
     expected_angle = sign * (abs(desired) - FORD_PATH_C1_DEADZONE) * 7.0
     assert math.isclose(cmd.path_angle, expected_angle)
+
+
+def test_tight_maneuver_keeps_stronger_live_model_geometry():
+  desired = 0.02
+  model_curvature = 0.04
+  cmd = lateral_path_command(arc_model(model_curvature), desired, desired, 5.0,
+                             desired, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.path_offset, 0.5 * model_curvature * 7.0 * 7.0)
+  assert math.isclose(cmd.path_angle, (model_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
 def test_tight_maneuver_c0_assists_undertracking():
