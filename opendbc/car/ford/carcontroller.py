@@ -1,3 +1,4 @@
+import importlib
 import math
 import numpy as np
 from opendbc.can import CANPacker
@@ -8,10 +9,23 @@ from opendbc.car.ford.lateral_path import driver_steering_opposes_command, later
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 
-try:
-  import openpilot.cereal.messaging as messaging
-except ImportError:
-  messaging = None
+
+def _load_messaging(import_module=importlib.import_module):
+  """Load messaging from sunnypilot first, with upstream as a fallback."""
+  for module_name in ("cereal.messaging", "openpilot.cereal.messaging"):
+    try:
+      return import_module(module_name)
+    except ImportError:
+      pass
+  return None
+
+
+def lmc2_ramp_type(driver_override: bool, driver_override_last: bool) -> int:
+  """Use the PSCM's native slow ramp only on a mode-0-to-mode-2 handoff."""
+  return 0 if driver_override_last and not driver_override else 3
+
+
+messaging = _load_messaging()
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -72,6 +86,7 @@ class CarController(CarControllerBase):
     self.apply_curvature_last = 0
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
+    self.driver_override_last = False
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -144,6 +159,7 @@ class CarController(CarControllerBase):
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
         driver_override = driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
                                                           desired_curvature)
+        ramp_type = lmc2_ramp_type(driver_override, self.driver_override_last)
         cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
                                    self.k_meas_filt, CC.latActive, driver_override,
                                    c2_last=self.apply_curvature_last)
@@ -152,7 +168,6 @@ class CarController(CarControllerBase):
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
         curvature_rate = 0.0
-        ramp_type = 3
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         apply_curvature = apply_ford_curvature_limits(desired_curvature, self.apply_curvature_last, current_curvature,
@@ -167,6 +182,7 @@ class CarController(CarControllerBase):
           self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,
           -apply_curvature, -curvature_rate, counter
         ))
+        self.driver_override_last = driver_override
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
 
