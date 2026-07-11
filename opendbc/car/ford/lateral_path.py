@@ -88,6 +88,24 @@ def _finite(value: float, fallback: float = 0.0) -> float:
   return float(value) if math.isfinite(value) else fallback
 
 
+def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
+                                     desired_curvature: float) -> bool:
+  """Relent only when the driver steers against the requested curvature.
+
+  Ford's steering-column torque and openpilot curvature use the same turn sign.
+  Same-sign torque is the driver helping the path controller and must not make
+  LMC2 drop out. With no directional request, any pressed input takes priority.
+  """
+  if not steering_pressed:
+    return False
+
+  steering_torque = _finite(steering_torque)
+  desired_curvature = _finite(desired_curvature)
+  if desired_curvature == 0.0:
+    return True
+  return steering_torque * desired_curvature < 0.0
+
+
 def _authority_floor(path_value: float, requested_value: float) -> float:
   """Keep stronger same-direction model geometry, otherwise honor the action."""
   if path_value * requested_value <= 0.0 or abs(path_value) < abs(requested_value):
@@ -106,7 +124,7 @@ def _valid_model_path(model) -> bool:
 
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
-                         steering_pressed: bool, c2_last: float | None = None) -> LateralPathCommand:
+                         driver_override: bool, c2_last: float | None = None) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is the
@@ -187,11 +205,11 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
 
-  # Don't command a path against the driver's hands: the PSCM integrates the
+  # Don't command a path against an opposing driver: the PSCM integrates the
   # torque fight and discharges it as a jump the moment they release. Zero the
-  # whole command so the carcontroller can drop to mode 0 (stock-style relent);
-  # the c2 slew then re-engages gently from zero on release.
-  if steering_pressed:
+  # whole command so the carcontroller can drop to mode 0 (stock-style relent).
+  # Helpful same-direction torque is not an override and stays in mode 2.
+  if driver_override:
     return LateralPathCommand(0.0, 0.0, 0.0, k_meas_filt)
 
   return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt)
