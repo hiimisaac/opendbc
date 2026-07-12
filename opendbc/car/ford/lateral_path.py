@@ -29,6 +29,7 @@ FORD_PATH_C2_CAN_CLIP = (-0.02, 0.02)
 
 FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
+FORD_PATH_PSCM_RESPONSE_TIME = 1.0  # s, identified LMC2 curvature response lag
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
 FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT = 0.02  # 1/m, bounds added offset authority
@@ -159,7 +160,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # and pure path heading is the proven regime.
   d_look = max(v_ego * FORD_PATH_D_LOOK_TIME, FORD_PATH_D_LOOK_MIN)
   d_c0 = FORD_PATH_D_C0
-  if _valid_model_path(model):
+  model_path_valid = _valid_model_path(model)
+  if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)
   else:
@@ -170,8 +172,27 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # While c2 owns lane following, preserve the model residual as-is. Once c2
   # starts fading for a maneuver, require c0/c1 to encode at least the action's
   # constant-curvature arc; keep stronger same-direction model anticipation.
+  c1_path_angle_raw = path_angle_raw
   if c2_share < 1.0:
+    # The PSCM takes about one second to realize an LMC2 curvature change. Look
+    # that response time farther into the model during maneuver entry and use
+    # the stronger same-direction curvature. Normalize orientation by distance
+    # before comparing so a constant-radius path is not amplified merely by
+    # sampling it farther away. Keep c0's base placement at 7m; preview belongs
+    # in c1, while c0 below only supplies near-path undertracking authority.
+    # Far curvature being stronger than near curvature is the stateless entry
+    # gate: steady and unwinding paths do not receive preview.
+    if model_path_valid:
+      model_horizon = max(d_look, _finite(model.position.x[-1], d_look))
+      d_preview = min(d_look + max(v_ego, 0.0) * FORD_PATH_PSCM_RESPONSE_TIME, model_horizon)
+      if d_preview > d_look:
+        near_curvature = path_angle_raw / d_look
+        preview_curvature = _interp(d_preview, model.position.x, model.orientation.z) / d_preview
+        if preview_curvature * desired_curvature > 0.0 and abs(preview_curvature) > abs(near_curvature):
+          c1_path_angle_raw = preview_curvature * d_look
+
     path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
+    c1_path_angle_raw = _authority_floor(c1_path_angle_raw, desired_curvature * d_look)
     path_offset_raw = _authority_floor(path_offset_raw, 0.5 * desired_curvature * d_c0 * d_c0)
 
   # Subtract only the measured curvature already delivering this path. Bounding
@@ -188,7 +209,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # chase heading, or the polynomial reads "straight" mid-turn and unwinds early.
   k_residual = delivered_curvature * c2_share
 
-  c1_error = path_angle_raw / d_look - k_residual
+  c1_error = c1_path_angle_raw / d_look - k_residual
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
   c1_error = math.copysign(max(abs(c1_error) - c1_deadzone, 0.0), c1_error)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
@@ -204,8 +225,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # the curvature still missing from the truck. This is maneuver-only, fades as
   # measured curvature catches up, and is disabled where yaw/v is unreliable or
   # high-speed c0 is prone to hunting.
-  undertrack_error = desired_curvature - k_meas_filt
-  if undertrack_error * desired_curvature > 0.0:
+  undertrack_error = path_curvature - k_meas_filt
+  if undertrack_error * path_curvature > 0.0:
     undertrack_error = _clip(undertrack_error, -FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
                              FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT)
     path_share = 1.0 - c2_share
