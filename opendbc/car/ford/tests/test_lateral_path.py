@@ -21,6 +21,15 @@ def arc_model(curvature, xs=(0.0, 7.0, 20.0)):
   )
 
 
+def changing_curvature_model(near_curvature, preview_curvature):
+  xs = (0.0, 7.0, 14.0, 20.0)
+  curvatures = (0.0, near_curvature, preview_curvature, preview_curvature)
+  return SimpleNamespace(
+    position=SimpleNamespace(x=list(xs), y=[0.5 * curvature * x * x for x, curvature in zip(xs, curvatures, strict=True)]),
+    orientation=SimpleNamespace(z=[curvature * x for x, curvature in zip(xs, curvatures, strict=True)]),
+  )
+
+
 def test_inactive_zeros_command():
   cmd = lateral_path_command(None, 0.01, 0.002, 20.0, 0.005, False, False)
 
@@ -290,8 +299,63 @@ def test_tight_maneuver_keeps_stronger_live_model_geometry():
   cmd = lateral_path_command(arc_model(model_curvature), desired, desired, 5.0,
                              desired, True, False, c2_last=0.0)
 
-  assert math.isclose(cmd.path_offset, 0.5 * model_curvature * 7.0 * 7.0)
+  model_offset = 0.5 * model_curvature * 7.0 * 7.0
+  missing_offset = 0.5 * (model_curvature - desired) * 7.0 * 7.0
+  assert math.isclose(cmd.path_offset, model_offset + missing_offset)
   assert math.isclose(cmd.path_angle, (model_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+
+
+def test_c1_previews_stronger_same_direction_model_curvature():
+  desired = -0.02
+  near_curvature = -0.01
+  preview_curvature = -0.04
+  cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0)
+
+  expected_curvature = abs(preview_curvature) - FORD_PATH_C1_DEADZONE
+  assert math.isclose(cmd.path_angle, -expected_curvature * 7.0)
+
+
+def test_c1_preview_does_not_amplify_constant_curvature():
+  curvature = 0.02
+  cmd = lateral_path_command(arc_model(curvature, xs=(0.0, 7.0, 14.0, 20.0)), curvature, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.path_angle, (curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+
+
+def test_c1_preview_ignores_opposite_future_curvature():
+  desired = 0.02
+  near_curvature = 0.02
+  preview_curvature = -0.04
+  cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.path_angle, (near_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+
+
+def test_c1_preview_does_not_add_far_field_c0():
+  desired = 0.02
+  near_curvature = desired
+  preview_curvature = 0.025
+  measured = desired
+  cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, measured, 7.0,
+                             measured, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.path_angle, (preview_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_offset, 0.5 * near_curvature * 7.0 * 7.0)
+
+
+def test_c0_assists_undertracking_of_stronger_model_geometry():
+  desired = 0.02
+  model_curvature = 0.04
+  measured = desired
+  cmd = lateral_path_command(arc_model(model_curvature, xs=(0.0, 7.0, 14.0, 20.0)), desired, measured, 7.0,
+                             measured, True, False, c2_last=0.0)
+
+  model_offset = 0.5 * model_curvature * 7.0 * 7.0
+  missing_offset = 0.5 * (model_curvature - measured) * 7.0 * 7.0
+  assert math.isclose(cmd.path_offset, model_offset + missing_offset)
 
 
 def test_tight_maneuver_c0_assists_undertracking():
