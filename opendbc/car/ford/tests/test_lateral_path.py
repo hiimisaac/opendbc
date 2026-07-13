@@ -37,6 +37,7 @@ def test_inactive_zeros_command():
   assert cmd.path_angle == 0.0
   assert cmd.path_offset == 0.0
   assert cmd.k_meas_filt == 0.002
+  assert cmd.c0_undertrack_correction == 0.0
 
 
 def test_steady_state_arc_idles_c0_c1():
@@ -381,3 +382,85 @@ def test_c0_undertracking_assist_is_bounded_to_useful_state():
     cmd = lateral_path_command(arc_model(desired), desired, measured, v_ego,
                                measured, True, False, c2_last=0.0)
     assert math.isclose(cmd.path_offset, requested_offset), (measured, v_ego)
+
+
+def test_persistent_logged_undertracking_builds_c0_only_authority():
+  # Logged steady alert near 24 mph: model requested ~0.021/m while the
+  # Lightning held ~0.015/m. Persistent error may earn more c0, but must not
+  # change c1/c2 or apply a universal path gain.
+  desired = 0.021
+  measured = 0.015
+  v_ego = 10.5
+  correction = 0.0
+  commands = []
+  for _ in range(12):
+    cmd = lateral_path_command(arc_model(desired), desired, measured, v_ego,
+                               measured, True, False, c2_last=0.0,
+                               c0_undertrack_correction=correction)
+    correction = cmd.c0_undertrack_correction
+    commands.append(cmd)
+
+  assert commands[-1].path_offset > commands[0].path_offset
+  assert commands[-1].path_angle == commands[0].path_angle
+  assert commands[-1].curvature == commands[0].curvature
+  assert 0.0 < correction <= 0.01
+
+
+def test_c0_adaptation_resets_before_reversed_turn():
+  correction = 0.006
+  cmd = lateral_path_command(arc_model(-0.02), -0.02, 0.015, 7.0,
+                             0.015, True, False, c2_last=0.0,
+                             c0_undertrack_correction=correction)
+
+  assert cmd.c0_undertrack_correction == 0.0
+
+
+def test_c0_adaptation_releases_when_tracking_catches_up():
+  correction = 0.006
+  cmd = lateral_path_command(arc_model(0.02), 0.02, 0.02, 7.0,
+                             0.02, True, False, c2_last=0.0,
+                             c0_undertrack_correction=correction)
+
+  assert 0.0 <= cmd.c0_undertrack_correction < correction
+
+
+def test_c0_adaptation_is_disabled_in_gentle_lane_following():
+  correction = 0.0
+  for _ in range(100):
+    cmd = lateral_path_command(arc_model(0.003), 0.003, 0.0, 20.0,
+                               0.0, True, False, c2_last=0.003,
+                               c0_undertrack_correction=correction)
+    correction = cmd.c0_undertrack_correction
+
+  assert correction == 0.0
+
+
+def test_c0_adaptation_is_bounded_in_persistent_tight_turn():
+  correction = 0.0
+  for _ in range(200):
+    cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 7.0,
+                               0.0, True, False, c2_last=0.0,
+                               c0_undertrack_correction=correction)
+    correction = cmd.c0_undertrack_correction
+
+  assert math.isclose(correction, 0.01, rel_tol=1e-6)
+
+
+def test_c0_adaptation_does_not_wind_up_behind_c0_limit():
+  correction = 0.0
+  for _ in range(200):
+    cmd = lateral_path_command(arc_model(0.2), 0.2, 0.0, 7.0,
+                               0.0, True, False, c2_last=0.0,
+                               c0_undertrack_correction=correction)
+    correction = cmd.c0_undertrack_correction
+
+  assert cmd.path_offset == 4.60
+  assert correction == 0.0
+
+
+def test_c0_adaptation_clears_on_driver_override():
+  cmd = lateral_path_command(arc_model(0.02), 0.02, 0.01, 7.0,
+                             0.01, True, True, c2_last=0.0,
+                             c0_undertrack_correction=0.006)
+
+  assert cmd.c0_undertrack_correction == 0.0
