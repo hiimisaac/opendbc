@@ -86,6 +86,7 @@ class CarController(CarControllerBase):
     self.apply_curvature_last = 0
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
+    self.c0_undertrack_correction = 0.0
     self.driver_override_last = False
     self.model = None
     self.model_frame = 0
@@ -162,8 +163,10 @@ class CarController(CarControllerBase):
         ramp_type = lmc2_ramp_type(driver_override, self.driver_override_last)
         cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
                                    self.k_meas_filt, CC.latActive, driver_override,
-                                   c2_last=self.apply_curvature_last)
+                                   c2_last=self.apply_curvature_last,
+                                   c0_undertrack_correction=self.c0_undertrack_correction)
         self.k_meas_filt = cmd.k_meas_filt
+        self.c0_undertrack_correction = cmd.c0_undertrack_correction
         apply_curvature = cmd.curvature
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset

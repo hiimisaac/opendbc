@@ -35,6 +35,12 @@ FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
 FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT = 0.02  # 1/m, bounds added offset authority
 FORD_PATH_C0_UNDERTRACK_SPEED_BP = (2.0, 5.0, 10.0, 15.0)  # m/s
 FORD_PATH_C0_UNDERTRACK_SPEED_GAIN = (0.0, 1.0, 1.0, 0.0)
+# A short-horizon filtered copy of persistent maneuver error may add more c0.
+# This is deliberately not an integral or global gain: it is capped, gated out
+# of lane following, and released quickly when the live error disappears.
+FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT = 0.01  # 1/m of additional c0-equivalent curvature
+FORD_PATH_C0_ADAPTIVE_ATTACK_TAU = 0.5   # s, requires persistent undertracking
+FORD_PATH_C0_ADAPTIVE_RELEASE_TAU = 0.2  # s, remove authority faster than it builds
 
 # Large sustained c2 charges a slow-unwinding state in the PSCM that discharges
 # as a pull after the maneuver (observed after every large-c2 turn; absent in
@@ -66,6 +72,7 @@ class LateralPathCommand:
   path_angle: float   # c1
   path_offset: float  # c0
   k_meas_filt: float
+  c0_undertrack_correction: float
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -125,7 +132,8 @@ def _valid_model_path(model) -> bool:
 
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
-                         driver_override: bool, c2_last: float | None = None) -> LateralPathCommand:
+                         driver_override: bool, c2_last: float | None = None,
+                         c0_undertrack_correction: float = 0.0) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is the
@@ -136,9 +144,11 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   desired_curvature = _finite(desired_curvature)
   k_meas = _finite(k_meas)
   v_ego = _finite(v_ego)
+  c0_undertrack_correction = _clip(_finite(c0_undertrack_correction),
+                                   -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT, FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
 
   if not lat_active:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas)
+    return LateralPathCommand(0.0, 0.0, 0.0, k_meas, 0.0)
 
   k_meas_filt = _finite(k_meas_filt)
   if v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
@@ -226,12 +236,46 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # measured curvature catches up, and is disabled where yaw/v is unreliable or
   # high-speed c0 is prone to hunting.
   undertrack_error = path_curvature - k_meas_filt
+  adaptive_target = 0.0
   if undertrack_error * path_curvature > 0.0:
     undertrack_error = _clip(undertrack_error, -FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
                              FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT)
     path_share = 1.0 - c2_share
     speed_gain = _interp(v_ego, FORD_PATH_C0_UNDERTRACK_SPEED_BP, FORD_PATH_C0_UNDERTRACK_SPEED_GAIN)
-    path_offset += 0.5 * undertrack_error * d_c0 * d_c0 * path_share * speed_gain
+    gated_error = undertrack_error * path_share * speed_gain
+    path_offset += 0.5 * gated_error * d_c0 * d_c0
+    if model_path_valid:
+      adaptive_target = _clip(gated_error, -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
+                              FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
+
+  # Bound the state to actual remaining c0 authority so correction cannot wind
+  # up invisibly behind the output clip and emerge later during the unwind.
+  path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
+  adaptive_lo = max(-FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
+                    2.0 * (FORD_PATH_C0_CAN_CLIP[0] - path_offset) / (d_c0 * d_c0))
+  adaptive_hi = min(FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
+                    2.0 * (FORD_PATH_C0_CAN_CLIP[1] - path_offset) / (d_c0 * d_c0))
+  adaptive_target = _clip(adaptive_target, adaptive_lo, adaptive_hi)
+  c0_undertrack_correction = _clip(c0_undertrack_correction, adaptive_lo, adaptive_hi)
+
+  # Never carry learned authority into the opposite turn. Skip attacking the
+  # new direction for one frame so a reversal starts from the stateless command.
+  direction_reversed = c0_undertrack_correction * path_curvature < 0.0
+  if direction_reversed:
+    c0_undertrack_correction = 0.0
+    adaptive_target = 0.0
+    applied_correction = 0.0
+  else:
+    building = adaptive_target * c0_undertrack_correction >= 0.0 and \
+               abs(adaptive_target) > abs(c0_undertrack_correction)
+    tau = FORD_PATH_C0_ADAPTIVE_ATTACK_TAU if building else FORD_PATH_C0_ADAPTIVE_RELEASE_TAU
+    alpha = 1.0 - math.exp(-FORD_PATH_DT / tau)
+    applied_correction = c0_undertrack_correction
+    c0_undertrack_correction += alpha * (adaptive_target - c0_undertrack_correction)
+    if not building:
+      applied_correction = c0_undertrack_correction
+
+  path_offset += 0.5 * applied_correction * d_c0 * d_c0
 
   path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
 
@@ -240,6 +284,6 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # whole command so the carcontroller can drop to mode 0 (stock-style relent).
   # Helpful same-direction torque is not an override and stays in mode 2.
   if driver_override:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas_filt)
+    return LateralPathCommand(0.0, 0.0, 0.0, k_meas_filt, 0.0)
 
-  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt)
+  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt, c0_undertrack_correction)
