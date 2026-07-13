@@ -163,7 +163,8 @@ def test_yaw_bias_does_not_create_c2_lane_following_bias():
 def test_driver_override_zeros_entire_command():
   # full relent: the carcontroller drops to mode 0, so nothing may be commanded
   k = 0.003
-  cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, True, True)
+  cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, True, True,
+                             path_angle_last=0.4, path_offset_last=1.0)
 
   assert cmd.curvature == 0.0
   assert cmd.path_angle == 0.0
@@ -294,7 +295,7 @@ def test_tight_maneuver_path_has_upstream_action_authority():
     assert math.isclose(cmd.path_angle, expected_angle)
 
 
-def test_tight_maneuver_keeps_stronger_live_model_geometry():
+def test_tight_maneuver_keeps_stronger_live_model_geometry_in_c0():
   desired = 0.02
   model_curvature = 0.04
   cmd = lateral_path_command(arc_model(model_curvature), desired, desired, 5.0,
@@ -303,21 +304,69 @@ def test_tight_maneuver_keeps_stronger_live_model_geometry():
   model_offset = 0.5 * model_curvature * 7.0 * 7.0
   missing_offset = 0.5 * (model_curvature - desired) * 7.0 * 7.0
   assert math.isclose(cmd.path_offset, model_offset + missing_offset)
-  assert math.isclose(cmd.path_angle, (model_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_angle, (desired - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
-def test_c1_previews_stronger_same_direction_model_curvature():
-  desired = -0.02
-  near_curvature = -0.01
-  preview_curvature = -0.04
+def test_c1_maneuver_authority_is_bounded_by_model_action():
+  # Logged tight turn: model path geometry exceeded the action and drove c1
+  # into its wire limit. C0 owns stronger near-path/tight-turn correction.
+  desired = -0.025
+  near_curvature = -0.03
+  preview_curvature = -0.06
   cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, 0.0, 7.0,
                              0.0, True, False, c2_last=0.0)
 
-  expected_curvature = abs(preview_curvature) - FORD_PATH_C1_DEADZONE
+  expected_curvature = abs(desired) - FORD_PATH_C1_DEADZONE
   assert math.isclose(cmd.path_angle, -expected_curvature * 7.0)
 
 
-def test_c1_preview_does_not_amplify_constant_curvature():
+def test_c1_slew_limits_abrupt_maneuver_entry():
+  # A logged model frame changed c1 by 0.136 rad at 7 m in 50 ms. Bound the
+  # coefficient by equivalent curvature so the limit scales with lookahead.
+  cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0,
+                             path_angle_last=0.0)
+
+  assert math.isclose(cmd.path_angle, 0.006 * 7.0)
+
+
+def test_c0_slew_limits_abrupt_maneuver_entry():
+  cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0,
+                             path_offset_last=0.0)
+
+  assert math.isclose(cmd.path_offset, 0.5 * 0.006 * 7.0 * 7.0)
+
+
+def test_full_c2_lane_following_only_shapes_maneuver_c0():
+  desired = 0.005
+  model_curvature = 0.02
+  cmd = lateral_path_command(arc_model(model_curvature), desired, 0.0, 7.0,
+                             0.0, True, False, c2_last=desired,
+                             path_angle_last=0.0, path_offset_last=0.0)
+
+  expected_c1 = (model_curvature - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE) * 7.0
+  assert math.isclose(cmd.path_angle, expected_c1)
+  assert math.isclose(cmd.path_offset, 0.5 * 0.006 * 7.0 * 7.0)
+
+
+def test_maneuver_slew_does_not_delay_unwind_or_reversal():
+  cmd = lateral_path_command(arc_model(0.0), 0.0, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0,
+                             path_angle_last=0.4, path_offset_last=1.0)
+
+  assert cmd.path_angle == 0.0
+  assert cmd.path_offset == 0.0
+
+  reverse = lateral_path_command(arc_model(-0.02), -0.02, 0.0, 7.0,
+                                 0.0, True, False, c2_last=0.0,
+                                 path_angle_last=0.4, path_offset_last=1.0)
+
+  assert reverse.path_angle < 0.0
+  assert reverse.path_offset < 0.0
+
+
+def test_c1_uses_near_constant_curvature():
   curvature = 0.02
   cmd = lateral_path_command(arc_model(curvature, xs=(0.0, 7.0, 14.0, 20.0)), curvature, 0.0, 7.0,
                              0.0, True, False, c2_last=0.0)
@@ -325,7 +374,7 @@ def test_c1_preview_does_not_amplify_constant_curvature():
   assert math.isclose(cmd.path_angle, (curvature - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
-def test_c1_preview_ignores_opposite_future_curvature():
+def test_c1_ignores_opposite_far_field_curvature():
   desired = 0.02
   near_curvature = 0.02
   preview_curvature = -0.04
@@ -335,7 +384,7 @@ def test_c1_preview_ignores_opposite_future_curvature():
   assert math.isclose(cmd.path_angle, (near_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
-def test_c1_preview_does_not_add_far_field_c0():
+def test_far_field_geometry_does_not_amplify_near_path_coefficients():
   desired = 0.02
   near_curvature = desired
   preview_curvature = 0.025
@@ -343,7 +392,7 @@ def test_c1_preview_does_not_add_far_field_c0():
   cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, measured, 7.0,
                              measured, True, False, c2_last=0.0)
 
-  assert math.isclose(cmd.path_angle, (preview_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_angle, (near_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
   assert math.isclose(cmd.path_offset, 0.5 * near_curvature * 7.0 * 7.0)
 
 

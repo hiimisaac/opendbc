@@ -59,6 +59,8 @@ class CarController(CarControllerBase):
     self.CAN = fordcan.CanBus(CP)
 
     self.apply_curvature_last = 0
+    self.path_angle_last = 0.0
+    self.path_offset_last = 0.0
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
     self.c0_undertrack_correction = 0.0
@@ -139,12 +141,16 @@ class CarController(CarControllerBase):
         cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
                                    self.k_meas_filt, CC.latActive, driver_override,
                                    c2_last=self.apply_curvature_last,
-                                   c0_undertrack_correction=self.c0_undertrack_correction)
+                                   c0_undertrack_correction=self.c0_undertrack_correction,
+                                   path_angle_last=self.path_angle_last,
+                                   path_offset_last=self.path_offset_last)
         self.k_meas_filt = cmd.k_meas_filt
         self.c0_undertrack_correction = cmd.c0_undertrack_correction
         apply_curvature = cmd.curvature
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
+        self.path_angle_last = path_angle
+        self.path_offset_last = path_offset
         curvature_rate = 0.0
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)

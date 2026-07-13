@@ -29,7 +29,6 @@ FORD_PATH_C2_CAN_CLIP = (-0.02, 0.02)
 
 FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
-FORD_PATH_PSCM_RESPONSE_TIME = 1.0  # s, identified LMC2 curvature response lag
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
 FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT = 0.02  # 1/m, bounds added offset authority
@@ -63,6 +62,11 @@ FORD_PATH_C1_DEADZONE = 0.0003       # 1/m, filtered yaw-noise floor on the c1 c
 # so it does not transmit model plan wiggle the slow c2 channel would filter.
 # (measured: straight-road weave amplification 1.85 with c1 active vs 1.30 silent)
 FORD_PATH_C1_CRUISE_DEADZONE = 0.0007  # 1/m, added at full c2 share
+# C0 and C1 encode the same maneuver path at different polynomial orders. Limit
+# same-direction authority buildup by one equivalent-curvature step so model-
+# frame jumps remain coherent at any c1 lookahead distance. Release and reversal
+# are not delayed. This is a transition bound, not a path gain.
+FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW = 0.006  # 1/m per 20Hz frame
 FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
 
 
@@ -94,6 +98,13 @@ def _interp(x: float, xs, ys) -> float:
 
 def _finite(value: float, fallback: float = 0.0) -> float:
   return float(value) if math.isfinite(value) else fallback
+
+
+def _limit_same_direction_attack(value: float, last: float, max_step: float) -> float:
+  """Limit growing same-direction authority without delaying release/reversal."""
+  if value * last >= 0.0 and abs(value) > abs(last):
+    return math.copysign(min(abs(value), abs(last) + max_step), value)
+  return value
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
@@ -133,7 +144,9 @@ def _valid_model_path(model) -> bool:
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
                          driver_override: bool, c2_last: float | None = None,
-                         c0_undertrack_correction: float = 0.0) -> LateralPathCommand:
+                         c0_undertrack_correction: float = 0.0,
+                         path_angle_last: float | None = None,
+                         path_offset_last: float | None = None) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is the
@@ -180,30 +193,13 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   # modelV2's legacy path geometry can be weaker than its lag-adjusted action.
   # While c2 owns lane following, preserve the model residual as-is. Once c2
-  # starts fading for a maneuver, require c0/c1 to encode at least the action's
-  # constant-curvature arc; keep stronger same-direction model anticipation.
+  # starts fading for a maneuver, c1 follows the bounded action while c0 keeps
+  # stronger same-direction near-path geometry and undertracking authority.
   c1_path_angle_raw = path_angle_raw
   if c2_share < 1.0:
-    # The PSCM takes about one second to realize an LMC2 curvature change. Look
-    # that response time farther into the model during maneuver entry and use
-    # the stronger same-direction curvature. Normalize orientation by distance
-    # before comparing so a constant-radius path is not amplified merely by
-    # sampling it farther away. Keep c0's base placement at 7m; preview belongs
-    # in c1, while c0 below only supplies near-path undertracking authority.
-    # Far curvature being stronger than near curvature is the stateless entry
-    # gate: steady and unwinding paths do not receive preview.
-    if model_path_valid:
-      model_horizon = max(d_look, _finite(model.position.x[-1], d_look))
-      d_preview = min(d_look + max(v_ego, 0.0) * FORD_PATH_PSCM_RESPONSE_TIME, model_horizon)
-      if d_preview > d_look:
-        near_curvature = path_angle_raw / d_look
-        preview_curvature = _interp(d_preview, model.position.x, model.orientation.z) / d_preview
-        if preview_curvature * desired_curvature > 0.0 and abs(preview_curvature) > abs(near_curvature):
-          c1_path_angle_raw = preview_curvature * d_look
-
     path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
-    c1_path_angle_raw = _authority_floor(c1_path_angle_raw, desired_curvature * d_look)
     path_offset_raw = _authority_floor(path_offset_raw, 0.5 * desired_curvature * d_c0 * d_c0)
+    c1_path_angle_raw = desired_curvature * d_look
 
   # Subtract only the measured curvature already delivering this path. Bounding
   # it to the path's direction and magnitude makes c0/c1 one-sided: they fill
@@ -223,6 +219,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
   c1_error = math.copysign(max(abs(c1_error) - c1_deadzone, 0.0), c1_error)
   path_angle = _clip(c1_error * d_look, *FORD_PATH_C1_CAN_CLIP)
+  if c2_share < 1.0 and path_angle_last is not None:
+    path_angle_last = _finite(path_angle_last)
+    c1_slew = FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW * d_look
+    path_angle = _limit_same_direction_attack(path_angle, path_angle_last, c1_slew)
   # c0 is maneuver-only: on straights it dithers centimeter position commands
   # into the PSCM's offset servo (measured standing left-pull), so it is exactly
   # zero there. Its gate reaches full strength by 0.006 so turn entries get the
@@ -278,6 +278,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   path_offset += 0.5 * applied_correction * d_c0 * d_c0
 
   path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
+  if c0_gain > 0.0 and path_offset_last is not None:
+    path_offset_last = _finite(path_offset_last)
+    c0_slew = 0.5 * FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW * d_c0 * d_c0
+    path_offset = _limit_same_direction_attack(path_offset, path_offset_last, c0_slew)
 
   # Don't command a path against an opposing driver: the PSCM integrates the
   # torque fight and discharges it as a jump the moment they release. Zero the
