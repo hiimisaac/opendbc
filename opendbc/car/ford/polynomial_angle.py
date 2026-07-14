@@ -25,6 +25,10 @@ FORD_POLY_C1_CAN_CLIP = (-0.475, 0.497)
 # largest value reached by the lat-test fade and did not require old-direction
 # C2 to re-enter on turn exit. Keep it as a continuously present base instead.
 FORD_POLY_C2_BASE_LIMIT = 0.006  # 1/m
+FORD_POLY_C2_LATCH_ENTER = 0.012  # 1/m requested curvature
+FORD_POLY_C2_LATCH_EXIT_TARGET = 0.002  # 1/m
+FORD_POLY_C2_LATCH_EXIT_ERROR = 0.001   # 1/m steering-angle error
+FORD_POLY_C2_FLUSH_FRAMES = 10          # 0.5 s at 20 Hz
 
 # C0/C1 extend the virtual target beyond the safe C2 base. Steering-angle
 # feedback is bounded separately so it can reject error without becoming an
@@ -49,6 +53,8 @@ class PolynomialAngleCommand:
   virtual_curvature: float
   path_curvature: float
   handoff_complete: bool
+  c2_latched: bool
+  c2_recovery_frames: int
 
 
 def _finite(value: float, fallback: float = 0.0) -> float:
@@ -88,7 +94,9 @@ def polynomial_angle_command(desired_curvature: float, angle_error_curvature: fl
                              *, virtual_curvature_last: float = 0.0,
                              path_curvature_last: float = 0.0,
                              curvature_rate_last: float = 0.0,
-                             driver_handoff: bool = False) -> PolynomialAngleCommand:
+                             driver_handoff: bool = False,
+                             c2_latched_last: bool = False,
+                             c2_recovery_frames_last: int = 0) -> PolynomialAngleCommand:
   """Encode one virtual steering target across the complete Ford polynomial.
 
   desired_curvature is openpilot's lag-adjusted action. angle_error_curvature
@@ -103,9 +111,20 @@ def polynomial_angle_command(desired_curvature: float, angle_error_curvature: fl
   virtual_curvature_last = _finite(virtual_curvature_last)
   path_curvature_last = _finite(path_curvature_last)
   curvature_rate_last = _finite(curvature_rate_last)
+  c2_latched = bool(c2_latched_last)
+  c2_recovery_frames = max(int(c2_recovery_frames_last), 0)
 
   if not lat_active:
-    return PolynomialAngleCommand(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, True)
+    # Continue sending zero while preserving the flush latch across a quick
+    # disengage/re-engage. After half a second of inactive zero commands, C2 is
+    # allowed to serve gentle curvature again.
+    if c2_latched:
+      c2_recovery_frames += 1
+      if c2_recovery_frames >= FORD_POLY_C2_FLUSH_FRAMES:
+        c2_latched = False
+        c2_recovery_frames = 0
+    return PolynomialAngleCommand(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, True,
+                                  c2_latched, c2_recovery_frames)
 
   target_curvature = measured_curvature if driver_override else desired_curvature
   if driver_override:
@@ -119,11 +138,28 @@ def polynomial_angle_command(desired_curvature: float, angle_error_curvature: fl
     virtual_curvature = _limit_same_direction_attack(target_curvature, virtual_curvature_last,
                                                      FORD_POLY_ATTACK_SLEW)
 
-  handoff_complete = not driver_handoff or virtual_curvature == target_curvature
+  # Large-turn C2 is stateful by observation, so remove it for the complete
+  # maneuver rather than fading it according to instantaneous curvature. It
+  # may return only after target and steering-angle error have both remained
+  # near straight long enough to flush the PSCM's held-curvature state.
+  if abs(target_curvature) >= FORD_POLY_C2_LATCH_ENTER:
+    c2_latched = True
+    c2_recovery_frames = 0
+  elif c2_latched:
+    near_straight = abs(target_curvature) <= FORD_POLY_C2_LATCH_EXIT_TARGET and \
+                    abs(angle_error_curvature) <= FORD_POLY_C2_LATCH_EXIT_ERROR
+    if near_straight:
+      c2_recovery_frames += 1
+      if c2_recovery_frames >= FORD_POLY_C2_FLUSH_FRAMES:
+        c2_latched = False
+        c2_recovery_frames = 0
+    else:
+      c2_recovery_frames = 0
 
-  # C2 never changes ownership. It is a continuous saturated projection of the
-  # shared target, so a falling target cannot make old-direction C2 grow.
-  c2 = _clip(virtual_curvature, -FORD_POLY_C2_BASE_LIMIT, FORD_POLY_C2_BASE_LIMIT)
+  # Outside maneuvers C2 is a continuous saturated projection of the shared
+  # target. While latched, its entire allocation moves into the C0/C1 pair.
+  c2 = 0.0 if c2_latched else _clip(virtual_curvature,
+                                    -FORD_POLY_C2_BASE_LIMIT, FORD_POLY_C2_BASE_LIMIT)
   overflow_curvature = virtual_curvature - c2
 
   angle_correction = 0.0 if driver_override else _clip(angle_error_curvature,
@@ -141,6 +177,8 @@ def polynomial_angle_command(desired_curvature: float, angle_error_curvature: fl
     path_curvature = _limit_same_direction_attack(path_target, path_curvature_last,
                                                   FORD_POLY_ATTACK_SLEW)
   path_curvature = _clip(path_curvature, *FORD_POLY_PATH_CURVATURE_CLIP)
+  handoff_complete = not driver_handoff or \
+                     (virtual_curvature == target_curvature and path_curvature == path_target)
 
   c1 = path_curvature * FORD_POLY_LOOKAHEAD
   c0 = 0.5 * path_curvature * FORD_POLY_LOOKAHEAD ** 2
@@ -164,4 +202,5 @@ def polynomial_angle_command(desired_curvature: float, angle_error_curvature: fl
       c3 = raw_c3
 
   return PolynomialAngleCommand(c2, c3, c1, c0, virtual_curvature,
-                                path_curvature, handoff_complete)
+                                path_curvature, handoff_complete,
+                                c2_latched, c2_recovery_frames)

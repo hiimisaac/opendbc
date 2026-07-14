@@ -79,6 +79,8 @@ class CarController(CarControllerBase):
     self.virtual_curvature_last = 0.0
     self.path_curvature_last = 0.0
     self.curvature_rate_last = 0.0
+    self.c2_latched = False
+    self.c2_recovery_frames = 0
     self.anti_overshoot_curvature_last = 0
     self.driver_handoff = False
 
@@ -158,7 +160,9 @@ class CarController(CarControllerBase):
                                        virtual_curvature_last=self.virtual_curvature_last,
                                        path_curvature_last=self.path_curvature_last,
                                        curvature_rate_last=self.curvature_rate_last,
-                                       driver_handoff=self.driver_handoff and not driver_override)
+                                       driver_handoff=self.driver_handoff and not driver_override,
+                                       c2_latched_last=self.c2_latched,
+                                       c2_recovery_frames_last=self.c2_recovery_frames)
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
@@ -166,6 +170,8 @@ class CarController(CarControllerBase):
         self.virtual_curvature_last = cmd.virtual_curvature
         self.path_curvature_last = cmd.path_curvature
         self.curvature_rate_last = cmd.curvature_rate
+        self.c2_latched = cmd.c2_latched
+        self.c2_recovery_frames = cmd.c2_recovery_frames
         if driver_override:
           self.driver_handoff = True
         elif self.driver_handoff and cmd.handoff_complete:
