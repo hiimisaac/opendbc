@@ -67,6 +67,10 @@ FORD_PATH_C1_CRUISE_DEADZONE = 0.0007  # 1/m, added at full c2 share
 # frame jumps remain coherent at any c1 lookahead distance. Release and reversal
 # are not delayed. This is a transition bound, not a path gain.
 FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW = 0.006  # 1/m per 20Hz frame
+# A driver hand-back must also bound releases and reversals because the model
+# path can differ sharply from the arc the driver was holding. Keep this faster
+# than maneuver attack so control resumes promptly without a coefficient step.
+FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW = 0.01  # 1/m per 20Hz frame
 FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
 
 
@@ -77,6 +81,7 @@ class LateralPathCommand:
   path_offset: float  # c0
   k_meas_filt: float
   c0_undertrack_correction: float
+  handoff_complete: bool
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -107,13 +112,17 @@ def _limit_same_direction_attack(value: float, last: float, max_step: float) -> 
   return value
 
 
+def _limit_step(value: float, last: float, max_step: float) -> float:
+  return _clip(value, last - max_step, last + max_step)
+
+
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
                                      desired_curvature: float) -> bool:
-  """Relent only when the driver steers against the requested curvature.
+  """Select cooperative path tracking when the driver opposes the request.
 
   Ford's steering-column torque and openpilot curvature use the same turn sign.
-  Same-sign torque is the driver helping the path controller and must not make
-  LMC2 drop out. With no directional request, any pressed input takes priority.
+  Same-sign torque is the driver helping the path controller and keeps normal
+  model control. With no directional request, any pressed input takes priority.
   """
   if not steering_pressed:
     return False
@@ -146,13 +155,15 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                          driver_override: bool, c2_last: float | None = None,
                          c0_undertrack_correction: float = 0.0,
                          path_angle_last: float | None = None,
-                         path_offset_last: float | None = None) -> LateralPathCommand:
+                         path_offset_last: float | None = None,
+                         driver_handoff: bool = False) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
-  model is a modelV2 reader (or None when missing/stale); k_meas is the
-  yaw-derived current curvature, and k_meas_filt is this module's state from
-  the previous step. Measured curvature shapes only the transient c0/c1
-  residual; c2 remains the upstream lane-following request.
+  model is a modelV2 reader (or None when missing/stale); k_meas is normally
+  yaw-derived curvature and is steering-angle-derived during a driver override.
+  k_meas_filt is this module's state from the previous step. Outside cooperative
+  control, measured curvature shapes only the transient c0/c1 residual and c2
+  remains the upstream lane-following request.
   """
   desired_curvature = _finite(desired_curvature)
   k_meas = _finite(k_meas)
@@ -161,7 +172,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                                    -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT, FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
 
   if not lat_active:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas, 0.0)
+    return LateralPathCommand(0.0, 0.0, 0.0, k_meas, 0.0, True)
 
   k_meas_filt = _finite(k_meas_filt)
   if v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
@@ -183,6 +194,15 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # and pure path heading is the proven regime.
   d_look = max(v_ego * FORD_PATH_D_LOOK_TIME, FORD_PATH_D_LOOK_MIN)
   d_c0 = FORD_PATH_D_C0
+  if driver_override:
+    # Keep the controller synchronized to the arc the driver is physically
+    # steering. C0/C1 update with the delivered path while c2 and adaptive
+    # authority stay empty, allowing a model hand-back anywhere in the curve
+    # without storing a torque fight in the PSCM.
+    path_angle = _clip(k_meas * d_look, *FORD_PATH_C1_CAN_CLIP)
+    path_offset = _clip(0.5 * k_meas * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
+    return LateralPathCommand(0.0, path_angle, path_offset, k_meas_filt, 0.0, False)
+
   model_path_valid = _valid_model_path(model)
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
@@ -283,11 +303,17 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     c0_slew = 0.5 * FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW * d_c0 * d_c0
     path_offset = _limit_same_direction_attack(path_offset, path_offset_last, c0_slew)
 
-  # Don't command a path against an opposing driver: the PSCM integrates the
-  # torque fight and discharges it as a jump the moment they release. Zero the
-  # whole command so the carcontroller can drop to mode 0 (stock-style relent).
-  # Helpful same-direction torque is not an override and stays in mode 2.
-  if driver_override:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas_filt, 0.0)
+  handoff_complete = True
+  if driver_handoff and path_angle_last is not None and path_offset_last is not None:
+    path_angle_last = _finite(path_angle_last)
+    path_offset_last = _finite(path_offset_last)
+    target_path_angle = path_angle
+    target_path_offset = path_offset
+    c1_handoff_slew = FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW * d_look
+    c0_handoff_slew = 0.5 * FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW * d_c0 * d_c0
+    path_angle = _limit_step(target_path_angle, path_angle_last, c1_handoff_slew)
+    path_offset = _limit_step(target_path_offset, path_offset_last, c0_handoff_slew)
+    handoff_complete = path_angle == target_path_angle and path_offset == target_path_offset
 
-  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt, c0_undertrack_correction)
+  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt,
+                            c0_undertrack_correction, handoff_complete)
