@@ -1,7 +1,7 @@
 import math
 from types import SimpleNamespace
 
-from opendbc.car.ford.carcontroller import _load_messaging, lmc2_mode, lmc2_precision
+from opendbc.car.ford.carcontroller import lmc2_mode, lmc2_precision
 from opendbc.car.ford.fordcan import lmc2_curvature_rate_for_can
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
@@ -281,41 +281,6 @@ def test_zero_torque_during_pressed_release_does_not_interrupt_handoff():
 
 def test_unpressed_driver_never_overrides_path_command():
   assert not driver_steering_opposes_command(False, -1.125, 0.013)
-
-
-def test_sunnypilot_messaging_namespace_is_preferred():
-  sentinel = object()
-  imports = []
-
-  def fake_import(name):
-    imports.append(name)
-    if name == "cereal.messaging":
-      return sentinel
-    raise ImportError(name)
-
-  assert _load_messaging(fake_import) is sentinel
-  assert imports == ["cereal.messaging"]
-
-
-def test_upstream_messaging_namespace_is_the_fallback():
-  sentinel = object()
-  imports = []
-
-  def fake_import(name):
-    imports.append(name)
-    if name == "openpilot.cereal.messaging":
-      return sentinel
-    raise ImportError(name)
-
-  assert _load_messaging(fake_import) is sentinel
-  assert imports == ["cereal.messaging", "openpilot.cereal.messaging"]
-
-
-def test_missing_messaging_namespaces_disable_model_subscription():
-  def fake_import(name):
-    raise ImportError(name)
-
-  assert _load_messaging(fake_import) is None
 
 
 def test_lmc2_stays_comfortably_active_during_driver_override():

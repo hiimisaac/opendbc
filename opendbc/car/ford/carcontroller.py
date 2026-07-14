@@ -1,25 +1,14 @@
-import importlib
 import math
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import AVERAGE_ROAD_ROLL, ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import driver_steering_opposes_command, lateral_path_command
+from opendbc.car.ford.lateral_path import driver_steering_opposes_command
+from opendbc.car.ford.polynomial_angle import FORD_POLY_ANGLE_ERROR_DEADZONE_DEG, polynomial_angle_command
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
-
-
-def _load_messaging(import_module=importlib.import_module):
-  """Load messaging from sunnypilot first, with upstream as a fallback."""
-  for module_name in ("cereal.messaging", "openpilot.cereal.messaging"):
-    try:
-      return import_module(module_name)
-    except ImportError:
-      pass
-  return None
-
 
 def lmc2_mode(lat_active: bool) -> int:
   return 2 if lat_active else 0
@@ -28,8 +17,6 @@ def lmc2_mode(lat_active: bool) -> int:
 def lmc2_precision(cooperative_control: bool) -> int:
   return 0 if cooperative_control else 1
 
-
-messaging = _load_messaging()
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -89,20 +76,11 @@ class CarController(CarControllerBase):
     self.VM = VehicleModel(CP)
 
     self.apply_curvature_last = 0
-    self.path_angle_last = 0.0
-    self.path_offset_last = 0.0
+    self.virtual_curvature_last = 0.0
+    self.path_curvature_last = 0.0
+    self.curvature_rate_last = 0.0
     self.anti_overshoot_curvature_last = 0
-    self.k_meas_filt = 0.0
-    self.c0_undertrack_correction = 0.0
     self.driver_handoff = False
-    self.model = None
-    self.model_frame = 0
-    self.sm = None
-    if messaging is not None and CP.flags & FordFlags.CANFD:
-      try:
-        self.sm = messaging.SubMaster(["modelV2"])
-      except Exception:
-        self.sm = None
 
     self.accel = 0.0
     self.gas = 0.0
@@ -115,12 +93,6 @@ class CarController(CarControllerBase):
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
-
-    if self.sm is not None:
-      self.sm.update(0)
-      if self.sm.updated["modelV2"]:
-        self.model = self.sm["modelV2"]
-        self.model_frame = self.frame
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -164,7 +136,6 @@ class CarController(CarControllerBase):
 
       if self.CP.flags & FordFlags.CANFD:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
-        model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
         driver_override = CC.latActive and driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
                                                                            desired_curvature)
         cooperative_control = driver_override or self.driver_handoff
@@ -174,21 +145,27 @@ class CarController(CarControllerBase):
         path_curvature = current_curvature
         if driver_override:
           path_curvature = -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg), CS.out.vEgoRaw, 0.0)
-        cmd = lateral_path_command(model, desired_curvature, path_curvature, CS.out.vEgoRaw,
-                                   self.k_meas_filt, CC.latActive, driver_override,
-                                   c2_last=self.apply_curvature_last,
-                                   c0_undertrack_correction=self.c0_undertrack_correction,
-                                   path_angle_last=self.path_angle_last,
-                                   path_offset_last=self.path_offset_last,
-                                   driver_handoff=self.driver_handoff and not driver_override)
-        self.k_meas_filt = cmd.k_meas_filt
-        self.c0_undertrack_correction = cmd.c0_undertrack_correction
+
+        # openpilot already produces a steering-wheel-angle target for Ford.
+        # Express its error as curvature, then let one shared controller encode
+        # that target across the complete LMC2 polynomial.
+        angle_error_deg = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
+        angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_POLY_ANGLE_ERROR_DEADZONE_DEG, 0.0),
+                                        angle_error_deg)
+        angle_error_curvature = -self.VM.calc_curvature(math.radians(angle_error_deg), CS.out.vEgoRaw, 0.0)
+        cmd = polynomial_angle_command(desired_curvature, angle_error_curvature, path_curvature,
+                                       CS.out.vEgoRaw, CC.latActive, driver_override,
+                                       virtual_curvature_last=self.virtual_curvature_last,
+                                       path_curvature_last=self.path_curvature_last,
+                                       curvature_rate_last=self.curvature_rate_last,
+                                       driver_handoff=self.driver_handoff and not driver_override)
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
-        self.path_angle_last = path_angle
-        self.path_offset_last = path_offset
+        self.virtual_curvature_last = cmd.virtual_curvature
+        self.path_curvature_last = cmd.path_curvature
+        self.curvature_rate_last = cmd.curvature_rate
         if driver_override:
           self.driver_handoff = True
         elif self.driver_handoff and cmd.handoff_complete:
