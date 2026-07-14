@@ -8,6 +8,7 @@ from opendbc.car.ford import fordcan
 from opendbc.car.ford.lateral_path import driver_steering_opposes_command, lateral_path_command
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
+from opendbc.car.vehicle_model import VehicleModel
 
 
 def _load_messaging(import_module=importlib.import_module):
@@ -20,9 +21,12 @@ def _load_messaging(import_module=importlib.import_module):
   return None
 
 
-def lmc2_ramp_type(driver_override: bool, driver_override_last: bool) -> int:
-  """Use the PSCM's native slow ramp only on a mode-0-to-mode-2 handoff."""
-  return 0 if driver_override_last and not driver_override else 3
+def lmc2_mode(lat_active: bool) -> int:
+  return 2 if lat_active else 0
+
+
+def lmc2_precision(cooperative_control: bool) -> int:
+  return 0 if cooperative_control else 1
 
 
 messaging = _load_messaging()
@@ -82,6 +86,7 @@ class CarController(CarControllerBase):
     super().__init__(dbc_names, CP, CP_SP)
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.CAN = fordcan.CanBus(CP)
+    self.VM = VehicleModel(CP)
 
     self.apply_curvature_last = 0
     self.path_angle_last = 0.0
@@ -89,7 +94,7 @@ class CarController(CarControllerBase):
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
     self.c0_undertrack_correction = 0.0
-    self.driver_override_last = False
+    self.driver_handoff = False
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -142,7 +147,7 @@ class CarController(CarControllerBase):
     path_angle = 0.0
     path_offset = 0.0
     curvature_rate = 0.0
-    ramp_type = 0
+    ramp_type = 3
     driver_override = False
 
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
@@ -160,15 +165,22 @@ class CarController(CarControllerBase):
       if self.CP.flags & FordFlags.CANFD:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
-        driver_override = driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
-                                                          desired_curvature)
-        ramp_type = lmc2_ramp_type(driver_override, self.driver_override_last)
-        cmd = lateral_path_command(model, desired_curvature, current_curvature, CS.out.vEgoRaw,
+        driver_override = CC.latActive and driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
+                                                                           desired_curvature)
+        cooperative_control = driver_override or self.driver_handoff
+        # During an opposing override, synchronize the path to the steering
+        # angle the driver is holding. Unlike yaw/v, this remains usable at low
+        # speed and follows the driver's input without waiting for vehicle yaw.
+        path_curvature = current_curvature
+        if driver_override:
+          path_curvature = -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg), CS.out.vEgoRaw, 0.0)
+        cmd = lateral_path_command(model, desired_curvature, path_curvature, CS.out.vEgoRaw,
                                    self.k_meas_filt, CC.latActive, driver_override,
                                    c2_last=self.apply_curvature_last,
                                    c0_undertrack_correction=self.c0_undertrack_correction,
                                    path_angle_last=self.path_angle_last,
-                                   path_offset_last=self.path_offset_last)
+                                   path_offset_last=self.path_offset_last,
+                                   driver_handoff=self.driver_handoff and not driver_override)
         self.k_meas_filt = cmd.k_meas_filt
         self.c0_undertrack_correction = cmd.c0_undertrack_correction
         apply_curvature = cmd.curvature
@@ -176,6 +188,10 @@ class CarController(CarControllerBase):
         path_offset = cmd.path_offset
         self.path_angle_last = path_angle
         self.path_offset_last = path_offset
+        if driver_override:
+          self.driver_handoff = True
+        elif self.driver_handoff and cmd.handoff_complete:
+          self.driver_handoff = False
         curvature_rate = 0.0
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
@@ -185,13 +201,13 @@ class CarController(CarControllerBase):
       self.apply_curvature_last = apply_curvature
 
       if self.CP.flags & FordFlags.CANFD:
-        mode = 2 if CC.latActive and not driver_override else 0
+        mode = lmc2_mode(CC.latActive)
+        precision = lmc2_precision(cooperative_control)
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(
-          self.packer, self.CAN, mode, ramp_type, 1, -path_offset, -path_angle,
+          self.packer, self.CAN, mode, ramp_type, precision, -path_offset, -path_angle,
           -apply_curvature, -curvature_rate, counter
         ))
-        self.driver_override_last = driver_override
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
 
