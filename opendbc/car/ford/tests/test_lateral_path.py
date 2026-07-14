@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 from opendbc.car.ford.carcontroller import _load_messaging, lmc2_mode, lmc2_precision
+from opendbc.car.ford.fordcan import lmc2_curvature_rate_for_can
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
@@ -11,6 +12,7 @@ from opendbc.car.ford.lateral_path import (
   FORD_PATH_K_MEAS_TAU,
   driver_steering_opposes_command,
   lateral_path_command,
+  model_curvature_rate,
 )
 
 
@@ -30,12 +32,56 @@ def changing_curvature_model(near_curvature, preview_curvature):
   )
 
 
+def spatial_curvature_rate_model(curvature, curvature_rate, distances=(0.0, 3.5, 7.0)):
+  return SimpleNamespace(
+    position=SimpleNamespace(x=list(distances), y=[0.0] * len(distances)),
+    orientation=SimpleNamespace(z=[curvature * s + 0.5 * curvature_rate * s * s for s in distances]),
+  )
+
+
+def test_model_curvature_rate_recovers_full_spatial_slope():
+  for curvature_rate in (-0.002, -0.0004, 0.0004, 0.002):
+    model = spatial_curvature_rate_model(0.01, curvature_rate)
+    assert math.isclose(model_curvature_rate(model, 7.0), curvature_rate, abs_tol=1e-12)
+
+
+def test_model_curvature_rate_uses_distance_along_path():
+  # Points are 5 m apart spatially despite advancing only 3 m longitudinally.
+  distances = (0.0, 5.0, 10.0)
+  curvature_rate = 0.0006
+  model = SimpleNamespace(
+    position=SimpleNamespace(x=[0.0, 3.0, 6.0], y=[0.0, 4.0, 8.0]),
+    orientation=SimpleNamespace(z=[0.01 * s + 0.5 * curvature_rate * s * s for s in distances]),
+  )
+
+  assert math.isclose(model_curvature_rate(model, 10.0), curvature_rate, abs_tol=1e-12)
+
+
+def test_model_curvature_rate_rejects_missing_or_degenerate_paths():
+  degenerate = SimpleNamespace(
+    position=SimpleNamespace(x=[0.0, 0.0], y=[0.0, 0.0]),
+    orientation=SimpleNamespace(z=[0.0, 0.1]),
+  )
+
+  assert model_curvature_rate(None, 7.0) == 0.0
+  assert model_curvature_rate(degenerate, 7.0) == 0.0
+
+
+def test_lmc2_curvature_rate_uses_full_wire_range_without_wrapping():
+  assert lmc2_curvature_rate_for_can(0.0008) == 0.0008
+  assert lmc2_curvature_rate_for_can(-0.0008) == -0.0008
+  assert lmc2_curvature_rate_for_can(0.002) == 0.001023
+  assert lmc2_curvature_rate_for_can(-0.002) == -0.001024
+  assert lmc2_curvature_rate_for_can(float("nan")) == 0.0
+
+
 def test_inactive_zeros_command():
   cmd = lateral_path_command(None, 0.01, 0.002, 20.0, 0.005, False, False)
 
   assert cmd.curvature == 0.0
   assert cmd.path_angle == 0.0
   assert cmd.path_offset == 0.0
+  assert cmd.curvature_rate == 0.0
   assert cmd.k_meas_filt == 0.002
   assert cmd.c0_undertrack_correction == 0.0
 
@@ -306,6 +352,17 @@ def test_non_finite_inputs_are_safe():
   assert math.isfinite(cmd.curvature)
   assert math.isfinite(cmd.path_angle)
   assert math.isfinite(cmd.path_offset)
+  assert math.isfinite(cmd.curvature_rate)
+
+
+def test_lateral_path_command_carries_model_spatial_curvature_slope():
+  curvature_rate = 0.0015
+  cmd = lateral_path_command(spatial_curvature_rate_model(0.01, curvature_rate), 0.01, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0)
+
+  # Keep the complete model coefficient here; only the physical CAN encoding
+  # boundary may saturate it when the message is packed.
+  assert math.isclose(cmd.curvature_rate, curvature_rate, abs_tol=1e-12)
 
 
 def test_c0_full_strength_through_turn_entry():

@@ -1,6 +1,18 @@
+import math
+
 from opendbc.car import CanBusBase, structs
 
 HUDControl = structs.CarControl.HUDControl
+
+LMC2_CURVATURE_RATE_MIN = -0.001024
+LMC2_CURVATURE_RATE_MAX = 0.001023
+
+
+def lmc2_curvature_rate_for_can(curvature_rate: float) -> float:
+  """Saturate only at the signed 11-bit signal boundary to prevent wrapping."""
+  if not math.isfinite(curvature_rate):
+    return 0.0
+  return min(max(curvature_rate, LMC2_CURVATURE_RATE_MIN), LMC2_CURVATURE_RATE_MAX)
 
 
 class CanBus(CanBusBase):
@@ -105,7 +117,7 @@ def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, ramp_type: int = 0, prec
     "LatCtlPathOffst_L_Actl": path_offset,      # [-5.12|5.11] meter
     "LatCtlPath_An_Actl": path_angle,           # [-0.5|0.5235] radians
     "LatCtlCurv_No_Actl": curvature,            # [-0.02|0.02094] 1/meter
-    "LatCtlCrv_NoRate2_Actl": curvature_rate,   # [-0.001024|0.001023] 1/meter^2
+    "LatCtlCrv_NoRate2_Actl": lmc2_curvature_rate_for_can(curvature_rate),  # [-0.001024|0.001023] 1/meter^2
     "HandsOffCnfm_B_Rq": 0,                     # 0=Inactive, 1=Active [0|1]
     "LatCtlPath_No_Cnt": counter,               # [0|15]
     "LatCtlPath_No_Cs": 0,                      # [0|255]

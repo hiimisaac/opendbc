@@ -159,6 +159,7 @@ class CarController(CarControllerBase):
         self.k_meas_filt = cmd.k_meas_filt
         self.c0_undertrack_correction = cmd.c0_undertrack_correction
         apply_curvature = cmd.curvature
+        curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
         self.path_angle_last = path_angle
@@ -167,7 +168,6 @@ class CarController(CarControllerBase):
           self.driver_handoff = True
         elif self.driver_handoff and cmd.handoff_complete:
           self.driver_handoff = False
-        curvature_rate = 0.0
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         # Preserve upstream's curvature error and ISO lateral jerk limits for
