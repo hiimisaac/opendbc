@@ -166,6 +166,144 @@ def test_c2_fade_is_continuous():
   assert math.isclose(cmd.curvature, k * 0.5)
 
 
+def test_large_turn_c2_does_not_reenter_during_unwind():
+  # Reproduce the logged failure: after a large turn makes c2 zero, a falling
+  # desired curvature must not let old-direction c2 fade back in.
+  c2_last = 0.0
+  c2_latched = False
+  recovery_frames = 0
+  unwind_curvature = 0.0
+
+  for desired in (0.012, 0.009, 0.006, 0.003, 0.0):
+    wheel_curvature = 0.012
+    cmd = lateral_path_command(
+      arc_model(desired), desired, wheel_curvature, 7.0, wheel_curvature, True, False,
+      c2_last=c2_last,
+      angle_error_curvature=desired - wheel_curvature,
+      wheel_curvature=wheel_curvature,
+      c2_latched_last=c2_latched,
+      c2_recovery_frames_last=recovery_frames,
+      unwind_curvature_last=unwind_curvature,
+    )
+    c2_last = cmd.curvature
+    c2_latched = cmd.c2_latched
+    recovery_frames = cmd.c2_recovery_frames
+    unwind_curvature = cmd.unwind_curvature
+    assert cmd.curvature == 0.0
+
+  # At zero target the wheel is still in the old turn, so c0/c1 must carry a
+  # bounded opposite-direction return instead of merely dropping to zero.
+  assert cmd.path_angle < 0.0
+  assert cmd.path_offset < 0.0
+
+
+def test_large_turn_c2_releases_only_after_stable_physical_flush():
+  c2_latched = True
+  recovery_frames = 0
+  for frame in range(10):
+    cmd = lateral_path_command(
+      arc_model(0.0), 0.0, 0.0, 7.0, 0.0, True, False,
+      c2_last=0.0,
+      angle_error_curvature=0.0,
+      wheel_curvature=0.0,
+      c2_latched_last=c2_latched,
+      c2_recovery_frames_last=recovery_frames,
+    )
+    c2_latched = cmd.c2_latched
+    recovery_frames = cmd.c2_recovery_frames
+    assert c2_latched == (frame < 9)
+
+
+def test_quick_disengage_preserves_large_turn_c2_flush():
+  inactive = lateral_path_command(
+    None, 0.0, 0.0, 7.0, 0.0, False, False,
+    c2_latched_last=True,
+  )
+  reengaged = lateral_path_command(
+    arc_model(0.003), 0.003, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0,
+    c2_latched_last=inactive.c2_latched,
+    c2_recovery_frames_last=inactive.c2_recovery_frames,
+  )
+
+  assert inactive.c2_latched
+  assert reengaged.c2_latched
+  assert reengaged.curvature == 0.0
+
+
+def test_large_turn_unwind_only_corrects_toward_desired_wheel_angle():
+  common = dict(c2_last=0.0, c2_latched_last=True, c2_recovery_frames_last=0)
+
+  lagging = lateral_path_command(
+    arc_model(0.003), 0.003, 0.01, 7.0, 0.01, True, False,
+    angle_error_curvature=-0.007, wheel_curvature=0.01, **common,
+  )
+  ahead = lateral_path_command(
+    arc_model(0.003), 0.003, 0.001, 7.0, 0.001, True, False,
+    angle_error_curvature=0.002, wheel_curvature=0.001, **common,
+  )
+  unlatched = lateral_path_command(
+    arc_model(0.003), 0.003, 0.01, 7.0, 0.01, True, False,
+    angle_error_curvature=-0.007, wheel_curvature=0.01,
+  )
+
+  assert lagging.unwind_curvature < 0.0
+  assert ahead.unwind_curvature == 0.0
+  assert unlatched.unwind_curvature == 0.0
+
+
+def test_large_turn_unwind_does_not_fight_yaw_based_c0_assist():
+  # Steering angle can show the wheel still wound into the old turn while the
+  # slower yaw filter claims the new target is undertracking. During this
+  # disagreement the physical wheel owns the exit direction.
+  cmd = lateral_path_command(
+    arc_model(0.003), 0.003, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0,
+    c0_undertrack_correction=0.006,
+    angle_error_curvature=-0.009,
+    wheel_curvature=0.012,
+    c2_latched_last=True,
+  )
+
+  assert cmd.unwind_curvature < 0.0
+  assert cmd.path_offset < 0.0
+  assert cmd.c0_undertrack_correction == 0.0
+
+
+def test_large_turn_unwind_rejects_only_opposing_model_curvature_rate():
+  common = dict(
+    desired_curvature=0.003,
+    k_meas=0.01,
+    v_ego=7.0,
+    k_meas_filt=0.01,
+    lat_active=True,
+    driver_override=False,
+    c2_last=0.0,
+    angle_error_curvature=-0.007,
+    wheel_curvature=0.01,
+    c2_latched_last=True,
+  )
+  opposing = lateral_path_command(spatial_curvature_rate_model(0.003, 0.0008), **common)
+  assisting = lateral_path_command(spatial_curvature_rate_model(0.003, -0.0008), **common)
+
+  assert opposing.curvature_rate == 0.0
+  assert math.isclose(assisting.curvature_rate, -0.0008, abs_tol=1e-12)
+
+
+def test_gentle_lane_following_ignores_wheel_angle_feedback():
+  baseline = lateral_path_command(arc_model(0.003), 0.003, 0.0, 20.0, 0.0, True, False,
+                                  c2_last=0.003)
+  with_angle_error = lateral_path_command(
+    arc_model(0.003), 0.003, 0.0, 20.0, 0.0, True, False,
+    c2_last=0.003, angle_error_curvature=-0.02, wheel_curvature=0.02,
+  )
+
+  assert with_angle_error.curvature == baseline.curvature
+  assert with_angle_error.curvature_rate == baseline.curvature_rate
+  assert with_angle_error.path_angle == baseline.path_angle
+  assert with_angle_error.path_offset == baseline.path_offset
+
+
 def test_c1_clips_to_can_range():
   cmd = lateral_path_command(None, 0.06, 0.0, 20.0, 0.0, True, False)
 

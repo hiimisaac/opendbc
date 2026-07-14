@@ -54,6 +54,21 @@ FORD_PATH_C2_FADE_BP = (0.006, 0.012)  # 1/m of desired curvature
 # share-transition and engage steps up to 1.3e-3/frame, which read as wheel
 # busyness (measured 1.8x stock steering-wheel micro-activity on straights).
 FORD_PATH_C2_SLEW = 0.0002    # 1/m per 20Hz frame
+# Once a real maneuver has removed c2, keep it out until both the action and
+# physical wheel have remained near straight. This matches the PSCM's observed
+# statefulness instead of letting the instantaneous fade recharge old-turn c2
+# on the way out of a curve.
+FORD_PATH_C2_LATCH_ENTER = FORD_PATH_C2_FADE_BP[1]
+FORD_PATH_C2_LATCH_EXIT_TARGET = 0.002  # 1/m
+FORD_PATH_C2_LATCH_EXIT_ERROR = 0.001   # 1/m of steering-angle error
+FORD_PATH_C2_FLUSH_FRAMES = 10          # 0.5 s at 20Hz
+
+# Only while the large-turn latch is flushing, steering-angle error may ask
+# c0/c1 to return the wheel toward its upstream target. It is separately capped
+# and attack-limited; release and reversal remain immediate.
+FORD_PATH_UNWIND_ERROR_LIMIT = 0.006   # 1/m
+FORD_PATH_UNWIND_ATTACK_SLEW = 0.002   # 1/m per 20Hz frame
+FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG = 2.5
 
 FORD_PATH_K_MEAS_TAU = 0.3    # s, low-pass on yaw-derived curvature
 FORD_PATH_K_MEAS_MIN_SPEED = 1.0     # m/s, yaw/v curvature is unusable below this
@@ -84,6 +99,9 @@ class LateralPathCommand:
   k_meas_filt: float
   c0_undertrack_correction: float
   handoff_complete: bool
+  c2_latched: bool = False
+  c2_recovery_frames: int = 0
+  unwind_curvature: float = 0.0
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -202,7 +220,12 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                          c0_undertrack_correction: float = 0.0,
                          path_angle_last: float | None = None,
                          path_offset_last: float | None = None,
-                         driver_handoff: bool = False) -> LateralPathCommand:
+                         driver_handoff: bool = False,
+                         angle_error_curvature: float = 0.0,
+                         wheel_curvature: float = 0.0,
+                         c2_latched_last: bool = False,
+                         c2_recovery_frames_last: int = 0,
+                         unwind_curvature_last: float = 0.0) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is normally
@@ -214,24 +237,54 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   desired_curvature = _finite(desired_curvature)
   k_meas = _finite(k_meas)
   v_ego = _finite(v_ego)
+  angle_error_curvature = _finite(angle_error_curvature)
+  wheel_curvature = _finite(wheel_curvature)
+  c2_latched = bool(c2_latched_last)
+  c2_recovery_frames = max(int(c2_recovery_frames_last), 0)
+  unwind_curvature_last = _clip(_finite(unwind_curvature_last),
+                                -FORD_PATH_UNWIND_ERROR_LIMIT, FORD_PATH_UNWIND_ERROR_LIMIT)
   c0_undertrack_correction = _clip(_finite(c0_undertrack_correction),
                                    -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT, FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
 
   if not lat_active:
-    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, 0.0, True)
+    # Preserve the c2 flush across a quick disengage/re-engage. Ten inactive
+    # zero frames are also sufficient to clear the observed held state.
+    if c2_latched:
+      c2_recovery_frames += 1
+      if c2_recovery_frames >= FORD_PATH_C2_FLUSH_FRAMES:
+        c2_latched = False
+        c2_recovery_frames = 0
+    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, 0.0, True,
+                              c2_latched, c2_recovery_frames, 0.0)
 
   k_meas_filt = _finite(k_meas_filt)
   if v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
     alpha = 1.0 - math.exp(-FORD_PATH_DT / FORD_PATH_K_MEAS_TAU)
     k_meas_filt = alpha * k_meas + (1.0 - alpha) * k_meas_filt
 
+  # Large-turn c2 is stateful by observation. Once removed, do not let the
+  # falling target fade it back into the old turn; require a stable target and
+  # physical steering-angle flush before returning c2 to cruise duty.
+  if abs(desired_curvature) >= FORD_PATH_C2_LATCH_ENTER:
+    c2_latched = True
+    c2_recovery_frames = 0
+  elif c2_latched:
+    near_straight = not driver_override and \
+                    abs(desired_curvature) <= FORD_PATH_C2_LATCH_EXIT_TARGET and \
+                    abs(angle_error_curvature) <= FORD_PATH_C2_LATCH_EXIT_ERROR
+    if near_straight:
+      c2_recovery_frames += 1
+      if c2_recovery_frames >= FORD_PATH_C2_FLUSH_FRAMES:
+        c2_latched = False
+        c2_recovery_frames = 0
+    else:
+      c2_recovery_frames = 0
+
   # c2: absolute upstream request for smooth lane following. Do not integrate
   # yaw-derived error here: its persistent sensor bias becomes a real pull.
-  c2 = _clip(desired_curvature, *FORD_PATH_C2_CAN_CLIP)
-
-  c2_share = _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
-  c2 *= c2_share
-  if c2_last is not None:
+  c2_share = 0.0 if c2_latched else _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
+  c2 = 0.0 if c2_latched else _clip(desired_curvature, *FORD_PATH_C2_CAN_CLIP) * c2_share
+  if not c2_latched and c2_last is not None:
     c2_last = _finite(c2_last)
     c2 = _clip(c2, c2_last - FORD_PATH_C2_SLEW, c2_last + FORD_PATH_C2_SLEW)
 
@@ -247,7 +300,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     # without storing a torque fight in the PSCM.
     path_angle = _clip(k_meas * d_look, *FORD_PATH_C1_CAN_CLIP)
     path_offset = _clip(0.5 * k_meas * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
-    return LateralPathCommand(0.0, 0.0, path_angle, path_offset, k_meas_filt, 0.0, False)
+    return LateralPathCommand(0.0, 0.0, path_angle, path_offset, k_meas_filt, 0.0, False,
+                              c2_latched, c2_recovery_frames, 0.0)
 
   model_path_valid = _valid_model_path(model)
   curvature_rate = model_curvature_rate(model, FORD_PATH_D_C0) if model_path_valid else 0.0
@@ -302,6 +356,17 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   c0_gain = _interp(abs(desired_curvature), FORD_PATH_C0_GATE_BP, (0.0, 1.0))
   path_offset = (path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain
 
+  # The normal residual is intentionally one-sided so biased yaw cannot create
+  # countersteer. During a latched large-turn exit only, the steering wheel is
+  # a trustworthy error sensor: permit a bounded correction when it points
+  # toward the desired angle and opposite the wheel's remaining old-turn arc.
+  unwind_target = 0.0
+  if c2_latched and angle_error_curvature * wheel_curvature < 0.0:
+    unwind_target = _clip(angle_error_curvature,
+                          -FORD_PATH_UNWIND_ERROR_LIMIT, FORD_PATH_UNWIND_ERROR_LIMIT)
+  unwind_curvature = _limit_same_direction_attack(unwind_target, unwind_curvature_last,
+                                                   FORD_PATH_UNWIND_ATTACK_SLEW)
+
   # On logged tight turns, the model/action floor entered path mode correctly
   # but plateaued wide until the driver intervened. Add one bounded c0 arc for
   # the curvature still missing from the truck. This is maneuver-only, fades as
@@ -309,7 +374,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # high-speed c0 is prone to hunting.
   undertrack_error = path_curvature - k_meas_filt
   adaptive_target = 0.0
-  if undertrack_error * path_curvature > 0.0:
+  if unwind_target == 0.0 and undertrack_error * path_curvature > 0.0:
     undertrack_error = _clip(undertrack_error, -FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
                              FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT)
     path_share = 1.0 - c2_share
@@ -332,7 +397,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   # Never carry learned authority into the opposite turn. Skip attacking the
   # new direction for one frame so a reversal starts from the stateless command.
-  direction_reversed = c0_undertrack_correction * path_curvature < 0.0
+  correction_direction = unwind_target if unwind_target != 0.0 else path_curvature
+  direction_reversed = c0_undertrack_correction * correction_direction < 0.0
   if direction_reversed:
     c0_undertrack_correction = 0.0
     adaptive_target = 0.0
@@ -348,6 +414,13 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
       applied_correction = c0_undertrack_correction
 
   path_offset += 0.5 * applied_correction * d_c0 * d_c0
+
+  path_angle = _clip(path_angle + unwind_curvature * d_look, *FORD_PATH_C1_CAN_CLIP)
+  path_offset += 0.5 * unwind_curvature * d_c0 * d_c0
+  # Keep c3 when it assists the physical unwind, but suppress a model slope
+  # that would push back into the wheel's remaining old-turn direction.
+  if unwind_curvature != 0.0 and curvature_rate * unwind_curvature < 0.0:
+    curvature_rate = 0.0
 
   path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
   if c0_gain > 0.0 and path_offset_last is not None:
@@ -368,4 +441,5 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     handoff_complete = path_angle == target_path_angle and path_offset == target_path_offset
 
   return LateralPathCommand(c2, curvature_rate, path_angle, path_offset, k_meas_filt,
-                            c0_undertrack_correction, handoff_complete)
+                            c0_undertrack_correction, handoff_complete,
+                            c2_latched, c2_recovery_frames, unwind_curvature)
