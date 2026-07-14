@@ -251,6 +251,11 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   model_path_valid = _valid_model_path(model)
   curvature_rate = model_curvature_rate(model, FORD_PATH_D_C0) if model_path_valid else 0.0
+  # Small c3 zero-crossings act like direct steering-rate commands in the PSCM
+  # and made gentle lane following chatty. Use the existing c2 maneuver blend:
+  # c3 is silent while c2 owns cruise curvature, then reaches full model slope
+  # once c0/c1 own a real maneuver.
+  curvature_rate *= 1.0 - c2_share
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)
