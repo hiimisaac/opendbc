@@ -355,9 +355,25 @@ def test_non_finite_inputs_are_safe():
   assert math.isfinite(cmd.curvature_rate)
 
 
-def test_lateral_path_command_carries_model_spatial_curvature_slope():
+def test_gentle_lane_following_suppresses_model_spatial_curvature_slope():
+  curvature_rate = 0.0008
+  cmd = lateral_path_command(spatial_curvature_rate_model(0.003, curvature_rate), 0.003, 0.003, 20.0,
+                             0.003, True, False, c2_last=0.003)
+
+  assert cmd.curvature_rate == 0.0
+
+
+def test_curvature_rate_blends_through_maneuver_entry():
+  curvature_rate = 0.0008
+  cmd = lateral_path_command(spatial_curvature_rate_model(0.009, curvature_rate), 0.009, 0.0, 7.0,
+                             0.0, True, False, c2_last=0.0)
+
+  assert math.isclose(cmd.curvature_rate, 0.5 * curvature_rate, abs_tol=1e-12)
+
+
+def test_tight_maneuver_carries_full_model_spatial_curvature_slope():
   curvature_rate = 0.0015
-  cmd = lateral_path_command(spatial_curvature_rate_model(0.01, curvature_rate), 0.01, 0.0, 7.0,
+  cmd = lateral_path_command(spatial_curvature_rate_model(0.02, curvature_rate), 0.02, 0.0, 7.0,
                              0.0, True, False, c2_last=0.0)
 
   # Keep the complete model coefficient here; only the physical CAN encoding
