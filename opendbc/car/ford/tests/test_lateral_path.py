@@ -1,7 +1,7 @@
 import math
 from types import SimpleNamespace
 
-from opendbc.car.ford.carcontroller import _load_messaging, lmc2_ramp_type
+from opendbc.car.ford.carcontroller import _load_messaging, lmc2_mode, lmc2_precision
 from opendbc.car.ford.lateral_path import (
   FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
@@ -160,15 +160,51 @@ def test_yaw_bias_does_not_create_c2_lane_following_bias():
   assert cmd.path_offset == 0.0
 
 
-def test_driver_override_zeros_entire_command():
-  # full relent: the carcontroller drops to mode 0, so nothing may be commanded
-  k = 0.003
-  cmd = lateral_path_command(arc_model(k), k, 0.0, 20.0, 0.0, True, True,
+def test_driver_override_tracks_delivered_arc_without_c2():
+  # Keep LMC2 synchronized to the curve the driver is physically steering so
+  # model control can resume in the curve without storing c2/adaptive authority.
+  desired = 0.02
+  measured = 0.012
+  cmd = lateral_path_command(arc_model(desired), desired, measured, 7.0, measured, True, True,
                              path_angle_last=0.4, path_offset_last=1.0)
 
   assert cmd.curvature == 0.0
-  assert cmd.path_angle == 0.0
-  assert cmd.path_offset == 0.0
+  assert math.isclose(cmd.path_angle, measured * 7.0)
+  assert math.isclose(cmd.path_offset, 0.5 * measured * 7.0 * 7.0)
+  assert cmd.c0_undertrack_correction == 0.0
+
+
+def test_driver_handoff_blends_back_to_model_path():
+  # Logged low-speed hand-back: the manually held arc differed sharply from
+  # the model path. Bound both coefficients by one equivalent-curvature step.
+  c0_last = 1.339
+  c1_last = 0.383
+  cmd = lateral_path_command(arc_model(0.0), 0.0, 0.0, 7.0, 0.0, True, False,
+                             path_angle_last=c1_last, path_offset_last=c0_last,
+                             driver_handoff=True)
+
+  assert math.isclose(cmd.path_angle, c1_last - 0.01 * 7.0)
+  assert math.isclose(cmd.path_offset, c0_last - 0.5 * 0.01 * 7.0 * 7.0)
+  assert not cmd.handoff_complete
+
+
+def test_driver_handoff_completes_in_curve():
+  path_angle = 0.383
+  path_offset = 1.339
+  target = lateral_path_command(arc_model(-0.01), -0.01, -0.01, 7.0, -0.01, True, False)
+
+  for _ in range(10):
+    cmd = lateral_path_command(arc_model(-0.01), -0.01, -0.01, 7.0, -0.01, True, False,
+                               path_angle_last=path_angle, path_offset_last=path_offset,
+                               driver_handoff=True)
+    path_angle = cmd.path_angle
+    path_offset = cmd.path_offset
+    if cmd.handoff_complete:
+      break
+
+  assert cmd.handoff_complete
+  assert math.isclose(cmd.path_angle, target.path_angle)
+  assert math.isclose(cmd.path_offset, target.path_offset)
 
 
 def test_helping_driver_does_not_override_path_command():
@@ -236,11 +272,11 @@ def test_missing_messaging_namespaces_disable_model_subscription():
   assert _load_messaging(fake_import) is None
 
 
-def test_lmc2_uses_native_slow_ramp_on_driver_override_release():
-  assert lmc2_ramp_type(driver_override=False, driver_override_last=True) == 0
-  assert lmc2_ramp_type(driver_override=False, driver_override_last=False) == 3
-  assert lmc2_ramp_type(driver_override=True, driver_override_last=False) == 3
-  assert lmc2_ramp_type(driver_override=True, driver_override_last=True) == 3
+def test_lmc2_stays_comfortably_active_during_driver_override():
+  assert lmc2_mode(lat_active=True) == 2
+  assert lmc2_precision(cooperative_control=True) == 0
+  assert lmc2_mode(lat_active=False) == 0
+  assert lmc2_precision(cooperative_control=False) == 1
 
 
 def test_c2_slew_limits_wire_steps():
