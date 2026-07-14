@@ -18,6 +18,7 @@ import math
 #
 # Split by frequency:
 # - c2 carries the upstream desired curvature for smooth lane following.
+# - c3 carries the model path's spatial curvature slope over the near field.
 # - c0/c1 carry the transient residual: model path geometry minus the arc the car
 #   is already delivering (low-passed measured curvature). They idle at zero in
 #   steady state, cover the PSCM's ~1s c2 lag during transients, and hold the
@@ -77,6 +78,7 @@ FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
 @dataclass(frozen=True)
 class LateralPathCommand:
   curvature: float    # c2
+  curvature_rate: float  # c3, spatial derivative of curvature
   path_angle: float   # c1
   path_offset: float  # c0
   k_meas_filt: float
@@ -150,6 +152,50 @@ def _valid_model_path(model) -> bool:
     return False
 
 
+def model_curvature_rate(model, horizon: float) -> float:
+  """Estimate d(curvature)/d(distance) from model path heading.
+
+  For a constant spatial curvature slope q, path heading follows
+  psi(s) = psi0 + k0*s + 0.5*q*s^2. Sampling the heading at the start,
+  midpoint, and end therefore recovers q while canceling heading and
+  curvature offsets. Distance is accumulated along the model path rather than
+  using longitudinal x so the result remains a spatial derivative in turns.
+  """
+  if not _valid_model_path(model):
+    return 0.0
+
+  try:
+    xs = [float(x) for x in model.position.x]
+    ys = [float(y) for y in model.position.y]
+    headings = [float(heading) for heading in model.orientation.z]
+  except (AttributeError, TypeError, ValueError):
+    return 0.0
+
+  if not all(math.isfinite(value) for values in (xs, ys, headings) for value in values):
+    return 0.0
+
+  distances = [0.0]
+  for i in range(1, len(xs)):
+    distances.append(distances[-1] + math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+
+  horizon = _finite(horizon)
+  horizon = min(horizon, distances[-1])
+  if horizon <= 0.0:
+    return 0.0
+
+  # Unwrap before interpolation so a +/-pi crossing cannot look like an
+  # enormous reversal in spatial curvature slope.
+  unwrapped_headings = [headings[0]]
+  for heading in headings[1:]:
+    delta = (heading - unwrapped_headings[-1] + math.pi) % (2.0 * math.pi) - math.pi
+    unwrapped_headings.append(unwrapped_headings[-1] + delta)
+
+  heading_start = unwrapped_headings[0]
+  heading_mid = _interp(0.5 * horizon, distances, unwrapped_headings)
+  heading_end = _interp(horizon, distances, unwrapped_headings)
+  return _finite(4.0 * (heading_start - 2.0 * heading_mid + heading_end) / (horizon * horizon))
+
+
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
                          driver_override: bool, c2_last: float | None = None,
@@ -172,7 +218,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                                    -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT, FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
 
   if not lat_active:
-    return LateralPathCommand(0.0, 0.0, 0.0, k_meas, 0.0, True)
+    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, 0.0, True)
 
   k_meas_filt = _finite(k_meas_filt)
   if v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
@@ -201,9 +247,10 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     # without storing a torque fight in the PSCM.
     path_angle = _clip(k_meas * d_look, *FORD_PATH_C1_CAN_CLIP)
     path_offset = _clip(0.5 * k_meas * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
-    return LateralPathCommand(0.0, path_angle, path_offset, k_meas_filt, 0.0, False)
+    return LateralPathCommand(0.0, 0.0, path_angle, path_offset, k_meas_filt, 0.0, False)
 
   model_path_valid = _valid_model_path(model)
+  curvature_rate = model_curvature_rate(model, FORD_PATH_D_C0) if model_path_valid else 0.0
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)
@@ -315,5 +362,5 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     path_offset = _limit_step(target_path_offset, path_offset_last, c0_handoff_slew)
     handoff_complete = path_angle == target_path_angle and path_offset == target_path_offset
 
-  return LateralPathCommand(c2, path_angle, path_offset, k_meas_filt,
+  return LateralPathCommand(c2, curvature_rate, path_angle, path_offset, k_meas_filt,
                             c0_undertrack_correction, handoff_complete)
