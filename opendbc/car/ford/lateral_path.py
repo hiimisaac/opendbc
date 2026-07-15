@@ -83,6 +83,10 @@ FORD_PATH_C1_CRUISE_DEADZONE = 0.0007  # 1/m, added at full c2 share
 # frame jumps remain coherent at any c1 lookahead distance. Release and reversal
 # are not delayed. This is a transition bound, not a path gain.
 FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW = 0.006  # 1/m per 20Hz frame
+# C3 behaves like a direct steering-rate request in the PSCM. Do not let one
+# noisy model frame step straight to the wire limit, but preserve the complete
+# sustained spatial slope and never delay a release or reversal.
+FORD_PATH_C3_ATTACK_SLEW = 0.0002  # 1/m^2 per 20Hz frame
 # A driver hand-back must also bound releases and reversals because the model
 # path can differ sharply from the arc the driver was holding. Keep this faster
 # than maneuver attack so control resumes promptly without a coefficient step.
@@ -137,21 +141,22 @@ def _limit_step(value: float, last: float, max_step: float) -> float:
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
-                                     desired_curvature: float) -> bool:
+                                     steering_angle_error_deg: float) -> bool:
   """Select cooperative path tracking when the driver opposes the request.
 
-  Ford's steering-column torque and openpilot curvature use the same turn sign.
-  Same-sign torque is the driver helping the path controller and keeps normal
-  model control. With no directional request, any pressed input takes priority.
+  Compare two signals in steering-wheel coordinates. Ford curvature has the
+  opposite sign from steering angle, which made the old curvature comparison
+  classify a driver helping the requested wheel motion as an override. With no
+  requested wheel motion, any pressed input takes priority.
   """
   if not steering_pressed:
     return False
 
   steering_torque = _finite(steering_torque)
-  desired_curvature = _finite(desired_curvature)
-  if desired_curvature == 0.0:
+  steering_angle_error_deg = _finite(steering_angle_error_deg)
+  if steering_angle_error_deg == 0.0:
     return True
-  return steering_torque * desired_curvature < 0.0
+  return steering_torque * steering_angle_error_deg < 0.0
 
 
 def _authority_floor(path_value: float, requested_value: float) -> float:
@@ -225,7 +230,9 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                          wheel_curvature: float = 0.0,
                          c2_latched_last: bool = False,
                          c2_recovery_frames_last: int = 0,
-                         unwind_curvature_last: float = 0.0) -> LateralPathCommand:
+                         unwind_curvature_last: float = 0.0,
+                         desired_curvature_last: float | None = None,
+                         curvature_rate_last: float | None = None) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
   model is a modelV2 reader (or None when missing/stale); k_meas is normally
@@ -282,11 +289,17 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   # c2: absolute upstream request for smooth lane following. Do not integrate
   # yaw-derived error here: its persistent sensor bias becomes a real pull.
-  c2_share = 0.0 if c2_latched else _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
+  instantaneous_c2_share = _interp(abs(desired_curvature), FORD_PATH_C2_FADE_BP, (1.0, 0.0))
+  c2_share = 0.0 if c2_latched else instantaneous_c2_share
   c2 = 0.0 if c2_latched else _clip(desired_curvature, *FORD_PATH_C2_CAN_CLIP) * c2_share
   if not c2_latched and c2_last is not None:
     c2_last = _finite(c2_last)
-    c2 = _clip(c2, c2_last - FORD_PATH_C2_SLEW, c2_last + FORD_PATH_C2_SLEW)
+    # The PSCM retains large c2 turns. Limit only same-direction authority
+    # buildup; release immediately, and flush the old sign before reversal.
+    if c2 * c2_last < 0.0:
+      c2 = 0.0
+    else:
+      c2 = _limit_same_direction_attack(c2, c2_last, FORD_PATH_C2_SLEW)
 
   # c0/c1: model path geometry minus the arc already being delivered. The
   # measured-curvature residual fades out at low speed, where yaw/v is garbage
@@ -307,9 +320,26 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   curvature_rate = model_curvature_rate(model, FORD_PATH_D_C0) if model_path_valid else 0.0
   # Small c3 zero-crossings act like direct steering-rate commands in the PSCM
   # and made gentle lane following chatty. Use the existing c2 maneuver blend:
-  # c3 is silent while c2 owns cruise curvature, then reaches full model slope
-  # once c0/c1 own a real maneuver.
-  curvature_rate *= 1.0 - c2_share
+  # c3 is silent while the *live* request belongs to cruise curvature, then
+  # reaches full model slope once c0/c1 own a real maneuver. Do not couple this
+  # blend to the historical c2 latch: doing so forced full c3 into gentle exits.
+  curvature_rate *= 1.0 - instantaneous_c2_share
+
+  # A preview slope may legitimately exist while the action is momentarily
+  # steady. Only reject it when the action is decisively changing faster in the
+  # opposite spatial direction. This catches the logged pull-back frames without
+  # reducing valid preview or imposing a steady-state gain/cap.
+  if desired_curvature_last is not None:
+    desired_curvature_last = _finite(desired_curvature_last, desired_curvature)
+    action_curvature_rate = (desired_curvature - desired_curvature_last) / \
+                            (max(abs(v_ego), 1.0) * FORD_PATH_DT)
+    if curvature_rate * action_curvature_rate < 0.0 and abs(action_curvature_rate) >= abs(curvature_rate):
+      curvature_rate = 0.0
+
+  if curvature_rate_last is not None:
+    curvature_rate_last = _finite(curvature_rate_last)
+    curvature_rate = _limit_same_direction_attack(curvature_rate, curvature_rate_last,
+                                                   FORD_PATH_C3_ATTACK_SLEW)
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)

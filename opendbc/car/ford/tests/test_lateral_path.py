@@ -272,19 +272,19 @@ def test_large_turn_unwind_does_not_fight_yaw_based_c0_assist():
 
 def test_large_turn_unwind_rejects_only_opposing_model_curvature_rate():
   common = dict(
-    desired_curvature=0.003,
-    k_meas=0.01,
+    desired_curvature=0.013,
+    k_meas=0.02,
     v_ego=7.0,
-    k_meas_filt=0.01,
+    k_meas_filt=0.02,
     lat_active=True,
     driver_override=False,
     c2_last=0.0,
     angle_error_curvature=-0.007,
-    wheel_curvature=0.01,
+    wheel_curvature=0.02,
     c2_latched_last=True,
   )
-  opposing = lateral_path_command(spatial_curvature_rate_model(0.003, 0.0008), **common)
-  assisting = lateral_path_command(spatial_curvature_rate_model(0.003, -0.0008), **common)
+  opposing = lateral_path_command(spatial_curvature_rate_model(0.013, 0.0008), **common)
+  assisting = lateral_path_command(spatial_curvature_rate_model(0.013, -0.0008), **common)
 
   assert opposing.curvature_rate == 0.0
   assert math.isclose(assisting.curvature_rate, -0.0008, abs_tol=1e-12)
@@ -392,10 +392,11 @@ def test_driver_handoff_completes_in_curve():
 
 
 def test_helping_driver_does_not_override_path_command():
-  # Logged failed right turn: both request and driver torque were negative.
-  driver_override = driver_steering_opposes_command(True, -1.125, -0.013)
+  # Logged handoff: desired wheel motion and driver torque were both negative.
+  # Curvature has the opposite sign on Ford, so classify in wheel-angle space.
+  driver_override = driver_steering_opposes_command(True, -1.125, -15.0)
   assert not driver_override
-  assert not driver_steering_opposes_command(True, 1.125, 0.013)
+  assert not driver_steering_opposes_command(True, 1.125, 15.0)
 
   cmd = lateral_path_command(arc_model(-0.013), -0.013, 0.0, 4.1, 0.0,
                              True, driver_override, c2_last=0.0)
@@ -404,8 +405,8 @@ def test_helping_driver_does_not_override_path_command():
 
 
 def test_opposing_driver_overrides_path_command():
-  assert driver_steering_opposes_command(True, 1.125, -0.013)
-  assert driver_steering_opposes_command(True, -1.125, 0.013)
+  assert driver_steering_opposes_command(True, 1.125, -15.0)
+  assert driver_steering_opposes_command(True, -1.125, 15.0)
 
 
 def test_pressed_driver_overrides_when_there_is_no_path_command():
@@ -414,7 +415,7 @@ def test_pressed_driver_overrides_when_there_is_no_path_command():
 
 def test_zero_torque_during_pressed_release_does_not_interrupt_handoff():
   # steeringPressed is debounced and remains true briefly after torque release.
-  assert not driver_steering_opposes_command(True, 0.0, -0.013)
+  assert not driver_steering_opposes_command(True, 0.0, -15.0)
 
 
 def test_unpressed_driver_never_overrides_path_command():
@@ -477,6 +478,19 @@ def test_c2_slew_passes_small_tracking():
   assert math.isclose(cmd.curvature, k)
 
 
+def test_c2_release_is_immediate_and_reversal_flushes_old_direction():
+  release = lateral_path_command(arc_model(0.001), 0.001, 0.001, 20.0, 0.001,
+                                 True, False, c2_last=0.004)
+  reversal = lateral_path_command(arc_model(0.003), 0.003, 0.003, 20.0, 0.003,
+                                  True, False, c2_last=-0.004)
+  reversed_attack = lateral_path_command(arc_model(0.003), 0.003, 0.003, 20.0, 0.003,
+                                         True, False, c2_last=reversal.curvature)
+
+  assert math.isclose(release.curvature, 0.001)
+  assert reversal.curvature == 0.0
+  assert math.isclose(reversed_attack.curvature, 0.0002)
+
+
 def test_k_meas_filter_tracks_measurement():
   alpha = 1.0 - math.exp(-FORD_PATH_DT / FORD_PATH_K_MEAS_TAU)
   cmd = lateral_path_command(None, 0.0, 0.01, 20.0, 0.0, True, False)
@@ -501,6 +515,13 @@ def test_gentle_lane_following_suppresses_model_spatial_curvature_slope():
   assert cmd.curvature_rate == 0.0
 
 
+def test_large_turn_latch_does_not_force_c3_into_gentle_tracking():
+  cmd = lateral_path_command(spatial_curvature_rate_model(0.003, 0.0008), 0.003, 0.003, 7.0,
+                             0.003, True, False, c2_last=0.0, c2_latched_last=True)
+
+  assert cmd.curvature_rate == 0.0
+
+
 def test_curvature_rate_blends_through_maneuver_entry():
   curvature_rate = 0.0008
   cmd = lateral_path_command(spatial_curvature_rate_model(0.009, curvature_rate), 0.009, 0.0, 7.0,
@@ -517,6 +538,39 @@ def test_tight_maneuver_carries_full_model_spatial_curvature_slope():
   # Keep the complete model coefficient here; only the physical CAN encoding
   # boundary may saturate it when the message is packed.
   assert math.isclose(cmd.curvature_rate, curvature_rate, abs_tol=1e-12)
+
+
+def test_curvature_rate_requires_coherence_with_decisive_action_reversal():
+  cmd = lateral_path_command(
+    spatial_curvature_rate_model(0.02, 0.0008), 0.019, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0, desired_curvature_last=0.020, curvature_rate_last=0.0008,
+  )
+
+  assert cmd.curvature_rate == 0.0
+
+
+def test_curvature_rate_limits_attack_but_reaches_full_spatial_slope():
+  curvature_rate = 0.0015
+  last = 0.0
+  for frame in range(8):
+    cmd = lateral_path_command(
+      spatial_curvature_rate_model(0.02, curvature_rate), 0.021, 0.0, 7.0, 0.0, True, False,
+      c2_last=0.0, desired_curvature_last=0.020, curvature_rate_last=last,
+    )
+    last = cmd.curvature_rate
+    if frame == 0:
+      assert math.isclose(last, 0.0002)
+
+  assert math.isclose(last, curvature_rate, abs_tol=1e-12)
+
+
+def test_curvature_rate_reversal_is_not_delayed():
+  cmd = lateral_path_command(
+    spatial_curvature_rate_model(-0.02, -0.0008), -0.021, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0, desired_curvature_last=-0.020, curvature_rate_last=0.0008,
+  )
+
+  assert math.isclose(cmd.curvature_rate, -0.0008, abs_tol=1e-12)
 
 
 def test_c0_full_strength_through_turn_entry():
