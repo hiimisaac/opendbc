@@ -97,6 +97,8 @@ class CarController(CarControllerBase):
     self.c2_latched = False
     self.c2_recovery_frames = 0
     self.unwind_curvature = 0.0
+    self.desired_curvature_last = 0.0
+    self.curvature_rate_last = 0.0
     self.driver_handoff = False
     self.model = None
     self.model_frame = 0
@@ -168,8 +170,9 @@ class CarController(CarControllerBase):
       if self.CP.flags & FordFlags.CANFD:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
+        angle_error_deg_raw = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
         driver_override = CC.latActive and driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
-                                                                           desired_curvature)
+                                                                           angle_error_deg_raw)
         cooperative_control = driver_override or self.driver_handoff
         # During an opposing override, synchronize the path to the steering
         # angle the driver is holding. Unlike yaw/v, this remains usable at low
@@ -182,7 +185,7 @@ class CarController(CarControllerBase):
         # The normal lat-test controller remains curvature/model driven. Only
         # its large-turn flush may use the existing upstream steering-angle
         # target to actively return a wheel that is lagging the requested exit.
-        angle_error_deg = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
+        angle_error_deg = angle_error_deg_raw
         angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, 0.0),
                                         angle_error_deg)
         angle_error_curvature = -self.VM.calc_curvature(math.radians(angle_error_deg), CS.out.vEgoRaw, 0.0)
@@ -197,12 +200,16 @@ class CarController(CarControllerBase):
                                    wheel_curvature=wheel_curvature,
                                    c2_latched_last=self.c2_latched,
                                    c2_recovery_frames_last=self.c2_recovery_frames,
-                                   unwind_curvature_last=self.unwind_curvature)
+                                   unwind_curvature_last=self.unwind_curvature,
+                                   desired_curvature_last=self.desired_curvature_last,
+                                   curvature_rate_last=self.curvature_rate_last)
         self.k_meas_filt = cmd.k_meas_filt
         self.c0_undertrack_correction = cmd.c0_undertrack_correction
         self.c2_latched = cmd.c2_latched
         self.c2_recovery_frames = cmd.c2_recovery_frames
         self.unwind_curvature = cmd.unwind_curvature
+        self.desired_curvature_last = desired_curvature
+        self.curvature_rate_last = cmd.curvature_rate
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
