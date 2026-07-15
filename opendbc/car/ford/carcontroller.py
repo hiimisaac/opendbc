@@ -72,7 +72,6 @@ class CarController(CarControllerBase):
     self.c2_latched = False
     self.c2_recovery_frames = 0
     self.unwind_curvature = 0.0
-    self.desired_curvature_last = 0.0
     self.curvature_rate_last = 0.0
     self.driver_handoff = False
     self.model = None
@@ -176,14 +175,12 @@ class CarController(CarControllerBase):
                                    c2_latched_last=self.c2_latched,
                                    c2_recovery_frames_last=self.c2_recovery_frames,
                                    unwind_curvature_last=self.unwind_curvature,
-                                   desired_curvature_last=self.desired_curvature_last,
                                    curvature_rate_last=self.curvature_rate_last)
         self.k_meas_filt = cmd.k_meas_filt
         self.c0_undertrack_correction = cmd.c0_undertrack_correction
         self.c2_latched = cmd.c2_latched
         self.c2_recovery_frames = cmd.c2_recovery_frames
         self.unwind_curvature = cmd.unwind_curvature
-        self.desired_curvature_last = desired_curvature
         self.curvature_rate_last = cmd.curvature_rate
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate

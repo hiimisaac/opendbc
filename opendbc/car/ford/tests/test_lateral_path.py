@@ -13,6 +13,7 @@ from opendbc.car.ford.lateral_path import (
   driver_steering_opposes_command,
   lateral_path_command,
   model_curvature_rate,
+  model_curvature_rate_consensus,
 )
 
 
@@ -32,10 +33,23 @@ def changing_curvature_model(near_curvature, preview_curvature):
   )
 
 
-def spatial_curvature_rate_model(curvature, curvature_rate, distances=(0.0, 3.5, 7.0)):
+def spatial_curvature_rate_model(curvature, curvature_rate,
+                                 distances=(0.0, 1.75, 2.5, 3.5, 5.0, 7.0)):
   return SimpleNamespace(
     position=SimpleNamespace(x=list(distances), y=[0.0] * len(distances)),
     orientation=SimpleNamespace(z=[curvature * s + 0.5 * curvature_rate * s * s for s in distances]),
+  )
+
+
+def multi_horizon_curvature_rate_model(rate_3_5, rate_5, rate_7):
+  distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0)
+  heading_3_5 = rate_3_5 * 3.5 * 3.5 / 4.0
+  headings = (0.0, 0.0, 0.0, heading_3_5,
+              rate_5 * 5.0 * 5.0 / 4.0,
+              2.0 * heading_3_5 + rate_7 * 7.0 * 7.0 / 4.0)
+  return SimpleNamespace(
+    position=SimpleNamespace(x=list(distances), y=[0.0] * len(distances)),
+    orientation=SimpleNamespace(z=list(headings)),
   )
 
 
@@ -65,6 +79,25 @@ def test_model_curvature_rate_rejects_missing_or_degenerate_paths():
 
   assert model_curvature_rate(None, 7.0) == 0.0
   assert model_curvature_rate(degenerate, 7.0) == 0.0
+
+
+def test_model_curvature_rate_consensus_keeps_full_same_direction_median():
+  model = multi_horizon_curvature_rate_model(0.0002, 0.0008, 0.002)
+
+  assert math.isclose(model_curvature_rate_consensus(model), 0.0008, abs_tol=1e-12)
+
+
+def test_model_curvature_rate_consensus_attenuates_horizon_disagreement():
+  model = multi_horizon_curvature_rate_model(-0.0002, 0.0008, 0.001)
+
+  # Median slope times |sum| / sum(|slope|): 0.0008 * 0.0016 / 0.002.
+  assert math.isclose(model_curvature_rate_consensus(model), 0.00064, abs_tol=1e-12)
+
+
+def test_model_curvature_rate_consensus_cancels_balanced_disagreement():
+  model = multi_horizon_curvature_rate_model(-0.0008, 0.0, 0.0008)
+
+  assert model_curvature_rate_consensus(model) == 0.0
 
 
 def test_lmc2_curvature_rate_uses_full_wire_range_without_wrapping():
@@ -540,13 +573,17 @@ def test_tight_maneuver_carries_full_model_spatial_curvature_slope():
   assert math.isclose(cmd.curvature_rate, curvature_rate, abs_tol=1e-12)
 
 
-def test_curvature_rate_requires_coherence_with_decisive_action_reversal():
+def test_curvature_rate_keeps_spatial_consensus_during_action_reversal():
+  previous = lateral_path_command(
+    spatial_curvature_rate_model(0.02, 0.0008), 0.020, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0, curvature_rate_last=0.0008,
+  )
   cmd = lateral_path_command(
     spatial_curvature_rate_model(0.02, 0.0008), 0.019, 0.0, 7.0, 0.0, True, False,
-    c2_last=0.0, desired_curvature_last=0.020, curvature_rate_last=0.0008,
+    c2_last=0.0, curvature_rate_last=previous.curvature_rate,
   )
 
-  assert cmd.curvature_rate == 0.0
+  assert math.isclose(cmd.curvature_rate, 0.0008, abs_tol=1e-12)
 
 
 def test_curvature_rate_limits_attack_but_reaches_full_spatial_slope():
@@ -555,7 +592,7 @@ def test_curvature_rate_limits_attack_but_reaches_full_spatial_slope():
   for frame in range(8):
     cmd = lateral_path_command(
       spatial_curvature_rate_model(0.02, curvature_rate), 0.021, 0.0, 7.0, 0.0, True, False,
-      c2_last=0.0, desired_curvature_last=0.020, curvature_rate_last=last,
+      c2_last=0.0, curvature_rate_last=last,
     )
     last = cmd.curvature_rate
     if frame == 0:
@@ -567,7 +604,7 @@ def test_curvature_rate_limits_attack_but_reaches_full_spatial_slope():
 def test_curvature_rate_reversal_is_not_delayed():
   cmd = lateral_path_command(
     spatial_curvature_rate_model(-0.02, -0.0008), -0.021, 0.0, 7.0, 0.0, True, False,
-    c2_last=0.0, desired_curvature_last=-0.020, curvature_rate_last=0.0008,
+    c2_last=0.0, curvature_rate_last=0.0008,
   )
 
   assert math.isclose(cmd.curvature_rate, -0.0008, abs_tol=1e-12)
