@@ -41,6 +41,17 @@ def spatial_curvature_rate_model(curvature, curvature_rate,
   )
 
 
+def polynomial_path_model(curvature, curvature_rate,
+                          distances=(0.0, 1.75, 2.5, 3.5, 5.0, 7.0)):
+  return SimpleNamespace(
+    position=SimpleNamespace(
+      x=list(distances),
+      y=[0.5 * curvature * s * s + curvature_rate * s * s * s / 6.0 for s in distances],
+    ),
+    orientation=SimpleNamespace(z=[curvature * s + 0.5 * curvature_rate * s * s for s in distances]),
+  )
+
+
 def multi_horizon_curvature_rate_model(rate_3_5, rate_5, rate_7):
   distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0)
   heading_3_5 = rate_3_5 * 3.5 * 3.5 / 4.0
@@ -546,6 +557,71 @@ def test_gentle_lane_following_suppresses_model_spatial_curvature_slope():
                              0.003, True, False, c2_last=0.003)
 
   assert cmd.curvature_rate == 0.0
+
+
+def test_coherent_polynomial_preview_starts_moving_turn_before_live_action_gate():
+  # Logged moving-turn reversal: the current action is still gentle, but c0,
+  # c1, and c3 already agree that a real turn begins in the near field.
+  for sign in (-1.0, 1.0):
+    cmd = lateral_path_command(
+      polynomial_path_model(sign * 0.0025, sign * 0.0015), sign * 0.0025,
+      -sign * 0.0015, 7.0, -sign * 0.0015, True, False,
+      c2_last=sign * 0.0025, path_angle_last=0.0, path_offset_last=0.0, curvature_rate_last=0.0,
+    )
+
+    assert math.isclose(cmd.curvature, sign * 0.0025, abs_tol=1e-12)
+    assert math.isclose(cmd.curvature_rate, sign * 0.0002, abs_tol=1e-12)
+    assert cmd.path_offset * sign > 0.0
+
+
+def test_polynomial_preview_requires_motion_and_delivered_curvature_reversal():
+  common = dict(
+    model=polynomial_path_model(0.0025, 0.0015), desired_curvature=0.0025,
+    lat_active=True, driver_override=False, c2_last=0.0025,
+    path_angle_last=0.0, path_offset_last=0.0, curvature_rate_last=0.0,
+  )
+  stopped = lateral_path_command(k_meas=-0.0015, v_ego=0.0, k_meas_filt=-0.0015, **common)
+  same_direction = lateral_path_command(k_meas=0.0015, v_ego=7.0, k_meas_filt=0.0015, **common)
+
+  assert stopped.curvature_rate == 0.0
+  assert stopped.path_offset == 0.0
+  assert same_direction.curvature_rate == 0.0
+  assert same_direction.path_offset == 0.0
+
+
+def test_polynomial_preview_requires_c0_c1_c3_direction_agreement():
+  model = polynomial_path_model(0.0025, 0.0015)
+  model.position.y = [-y for y in model.position.y]
+  cmd = lateral_path_command(
+    model, 0.0025, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0025, path_angle_last=0.0, path_offset_last=0.0, curvature_rate_last=0.0,
+  )
+
+  assert cmd.curvature_rate == 0.0
+  assert cmd.path_offset == 0.0
+
+
+def test_polynomial_preview_rejects_conflicting_path_heading():
+  model = polynomial_path_model(0.0025, 0.0015)
+  model.orientation.z = [heading - 0.01 * distance
+                         for heading, distance in zip(model.orientation.z, model.position.x, strict=True)]
+  cmd = lateral_path_command(
+    model, 0.0025, 0.0, 7.0, 0.0, True, False,
+    c2_last=0.0025, path_angle_last=0.0, path_offset_last=0.0, curvature_rate_last=0.0,
+  )
+
+  assert cmd.curvature_rate == 0.0
+  assert cmd.path_offset == 0.0
+
+
+def test_polynomial_preview_does_not_hold_geometry_during_turn_exit():
+  cmd = lateral_path_command(
+    polynomial_path_model(0.01, -0.0015), 0.0025, 0.006, 7.0, 0.006, True, False,
+    c2_last=0.0025, path_angle_last=0.0, path_offset_last=0.0, curvature_rate_last=0.0,
+  )
+
+  assert cmd.curvature_rate == 0.0
+  assert cmd.path_offset == 0.0
 
 
 def test_large_turn_latch_does_not_force_c3_into_gentle_tracking():
