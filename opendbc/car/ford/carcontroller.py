@@ -4,8 +4,12 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import AVERAGE_ROAD_ROLL, ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
+from opendbc.car.ford.coherent_path import (
+  FORD_COHERENT_ANGLE_ERROR_DEADZONE_DEG,
+  CoherentPathController,
+)
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, driver_steering_opposes_command, lateral_path_command
+from opendbc.car.ford.lateral_path import driver_steering_opposes_command
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -94,16 +98,8 @@ class CarController(CarControllerBase):
     self.VM = VehicleModel(CP)
 
     self.apply_curvature_last = 0
-    self.path_angle_last = 0.0
-    self.path_offset_last = 0.0
     self.anti_overshoot_curvature_last = 0
-    self.k_meas_filt = 0.0
-    self.c0_undertrack_correction = 0.0
-    self.c2_latched = False
-    self.c2_recovery_frames = 0
-    self.unwind_curvature = 0.0
-    self.curvature_rate_last = 0.0
-    self.driver_handoff = False
+    self.path_controller = CoherentPathController()
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -177,51 +173,23 @@ class CarController(CarControllerBase):
         angle_error_deg_raw = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
         driver_override = CC.latActive and driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
                                                                            angle_error_deg_raw)
-        cooperative_control = driver_override or self.driver_handoff
         # During an opposing override, synchronize the path to the steering
         # angle the driver is holding. Unlike yaw/v, this remains usable at low
         # speed and follows the driver's input without waiting for vehicle yaw.
         wheel_curvature = -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg), CS.out.vEgoRaw, 0.0)
-        path_curvature = current_curvature
-        if driver_override:
-          path_curvature = wheel_curvature
-
-        # The normal lat-test controller remains curvature/model driven. Only
-        # its large-turn flush may use the existing upstream steering-angle
-        # target to actively return a wheel that is lagging the requested exit.
         angle_error_deg = angle_error_deg_raw
-        angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, 0.0),
+        angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_COHERENT_ANGLE_ERROR_DEADZONE_DEG, 0.0),
                                         angle_error_deg)
         angle_error_curvature = -self.VM.calc_curvature(math.radians(angle_error_deg), CS.out.vEgoRaw, 0.0)
-        cmd = lateral_path_command(model, desired_curvature, path_curvature, CS.out.vEgoRaw,
-                                   self.k_meas_filt, CC.latActive, driver_override,
-                                   c2_last=self.apply_curvature_last,
-                                   c0_undertrack_correction=self.c0_undertrack_correction,
-                                   path_angle_last=self.path_angle_last,
-                                   path_offset_last=self.path_offset_last,
-                                   driver_handoff=self.driver_handoff and not driver_override,
-                                   angle_error_curvature=angle_error_curvature,
-                                   wheel_curvature=wheel_curvature,
-                                   c2_latched_last=self.c2_latched,
-                                   c2_recovery_frames_last=self.c2_recovery_frames,
-                                   unwind_curvature_last=self.unwind_curvature,
-                                   curvature_rate_last=self.curvature_rate_last)
-        self.k_meas_filt = cmd.k_meas_filt
-        self.c0_undertrack_correction = cmd.c0_undertrack_correction
-        self.c2_latched = cmd.c2_latched
-        self.c2_recovery_frames = cmd.c2_recovery_frames
-        self.unwind_curvature = cmd.unwind_curvature
-        self.curvature_rate_last = cmd.curvature_rate
+        measured_curvature = wheel_curvature if driver_override else current_curvature
+        cmd = self.path_controller.update(model, desired_curvature, measured_curvature,
+                                          CS.out.vEgoRaw, CC.latActive, driver_override,
+                                          angle_error_curvature)
+        cooperative_control = cmd.cooperative_control
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
-        self.path_angle_last = path_angle
-        self.path_offset_last = path_offset
-        if driver_override:
-          self.driver_handoff = True
-        elif self.driver_handoff and cmd.handoff_complete:
-          self.driver_handoff = False
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         apply_curvature = apply_ford_curvature_limits(desired_curvature, self.apply_curvature_last, current_curvature,
