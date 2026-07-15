@@ -87,6 +87,10 @@ FORD_PATH_MANEUVER_CURVATURE_ATTACK_SLEW = 0.006  # 1/m per 20Hz frame
 # noisy model frame step straight to the wire limit, but preserve the complete
 # sustained spatial slope and never delay a release or reversal.
 FORD_PATH_C3_ATTACK_SLEW = 0.0002  # 1/m^2 per 20Hz frame
+# C3 comes from one model frame at three near-field distances. Same-direction
+# estimates keep the full median slope; conflicting horizons continuously
+# attenuate it without timers, latches, or a new authority cap.
+FORD_PATH_C3_HORIZONS = (3.5, 5.0, 7.0)  # m
 # A driver hand-back must also bound releases and reversals because the model
 # path can differ sharply from the arc the driver was holding. Keep this faster
 # than maneuver attack so control resumes promptly without a coefficient step.
@@ -219,6 +223,18 @@ def model_curvature_rate(model, horizon: float) -> float:
   return _finite(4.0 * (heading_start - 2.0 * heading_mid + heading_end) / (horizon * horizon))
 
 
+def model_curvature_rate_consensus(model) -> float:
+  """Return the median near-field spatial slope, attenuated by sign conflict."""
+  curvature_rates = tuple(model_curvature_rate(model, horizon) for horizon in FORD_PATH_C3_HORIZONS)
+  magnitude = sum(abs(curvature_rate) for curvature_rate in curvature_rates)
+  if magnitude == 0.0:
+    return 0.0
+
+  median = sorted(curvature_rates)[1]
+  agreement = abs(sum(curvature_rates)) / magnitude
+  return _finite(median * agreement)
+
+
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
                          driver_override: bool, c2_last: float | None = None,
@@ -231,7 +247,6 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                          c2_latched_last: bool = False,
                          c2_recovery_frames_last: int = 0,
                          unwind_curvature_last: float = 0.0,
-                         desired_curvature_last: float | None = None,
                          curvature_rate_last: float | None = None) -> LateralPathCommand:
   """One 20Hz step of the composed LMC2 command.
 
@@ -317,24 +332,13 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                               c2_latched, c2_recovery_frames, 0.0)
 
   model_path_valid = _valid_model_path(model)
-  curvature_rate = model_curvature_rate(model, FORD_PATH_D_C0) if model_path_valid else 0.0
+  curvature_rate = model_curvature_rate_consensus(model) if model_path_valid else 0.0
   # Small c3 zero-crossings act like direct steering-rate commands in the PSCM
   # and made gentle lane following chatty. Use the existing c2 maneuver blend:
   # c3 is silent while the *live* request belongs to cruise curvature, then
   # reaches full model slope once c0/c1 own a real maneuver. Do not couple this
   # blend to the historical c2 latch: doing so forced full c3 into gentle exits.
   curvature_rate *= 1.0 - instantaneous_c2_share
-
-  # A preview slope may legitimately exist while the action is momentarily
-  # steady. Only reject it when the action is decisively changing faster in the
-  # opposite spatial direction. This catches the logged pull-back frames without
-  # reducing valid preview or imposing a steady-state gain/cap.
-  if desired_curvature_last is not None:
-    desired_curvature_last = _finite(desired_curvature_last, desired_curvature)
-    action_curvature_rate = (desired_curvature - desired_curvature_last) / \
-                            (max(abs(v_ego), 1.0) * FORD_PATH_DT)
-    if curvature_rate * action_curvature_rate < 0.0 and abs(action_curvature_rate) >= abs(curvature_rate):
-      curvature_rate = 0.0
 
   if curvature_rate_last is not None:
     curvature_rate_last = _finite(curvature_rate_last)
