@@ -56,6 +56,11 @@ def apply_creep_compensation(accel: float, v_ego: float) -> float:
   return float(accel)
 
 
+def apply_brake_gas_interlock(gas: float, brake_request: bool) -> float:
+  """Ford ACC must never receive propulsion while brake actuation is requested."""
+  return CarControllerParams.INACTIVE_GAS if brake_request else gas
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
@@ -258,6 +263,7 @@ class CarController(CarControllerBase):
       elif accel_pitch_compensated < 0.0:
         self.brake_request = True
 
+      gas = apply_brake_gas_interlock(gas, self.brake_request)
       stopping = CC.actuators.longControlState == LongCtrlState.stopping
       # TODO: look into using the actuators packet to send the desired speed
       can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
