@@ -333,23 +333,45 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   model_path_valid = _valid_model_path(model)
   curvature_rate = model_curvature_rate_consensus(model) if model_path_valid else 0.0
-  # Small c3 zero-crossings act like direct steering-rate commands in the PSCM
-  # and made gentle lane following chatty. Use the existing c2 maneuver blend:
-  # c3 is silent while the *live* request belongs to cruise curvature, then
-  # reaches full model slope once c0/c1 own a real maneuver. Do not couple this
-  # blend to the historical c2 latch: doing so forced full c3 into gentle exits.
-  curvature_rate *= 1.0 - instantaneous_c2_share
-
-  if curvature_rate_last is not None:
-    curvature_rate_last = _finite(curvature_rate_last)
-    curvature_rate = _limit_same_direction_attack(curvature_rate, curvature_rate_last,
-                                                   FORD_PATH_C3_ATTACK_SLEW)
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)
   else:
     path_angle_raw = desired_curvature * d_look
     path_offset_raw = 0.5 * desired_curvature * d_c0 * d_c0
+
+  # A moving turn may already be visible in the spatial polynomial while the
+  # live action is still gentle. Preview only the shortest c3 horizon, and only
+  # when c0 and c1 independently confirm a building maneuver in the same
+  # direction. This starts a real curvature reversal sooner without admitting
+  # isolated c3 plan noise into ordinary lane following.
+  coherent_preview_curvature = 0.0
+  if model_path_valid:
+    preview_curvature = desired_curvature + curvature_rate * FORD_PATH_C3_HORIZONS[0]
+    c0_path_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
+    c1_path_curvature = path_angle_raw / d_look
+    preview_direction_agrees = preview_curvature * curvature_rate > 0.0 and \
+                               abs(preview_curvature) > abs(desired_curvature)
+    geometry_direction_agrees = c0_path_curvature * preview_curvature > 0.0 and \
+                                 c1_path_curvature * preview_curvature > 0.0
+    geometry_is_maneuver = abs(c0_path_curvature) >= FORD_PATH_C0_GATE_BP[0] and \
+                           abs(c1_path_curvature) >= FORD_PATH_C0_GATE_BP[0]
+    moving_reversal = v_ego > FORD_PATH_K_MEAS_MIN_SPEED and k_meas * preview_curvature < 0.0
+    if moving_reversal and preview_direction_agrees and geometry_direction_agrees and geometry_is_maneuver:
+      coherent_preview_curvature = preview_curvature
+
+  # Small c3 zero-crossings act like direct steering-rate commands in the PSCM
+  # and made gentle lane following chatty. Use the existing c2 maneuver blend,
+  # augmented by coherent imminent geometry. Do not couple this blend to the
+  # historical c2 latch: doing so forced full c3 into gentle exits.
+  live_maneuver_share = 1.0 - instantaneous_c2_share
+  preview_maneuver_share = _interp(abs(coherent_preview_curvature), FORD_PATH_C2_FADE_BP, (0.0, 1.0))
+  curvature_rate *= max(live_maneuver_share, preview_maneuver_share)
+
+  if curvature_rate_last is not None:
+    curvature_rate_last = _finite(curvature_rate_last)
+    curvature_rate = _limit_same_direction_attack(curvature_rate, curvature_rate_last,
+                                                   FORD_PATH_C3_ATTACK_SLEW)
 
   # modelV2's legacy path geometry can be weaker than its lag-adjusted action.
   # While c2 owns lane following, preserve the model residual as-is. Once c2
@@ -385,9 +407,11 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     path_angle = _limit_same_direction_attack(path_angle, path_angle_last, c1_slew)
   # c0 is maneuver-only: on straights it dithers centimeter position commands
   # into the PSCM's offset servo (measured standing left-pull), so it is exactly
-  # zero there. Its gate reaches full strength by 0.006 so turn entries get the
-  # full offset authority (the 1-share gate withheld 55% through the corridor).
-  c0_gain = _interp(abs(desired_curvature), FORD_PATH_C0_GATE_BP, (0.0, 1.0))
+  # zero unless the live action or coherent imminent geometry is a maneuver.
+  # Its gate reaches full strength by 0.006 so turn entries get the full offset
+  # authority (the 1-share gate withheld 55% through the corridor).
+  c0_gate_curvature = max(abs(desired_curvature), abs(coherent_preview_curvature))
+  c0_gain = _interp(c0_gate_curvature, FORD_PATH_C0_GATE_BP, (0.0, 1.0))
   path_offset = (path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain
 
   # The normal residual is intentionally one-sided so biased yaw cannot create
