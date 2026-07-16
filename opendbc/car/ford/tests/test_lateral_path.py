@@ -761,20 +761,33 @@ def test_tight_maneuver_keeps_stronger_live_model_geometry_in_c0():
 
   model_offset = 0.5 * model_curvature * 7.0 * 7.0
   assert math.isclose(cmd.path_offset, model_offset)
-  assert math.isclose(cmd.path_angle, (desired - FORD_PATH_C1_DEADZONE) * 7.0)
+  assert math.isclose(cmd.path_angle, (model_curvature - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
-def test_c1_maneuver_authority_is_bounded_by_model_action():
-  # Logged tight turn: model path geometry exceeded the action and drove c1
-  # into its wire limit. C0 owns stronger near-path/tight-turn correction.
+def test_c1_maneuver_keeps_stronger_live_model_heading():
+  # Logged moving turn: model path heading identified the turn before the
+  # lag-adjusted action. Preserve that coherent model preview in c1.
   desired = -0.025
   near_curvature = -0.03
   preview_curvature = -0.06
   cmd = lateral_path_command(changing_curvature_model(near_curvature, preview_curvature), desired, 0.0, 7.0,
                              0.0, True, False, c2_last=0.0)
 
-  expected_curvature = abs(desired) - FORD_PATH_C1_DEADZONE
+  expected_curvature = abs(near_curvature) - FORD_PATH_C1_DEADZONE
   assert math.isclose(cmd.path_angle, -expected_curvature * 7.0)
+
+
+def test_c1_stronger_model_heading_does_not_survive_latched_exit():
+  desired = 0.003
+  cmd = lateral_path_command(arc_model(0.02), desired, 0.02, 7.0,
+                             0.02, True, False, c2_last=0.0,
+                             c2_latched_last=True,
+                             angle_error_curvature=-0.002,
+                             wheel_curvature=0.02)
+
+  assert cmd.unwind_curvature < 0.0
+  expected_angle = (desired - FORD_PATH_C1_DEADZONE + cmd.unwind_curvature) * 7.0
+  assert math.isclose(cmd.path_angle, expected_angle)
 
 
 def test_c1_slew_limits_abrupt_maneuver_entry():
