@@ -1,19 +1,26 @@
 import math
 from types import SimpleNamespace
 
-from opendbc.car.ford.carcontroller import _load_messaging, lmc2_mode, lmc2_precision
+from opendbc.car.ford.carcontroller import (
+  _load_messaging,
+  ford_curvature_from_steering_angle,
+  lmc2_mode,
+  lmc2_precision,
+)
 from opendbc.car.ford.fordcan import lmc2_curvature_rate_for_can
 from opendbc.car.ford.lateral_path import (
-  FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
+  FORD_PATH_C0_FEEDBACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
   FORD_PATH_C1_CRUISE_DEADZONE,
   FORD_PATH_C1_DEADZONE,
   FORD_PATH_DT,
   FORD_PATH_K_MEAS_TAU,
+  SteeringAngleProjector,
   driver_steering_opposes_command,
   lateral_path_command,
   model_curvature_rate,
   model_curvature_rate_consensus,
+  projected_tracking_error,
 )
 
 
@@ -127,7 +134,6 @@ def test_inactive_zeros_command():
   assert cmd.path_offset == 0.0
   assert cmd.curvature_rate == 0.0
   assert cmd.k_meas_filt == 0.002
-  assert cmd.c0_undertrack_correction == 0.0
 
 
 def test_steady_state_arc_idles_c0_c1():
@@ -174,8 +180,7 @@ def test_c2_fades_out_of_maneuvers_and_c1_carries():
   assert cmd.curvature == 0.0  # maneuver curvature: c2 confined to cruise duty
   # c2 carries nothing, so c1 holds the full arc heading (no delivered-curvature subtraction)
   assert math.isclose(cmd.path_angle, (k - FORD_PATH_C1_DEADZONE) * 7.0)
-  expected_c0_curvature = k + FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT
-  assert math.isclose(cmd.path_offset, 0.5 * expected_c0_curvature * 7.0 * 7.0)
+  assert math.isclose(cmd.path_offset, 0.5 * k * 7.0 * 7.0)
 
 
 def test_c1_holds_arc_mid_maneuver():
@@ -296,22 +301,21 @@ def test_large_turn_unwind_only_corrects_toward_desired_wheel_angle():
   assert unlatched.unwind_curvature == 0.0
 
 
-def test_large_turn_unwind_does_not_fight_yaw_based_c0_assist():
+def test_large_turn_unwind_does_not_fight_same_direction_angle_feedback():
   # Steering angle can show the wheel still wound into the old turn while the
-  # slower yaw filter claims the new target is undertracking. During this
-  # disagreement the physical wheel owns the exit direction.
+  # upstream path has begun its exit. During this disagreement the physical
+  # wheel owns the exit direction.
   cmd = lateral_path_command(
     arc_model(0.003), 0.003, 0.0, 7.0, 0.0, True, False,
     c2_last=0.0,
-    c0_undertrack_correction=0.006,
     angle_error_curvature=-0.009,
     wheel_curvature=0.012,
+    projected_wheel_curvature=0.006,
     c2_latched_last=True,
   )
 
   assert cmd.unwind_curvature < 0.0
   assert cmd.path_offset < 0.0
-  assert cmd.c0_undertrack_correction == 0.0
 
 
 def test_large_turn_unwind_rejects_only_opposing_model_curvature_rate():
@@ -390,16 +394,16 @@ def test_yaw_bias_does_not_create_c2_lane_following_bias():
 
 def test_driver_override_tracks_delivered_arc_without_c2():
   # Keep LMC2 synchronized to the curve the driver is physically steering so
-  # model control can resume in the curve without storing c2/adaptive authority.
+  # model control can resume in the curve without storing c2/feedback authority.
   desired = 0.02
   measured = 0.012
   cmd = lateral_path_command(arc_model(desired), desired, measured, 7.0, measured, True, True,
-                             path_angle_last=0.4, path_offset_last=1.0)
+                             path_angle_last=0.4, path_offset_last=1.0,
+                             projected_wheel_curvature=0.0)
 
   assert cmd.curvature == 0.0
   assert math.isclose(cmd.path_angle, measured * 7.0)
   assert math.isclose(cmd.path_offset, 0.5 * measured * 7.0 * 7.0)
-  assert cmd.c0_undertrack_correction == 0.0
 
 
 def test_driver_handoff_blends_back_to_model_path():
@@ -716,8 +720,7 @@ def test_tight_maneuver_keeps_stronger_live_model_geometry_in_c0():
                              desired, True, False, c2_last=0.0)
 
   model_offset = 0.5 * model_curvature * 7.0 * 7.0
-  missing_offset = 0.5 * (model_curvature - desired) * 7.0 * 7.0
-  assert math.isclose(cmd.path_offset, model_offset + missing_offset)
+  assert math.isclose(cmd.path_offset, model_offset)
   assert math.isclose(cmd.path_angle, (desired - FORD_PATH_C1_DEADZONE) * 7.0)
 
 
@@ -810,120 +813,112 @@ def test_far_field_geometry_does_not_amplify_near_path_coefficients():
   assert math.isclose(cmd.path_offset, 0.5 * near_curvature * 7.0 * 7.0)
 
 
-def test_c0_assists_undertracking_of_stronger_model_geometry():
+def test_c0_feedback_tracks_stronger_model_geometry_than_action():
   desired = 0.02
   model_curvature = 0.04
   measured = desired
   cmd = lateral_path_command(arc_model(model_curvature, xs=(0.0, 7.0, 14.0, 20.0)), desired, measured, 7.0,
-                             measured, True, False, c2_last=0.0)
+                             measured, True, False, c2_last=0.0,
+                             wheel_curvature=measured,
+                             projected_wheel_curvature=measured)
 
   model_offset = 0.5 * model_curvature * 7.0 * 7.0
   missing_offset = 0.5 * (model_curvature - measured) * 7.0 * 7.0
   assert math.isclose(cmd.path_offset, model_offset + missing_offset)
 
 
-def test_tight_maneuver_c0_assists_undertracking():
+def test_yaw_undertracking_does_not_add_feedback_without_steering_error():
   desired = 0.03
   measured = 0.015
   cmd = lateral_path_command(arc_model(desired), desired, measured, 7.0,
-                             measured, True, False, c2_last=0.0)
+                             measured, True, False, c2_last=0.0,
+                             wheel_curvature=desired,
+                             projected_wheel_curvature=desired)
 
   requested_offset = 0.5 * desired * 7.0 * 7.0
-  missing_offset = 0.5 * (desired - measured) * 7.0 * 7.0
-  assert math.isclose(cmd.path_offset, requested_offset + missing_offset)
+  assert math.isclose(cmd.path_offset, requested_offset)
 
 
-def test_c0_undertracking_assist_is_bounded_to_useful_state():
+def test_angle_feedback_is_maneuver_only_and_never_countersteers():
   desired = 0.03
   requested_offset = 0.5 * desired * 7.0 * 7.0
-  cases = [
-    (0.04, 7.0),   # already tracking beyond the request
-    (0.015, 1.5),  # yaw/v is unreliable at crawl speed
-    (0.015, 15.0), # avoid exciting high-speed c0 hunting
-  ]
-  for measured, v_ego in cases:
-    cmd = lateral_path_command(arc_model(desired), desired, measured, v_ego,
-                               measured, True, False, c2_last=0.0)
-    assert math.isclose(cmd.path_offset, requested_offset), (measured, v_ego)
+  countersteer = lateral_path_command(
+    arc_model(desired), desired, 0.0, 7.0, 0.0, True, False, c2_last=0.0,
+    wheel_curvature=0.05, projected_wheel_curvature=0.05,
+  )
+  gentle = lateral_path_command(
+    arc_model(0.003), 0.003, 0.0, 20.0, 0.0, True, False, c2_last=0.003,
+    wheel_curvature=0.0, projected_wheel_curvature=0.0,
+  )
+
+  assert math.isclose(countersteer.path_offset, requested_offset)
+  assert gentle.path_offset == 0.0
 
 
-def test_persistent_logged_undertracking_builds_c0_only_authority():
-  # Logged steady alert near 24 mph: model requested ~0.021/m while the
-  # Lightning held ~0.015/m. Persistent error may earn more c0, but must not
-  # change c1/c2 or apply a universal path gain.
-  desired = 0.021
-  measured = 0.015
-  v_ego = 10.5
-  correction = 0.0
-  commands = []
-  for _ in range(12):
-    cmd = lateral_path_command(arc_model(desired), desired, measured, v_ego,
-                               measured, True, False, c2_last=0.0,
-                               c0_undertrack_correction=correction)
-    correction = cmd.c0_undertrack_correction
-    commands.append(cmd)
+def test_angle_feedback_is_bounded_and_c0_only():
+  desired = 0.03
+  measured = 0.0
+  base = lateral_path_command(arc_model(desired), desired, measured, 7.0,
+                              measured, True, False, c2_last=0.0,
+                              wheel_curvature=desired, projected_wheel_curvature=desired)
+  feedback = lateral_path_command(
+    arc_model(desired), desired, measured, 7.0, measured, True, False, c2_last=0.0,
+    wheel_curvature=0.0, projected_wheel_curvature=0.0,
+  )
 
-  assert commands[-1].path_offset > commands[0].path_offset
-  assert commands[-1].path_angle == commands[0].path_angle
-  assert commands[-1].curvature == commands[0].curvature
-  assert 0.0 < correction <= 0.01
+  expected_added_offset = 0.5 * FORD_PATH_C0_FEEDBACK_ERROR_LIMIT * 7.0 * 7.0
+  assert math.isclose(feedback.path_offset, base.path_offset + expected_added_offset)
+  assert feedback.path_angle == base.path_angle
+  assert feedback.curvature == base.curvature
 
 
-def test_c0_adaptation_resets_before_reversed_turn():
-  correction = 0.006
-  cmd = lateral_path_command(arc_model(-0.02), -0.02, 0.015, 7.0,
-                             0.015, True, False, c2_last=0.0,
-                             c0_undertrack_correction=correction)
+def test_angle_feedback_has_no_persistent_state():
+  desired = 0.03
+  measured = 0.0
+  common = dict(model=arc_model(desired), desired_curvature=desired, k_meas=measured,
+                v_ego=7.0, k_meas_filt=measured, lat_active=True,
+                driver_override=False, c2_last=0.0)
 
-  assert cmd.c0_undertrack_correction == 0.0
+  with_feedback = lateral_path_command(**common, wheel_curvature=0.0, projected_wheel_curvature=0.0)
+  released = lateral_path_command(**common, wheel_curvature=desired, projected_wheel_curvature=desired)
 
-
-def test_c0_adaptation_releases_when_tracking_catches_up():
-  correction = 0.006
-  cmd = lateral_path_command(arc_model(0.02), 0.02, 0.02, 7.0,
-                             0.02, True, False, c2_last=0.0,
-                             c0_undertrack_correction=correction)
-
-  assert 0.0 <= cmd.c0_undertrack_correction < correction
+  assert with_feedback.path_offset > released.path_offset
+  assert released.path_offset == lateral_path_command(
+    **common, wheel_curvature=desired, projected_wheel_curvature=desired,
+  ).path_offset
 
 
-def test_c0_adaptation_is_disabled_in_gentle_lane_following():
-  correction = 0.0
-  for _ in range(100):
-    cmd = lateral_path_command(arc_model(0.003), 0.003, 0.0, 20.0,
-                               0.0, True, False, c2_last=0.003,
-                               c0_undertrack_correction=correction)
-    correction = cmd.c0_undertrack_correction
+def test_predicted_steering_error_reduces_c0_feedback_as_wheel_closes():
+  desired = 0.03
+  measured = desired
+  common = dict(model=arc_model(desired), desired_curvature=desired, k_meas=measured,
+                v_ego=7.0, k_meas_filt=measured, lat_active=True,
+                driver_override=False, c2_last=0.0)
 
-  assert correction == 0.0
+  base = lateral_path_command(**common, wheel_curvature=desired, projected_wheel_curvature=desired)
+  closing = lateral_path_command(**common, wheel_curvature=0.0, projected_wheel_curvature=0.025)
+  lagging = lateral_path_command(**common, wheel_curvature=0.0, projected_wheel_curvature=0.015)
 
-
-def test_c0_adaptation_is_bounded_in_persistent_tight_turn():
-  correction = 0.0
-  for _ in range(200):
-    cmd = lateral_path_command(arc_model(0.06), 0.06, 0.0, 7.0,
-                               0.0, True, False, c2_last=0.0,
-                               c0_undertrack_correction=correction)
-    correction = cmd.c0_undertrack_correction
-
-  assert math.isclose(correction, 0.01, rel_tol=1e-6)
+  assert base.path_offset < closing.path_offset < lagging.path_offset
 
 
-def test_c0_adaptation_does_not_wind_up_behind_c0_limit():
-  correction = 0.0
-  for _ in range(200):
-    cmd = lateral_path_command(arc_model(0.2), 0.2, 0.0, 7.0,
-                               0.0, True, False, c2_last=0.0,
-                               c0_undertrack_correction=correction)
-    correction = cmd.c0_undertrack_correction
-
-  assert cmd.path_offset == 4.60
-  assert correction == 0.0
+def test_projection_only_discounts_curvature_error_closing_model_target():
+  assert math.isclose(projected_tracking_error(0.04, 0.02, 0.03), 0.01)
+  assert projected_tracking_error(0.04, 0.02, 0.05) == 0.0
+  assert math.isclose(projected_tracking_error(0.04, 0.02, 0.01), 0.02)
+  assert math.isclose(projected_tracking_error(-0.04, -0.02, -0.03), -0.01)
 
 
-def test_c0_adaptation_clears_on_driver_override():
-  cmd = lateral_path_command(arc_model(0.02), 0.02, 0.01, 7.0,
-                             0.01, True, True, c2_last=0.0,
-                             c0_undertrack_correction=0.006)
+def test_steering_angle_projector_uses_exact_20hz_tenth_second_window():
+  projector = SteeringAngleProjector()
 
-  assert cmd.c0_undertrack_correction == 0.0
+  assert projector.update(50.0) == 50.0
+  assert projector.update(55.0) == 65.0
+  assert projector.update(60.0) == 70.0
+
+
+def test_ford_steering_angle_conversion_has_curvature_sign():
+  vm = SimpleNamespace(calc_curvature=lambda angle, _speed, _roll: angle)
+
+  assert math.isclose(ford_curvature_from_steering_angle(vm, 90.0, 7.0), -math.pi / 2.0)
+  assert math.isclose(ford_curvature_from_steering_angle(vm, -90.0, 7.0), math.pi / 2.0)
