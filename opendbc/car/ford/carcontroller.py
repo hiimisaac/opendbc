@@ -7,9 +7,9 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hystere
 from opendbc.car.lateral import AVERAGE_ROAD_ROLL, ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.lateral_path import (
+  DriverOverrideFilter,
   FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG,
   SteeringAngleProjector,
-  driver_steering_opposes_command,
   lateral_path_command,
 )
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
@@ -115,6 +115,7 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.driver_handoff = False
     self.steering_angle_projector = SteeringAngleProjector()
+    self.driver_override_filter = DriverOverrideFilter()
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -186,14 +187,16 @@ class CarController(CarControllerBase):
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
         angle_error_deg_raw = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
-        driver_override = CC.latActive and driver_steering_opposes_command(CS.out.steeringPressed, CS.out.steeringTorque,
-                                                                           angle_error_deg_raw)
-        cooperative_control = driver_override or self.driver_handoff
         # During an opposing override, synchronize the path to the steering
         # angle the driver is holding. Unlike yaw/v, this remains usable at low
         # speed and follows the driver's input without waiting for vehicle yaw.
         actual_angle_deg = CS.out.steeringAngleDeg
         projected_angle_deg = self.steering_angle_projector.update(actual_angle_deg)
+        driver_override = self.driver_override_filter.update(
+          CC.latActive and CS.out.steeringPressed, CS.out.steeringTorque,
+          angle_error_deg_raw, actual_angle_deg, projected_angle_deg,
+        )
+        cooperative_control = driver_override or self.driver_handoff or self.driver_override_filter.pending
         wheel_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
         path_curvature = current_curvature
         if driver_override:
@@ -214,23 +217,32 @@ class CarController(CarControllerBase):
                                    path_offset_last=self.path_offset_last,
                                    driver_handoff=self.driver_handoff and not driver_override,
                                    angle_error_curvature=angle_error_curvature,
-                                   wheel_curvature=wheel_curvature,
-                                   projected_wheel_curvature=projected_wheel_curvature,
-                                   c2_latched_last=self.c2_latched,
+                                    wheel_curvature=wheel_curvature,
+                                    projected_wheel_curvature=projected_wheel_curvature,
+                                    c2_latched_last=self.c2_latched,
                                    c2_recovery_frames_last=self.c2_recovery_frames,
                                    unwind_curvature_last=self.unwind_curvature,
                                    curvature_rate_last=self.curvature_rate_last)
         self.k_meas_filt = cmd.k_meas_filt
         self.c2_latched = cmd.c2_latched
         self.c2_recovery_frames = cmd.c2_recovery_frames
-        self.unwind_curvature = cmd.unwind_curvature
-        self.curvature_rate_last = cmd.curvature_rate
-        apply_curvature = cmd.curvature
-        curvature_rate = cmd.curvature_rate
-        path_angle = cmd.path_angle
-        path_offset = cmd.path_offset
-        self.path_angle_last = path_angle
-        self.path_offset_last = path_offset
+        if self.driver_override_filter.pending:
+          # A single weak opposing sample can be road shock or steering-column
+          # noise. Hold the coherent polynomial for one frame rather than
+          # collapsing it or adding authority while intent is ambiguous.
+          apply_curvature = self.apply_curvature_last
+          curvature_rate = self.curvature_rate_last
+          path_angle = self.path_angle_last
+          path_offset = self.path_offset_last
+        else:
+          self.unwind_curvature = cmd.unwind_curvature
+          self.curvature_rate_last = cmd.curvature_rate
+          apply_curvature = cmd.curvature
+          curvature_rate = cmd.curvature_rate
+          path_angle = cmd.path_angle
+          path_offset = cmd.path_offset
+          self.path_angle_last = path_angle
+          self.path_offset_last = path_offset
         if driver_override:
           self.driver_handoff = True
         elif self.driver_handoff and cmd.handoff_complete:
