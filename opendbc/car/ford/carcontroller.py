@@ -8,6 +8,7 @@ from opendbc.car.lateral import AVERAGE_ROAD_ROLL, ISO_LATERAL_ACCEL, apply_std_
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.lateral_path import (
   DriverOverrideFilter,
+  FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
   FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG,
   SteeringAngleProjector,
   lateral_path_command,
@@ -115,6 +116,9 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.driver_handoff = False
     self.steering_angle_projector = SteeringAngleProjector()
+    self.driver_override_angle_projector = SteeringAngleProjector(
+      horizon=FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
+    )
     self.driver_override_filter = DriverOverrideFilter()
     self.model = None
     self.model_frame = 0
@@ -192,9 +196,10 @@ class CarController(CarControllerBase):
         # speed and follows the driver's input without waiting for vehicle yaw.
         actual_angle_deg = CS.out.steeringAngleDeg
         projected_angle_deg = self.steering_angle_projector.update(actual_angle_deg)
+        override_projected_angle_deg = self.driver_override_angle_projector.update(actual_angle_deg)
         driver_override = self.driver_override_filter.update(
           CC.latActive and CS.out.steeringPressed, CS.out.steeringTorque,
-          angle_error_deg_raw, actual_angle_deg, projected_angle_deg,
+          angle_error_deg_raw, actual_angle_deg, override_projected_angle_deg,
         )
         cooperative_control = driver_override or self.driver_handoff or self.driver_override_filter.pending
         wheel_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)

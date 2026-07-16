@@ -16,6 +16,7 @@ from opendbc.car.ford.lateral_path import (
   FORD_PATH_C1_DEADZONE,
   FORD_PATH_DT,
   FORD_PATH_K_MEAS_TAU,
+  FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
   SteeringAngleProjector,
   driver_steering_opposes_command,
   lateral_path_command,
@@ -618,6 +619,59 @@ def test_coherent_polynomial_preview_starts_moving_turn_before_live_action_gate(
     assert cmd.path_offset * sign > 0.0
 
 
+def test_spatial_preview_reencodes_farther_model_curvature_at_near_coefficient_scale():
+  curvature = 0.0025
+  curvature_rate = 0.0015
+  preview_distance = 10.5  # 7 m base + 7 m/s * 0.5 s
+  model = polynomial_path_model(
+    curvature, curvature_rate,
+    distances=(0.0, 1.75, 2.5, 3.5, 5.0, 7.0, preview_distance, 12.0),
+  )
+
+  cmd = lateral_path_command(
+    model, curvature, -0.0015, 7.0, -0.0015, True, False,
+    c2_last=curvature,
+  )
+
+  preview_c1_curvature = curvature + 0.5 * curvature_rate * preview_distance
+  preview_c0_curvature = curvature + curvature_rate * preview_distance / 3.0
+  expected_angle = (preview_c1_curvature - FORD_PATH_C1_DEADZONE -
+                    FORD_PATH_C1_CRUISE_DEADZONE) * 7.0
+  expected_offset = 0.5 * preview_c0_curvature * 7.0 * 7.0
+  assert math.isclose(cmd.path_angle, expected_angle)
+  assert math.isclose(cmd.path_offset, expected_offset)
+
+
+def test_spatial_preview_can_lead_a_stale_opposite_action_during_reversal():
+  distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0, 10.5, 12.0)
+  full_model = polynomial_path_model(0.0025, -0.002, distances=distances)
+  near_model = polynomial_path_model(0.0025, -0.002)
+  common = dict(
+    desired_curvature=0.0034, k_meas=0.002, v_ego=7.0, k_meas_filt=0.002,
+    lat_active=True, driver_override=False, c2_last=0.0034,
+  )
+
+  full = lateral_path_command(model=full_model, **common)
+  near = lateral_path_command(model=near_model, **common)
+
+  assert full.path_angle < near.path_angle < 0.0
+  assert full.path_offset < near.path_offset < 0.0
+
+
+def test_spatial_c0_c1_preview_does_not_wake_suppressed_c3():
+  distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0, 10.5, 12.0)
+  model = polynomial_path_model(0.0207, -0.008, distances=distances)
+
+  cmd = lateral_path_command(
+    model, 0.0025, 0.001, 7.0, 0.001, True, False,
+    c2_last=0.0025,
+  )
+
+  assert cmd.path_angle < 0.0
+  assert cmd.path_offset < 0.0
+  assert cmd.curvature_rate == 0.0
+
+
 def test_polynomial_preview_requires_motion_and_delivered_curvature_reversal():
   common = dict(
     model=polynomial_path_model(0.0025, 0.0015), desired_curvature=0.0025,
@@ -666,6 +720,22 @@ def test_polynomial_preview_does_not_hold_geometry_during_turn_exit():
 
   assert cmd.curvature_rate == 0.0
   assert cmd.path_offset == 0.0
+
+
+def test_spatial_preview_releases_when_far_geometry_stops_building():
+  distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0, 10.5, 12.0)
+  full_model = polynomial_path_model(0.02, -0.0015, distances=distances)
+  near_model = polynomial_path_model(0.02, -0.0015)
+  common = dict(
+    desired_curvature=0.009, k_meas=0.0, v_ego=7.0, k_meas_filt=0.0,
+    lat_active=True, driver_override=False, c2_last=0.0,
+  )
+
+  full = lateral_path_command(model=full_model, **common)
+  near = lateral_path_command(model=near_model, **common)
+
+  assert math.isclose(full.path_angle, near.path_angle)
+  assert math.isclose(full.path_offset, near.path_offset)
 
 
 def test_large_turn_latch_does_not_force_c3_into_gentle_tracking():
@@ -962,12 +1032,24 @@ def test_projection_only_discounts_curvature_error_closing_model_target():
   assert math.isclose(projected_tracking_error(-0.04, -0.02, -0.03), -0.01)
 
 
-def test_steering_angle_projector_uses_exact_20hz_tenth_second_window():
+def test_steering_angle_projector_uses_exact_20hz_035_second_window():
   projector = SteeringAngleProjector()
 
-  assert projector.update(50.0) == 50.0
-  assert projector.update(55.0) == 65.0
-  assert projector.update(60.0) == 70.0
+  projected = 0.0
+  for angle in range(8):
+    projected = projector.update(float(angle))
+
+  assert math.isclose(projected, 14.0)
+
+
+def test_driver_override_can_keep_short_steering_projection():
+  projector = SteeringAngleProjector(horizon=FORD_PATH_OVERRIDE_PROJECTION_HORIZON)
+
+  projected = 0.0
+  for angle in range(8):
+    projected = projector.update(float(angle))
+
+  assert math.isclose(projected, 9.0)
 
 
 def test_ford_steering_angle_conversion_has_curvature_sign():
