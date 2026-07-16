@@ -9,6 +9,7 @@ from opendbc.car.ford.carcontroller import (
 )
 from opendbc.car.ford.fordcan import lmc2_curvature_rate_for_can
 from opendbc.car.ford.lateral_path import (
+  DriverOverrideFilter,
   FORD_PATH_C0_FEEDBACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
   FORD_PATH_C1_CRUISE_DEADZONE,
@@ -468,6 +469,45 @@ def test_zero_torque_during_pressed_release_does_not_interrupt_handoff():
 
 def test_unpressed_driver_never_overrides_path_command():
   assert not driver_steering_opposes_command(False, -1.125, 0.013)
+
+
+def test_single_weak_opposing_bump_does_not_override_closing_wheel():
+  override_filter = DriverOverrideFilter()
+
+  # Segment 12: a one-frame -1.0625 Nm pulse appeared while the wheel was
+  # still moving quickly toward a desired angle 95 degrees away.
+  assert not override_filter.update(True, -1.0625, 95.1, 116.7, 122.1)
+  assert override_filter.pending
+
+
+def test_separated_weak_opposing_bumps_do_not_accumulate():
+  override_filter = DriverOverrideFilter()
+
+  assert not override_filter.update(True, -1.0625, 95.1, 116.7, 122.1)
+  assert not override_filter.update(False, -0.9375, 99.5, 120.1, 125.5)
+  assert not override_filter.update(True, -1.3125, 83.4, 153.2, 162.1)
+  assert override_filter.pending
+
+
+def test_sustained_weak_opposition_overrides_on_second_frame():
+  override_filter = DriverOverrideFilter()
+
+  assert not override_filter.update(True, -1.125, 80.0, 120.0, 125.0)
+  assert override_filter.update(True, -1.125, 75.0, 125.0, 130.0)
+  assert override_filter.update(True, -1.125, 70.0, 130.0, 135.0)
+  assert not override_filter.pending
+
+
+def test_strong_opposition_overrides_immediately_while_wheel_closes():
+  override_filter = DriverOverrideFilter()
+
+  assert override_filter.update(True, -2.0, 80.0, 120.0, 125.0)
+
+
+def test_weak_opposition_overrides_immediately_when_wheel_diverges():
+  override_filter = DriverOverrideFilter()
+
+  assert override_filter.update(True, -1.125, 80.0, 120.0, 115.0)
 
 
 def test_sunnypilot_messaging_namespace_is_preferred():
