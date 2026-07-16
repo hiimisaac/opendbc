@@ -25,7 +25,7 @@ import math
 #   steady state, cover the PSCM's ~1s c2 lag during transients, and hold the
 #   remainder as a sustained chase heading past c2's range.
 # - c0 also closes bounded steering-angle error during maneuvers. Actual wheel
-#   motion is projected 0.1 s forward first, so feedback does not keep building
+#   motion is projected 0.35 s forward first, so feedback does not keep building
 #   while the PSCM is already moving toward the requested angle.
 
 FORD_PATH_C0_CAN_CLIP = (-4.61, 4.60)
@@ -35,6 +35,8 @@ FORD_PATH_C2_CAN_CLIP = (-0.02, 0.02)
 FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
+FORD_PATH_PREVIEW_TIME = 0.5  # s, spatial phase lead for coherent moving turns
+FORD_PATH_PREVIEW_MAX = 12.0  # m, do not pull distant model geometry into LMC2
 FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
 FORD_PATH_C0_FEEDBACK_ERROR_LIMIT = 0.02  # 1/m of steering-angle tracking error
 
@@ -92,7 +94,8 @@ FORD_PATH_C3_HORIZONS = (3.5, 5.0, 7.0)  # m
 # than maneuver attack so control resumes promptly without a coefficient step.
 FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW = 0.01  # 1/m per 20Hz frame
 FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
-FORD_PATH_ANGLE_PROJECTION_HORIZON = 0.1  # s, measured wheel-motion lookahead
+FORD_PATH_ANGLE_PROJECTION_HORIZON = 0.35  # s, measured wheel-motion lookahead
+FORD_PATH_OVERRIDE_PROJECTION_HORIZON = 0.1  # s, preserve responsive driver-intent detection
 FORD_PATH_DRIVER_OVERRIDE_IMMEDIATE_TORQUE = 2.0  # Nm, 2x Ford's normal steering-pressed threshold
 FORD_PATH_DRIVER_OVERRIDE_CONFIRM_FRAMES = 2      # 0.1 s at 20Hz, including the first weak sample
 
@@ -422,9 +425,42 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
 
   model_path_valid = _valid_model_path(model)
   curvature_rate = model_curvature_rate_consensus(model) if model_path_valid else 0.0
+  spatial_preview_curvature = 0.0
   if model_path_valid:
     path_angle_raw = _interp(d_look, model.position.x, model.orientation.z)
     path_offset_raw = _interp(d_c0, model.position.x, model.position.y)
+    near_path_angle_raw = path_angle_raw
+    near_path_offset_raw = path_offset_raw
+
+    # The model can describe a moving turn several meters before its lag-
+    # adjusted action and 7 m geometry reach the same curvature. When c0, c1,
+    # and c3 all describe a stronger building arc, sample up to 0.5 s farther
+    # ahead, recover curvature there, then re-encode it at the normal c0/c1
+    # distances. This advances phase without multiplying steady-state gain or
+    # shipping a raw 12 m lateral offset to the PSCM.
+    preview_distance = min(d_look + max(v_ego, 0.0) * FORD_PATH_PREVIEW_TIME,
+                           FORD_PATH_PREVIEW_MAX)
+    preview_distance = max(d_look, min(preview_distance, _finite(model.position.x[-1], d_look)))
+    if preview_distance > d_look and v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
+      c0_path_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
+      c1_path_curvature = path_angle_raw / d_look
+      preview_path_angle = _interp(preview_distance, model.position.x, model.orientation.z)
+      preview_path_offset = _interp(preview_distance, model.position.x, model.position.y)
+      preview_c0_curvature = 2.0 * preview_path_offset / (preview_distance * preview_distance)
+      preview_c1_curvature = preview_path_angle / preview_distance
+      preview_strength = min(abs(preview_c0_curvature), abs(preview_c1_curvature))
+      preview_share = _interp(preview_strength, FORD_PATH_C0_GATE_BP, (0.0, 1.0))
+      preview_geometry_agrees = preview_c0_curvature * preview_c1_curvature > 0.0
+      preview_is_building = abs(preview_c0_curvature) > abs(c0_path_curvature) and \
+                            abs(preview_c1_curvature) > abs(c1_path_curvature)
+      c3_direction_agrees = curvature_rate * preview_c0_curvature > 0.0 and \
+                            curvature_rate * preview_c1_curvature > 0.0
+      if preview_geometry_agrees and preview_is_building and c3_direction_agrees:
+        c0_path_curvature += preview_share * (preview_c0_curvature - c0_path_curvature)
+        c1_path_curvature += preview_share * (preview_c1_curvature - c1_path_curvature)
+        path_offset_raw = 0.5 * c0_path_curvature * d_c0 * d_c0
+        path_angle_raw = c1_path_curvature * d_look
+        spatial_preview_curvature = math.copysign(preview_strength, preview_c0_curvature)
   else:
     path_angle_raw = desired_curvature * d_look
     path_offset_raw = 0.5 * desired_curvature * d_c0 * d_c0
@@ -437,8 +473,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   coherent_preview_curvature = 0.0
   if model_path_valid:
     preview_curvature = desired_curvature + curvature_rate * FORD_PATH_C3_HORIZONS[0]
-    c0_path_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
-    c1_path_curvature = path_angle_raw / d_look
+    c0_path_curvature = 2.0 * near_path_offset_raw / (d_c0 * d_c0)
+    c1_path_curvature = near_path_angle_raw / d_look
     preview_direction_agrees = preview_curvature * curvature_rate > 0.0 and \
                                abs(preview_curvature) > abs(desired_curvature)
     geometry_direction_agrees = c0_path_curvature * preview_curvature > 0.0 and \
@@ -500,7 +536,8 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # zero unless the live action or coherent imminent geometry is a maneuver.
   # Its gate reaches full strength by 0.006 so turn entries get the full offset
   # authority (the 1-share gate withheld 55% through the corridor).
-  c0_gate_curvature = max(abs(desired_curvature), abs(coherent_preview_curvature))
+  c0_gate_curvature = max(abs(desired_curvature), abs(coherent_preview_curvature),
+                          abs(spatial_preview_curvature))
   c0_gain = _interp(c0_gate_curvature, FORD_PATH_C0_GATE_BP, (0.0, 1.0))
   path_offset = (path_offset_raw - 0.5 * k_residual * d_c0 * d_c0) * c0_gain
 
