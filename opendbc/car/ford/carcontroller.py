@@ -1,11 +1,17 @@
 import importlib
 import math
+
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.lateral import AVERAGE_ROAD_ROLL, ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, driver_steering_opposes_command, lateral_path_command
+from opendbc.car.ford.lateral_path import (
+  FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG,
+  SteeringAngleProjector,
+  driver_steering_opposes_command,
+  lateral_path_command,
+)
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -37,6 +43,11 @@ VisualAlert = structs.CarControl.HUDControl.VisualAlert
 # CAN FD limits:
 # Limit to average banked road since safety doesn't have the roll, higher actual roll lowers lateral acceleration
 MAX_LATERAL_ACCEL = ISO_LATERAL_ACCEL - (ACCELERATION_DUE_TO_GRAVITY * AVERAGE_ROAD_ROLL)  # ~2.4 m/s^2
+
+
+def ford_curvature_from_steering_angle(VM, steering_angle_deg: float, v_ego: float) -> float:
+  """Convert steering-wheel angle to Ford's opposite-sign curvature."""
+  return -float(VM.calc_curvature(math.radians(steering_angle_deg), v_ego, 0.0))
 
 
 def anti_overshoot(apply_curvature, apply_curvature_last, v_ego):
@@ -98,12 +109,12 @@ class CarController(CarControllerBase):
     self.path_offset_last = 0.0
     self.anti_overshoot_curvature_last = 0
     self.k_meas_filt = 0.0
-    self.c0_undertrack_correction = 0.0
     self.c2_latched = False
     self.c2_recovery_frames = 0
     self.unwind_curvature = 0.0
     self.curvature_rate_last = 0.0
     self.driver_handoff = False
+    self.steering_angle_projector = SteeringAngleProjector()
     self.model = None
     self.model_frame = 0
     self.sm = None
@@ -181,33 +192,35 @@ class CarController(CarControllerBase):
         # During an opposing override, synchronize the path to the steering
         # angle the driver is holding. Unlike yaw/v, this remains usable at low
         # speed and follows the driver's input without waiting for vehicle yaw.
-        wheel_curvature = -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg), CS.out.vEgoRaw, 0.0)
+        actual_angle_deg = CS.out.steeringAngleDeg
+        projected_angle_deg = self.steering_angle_projector.update(actual_angle_deg)
+        wheel_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
         path_curvature = current_curvature
         if driver_override:
           path_curvature = wheel_curvature
 
-        # The normal lat-test controller remains curvature/model driven. Only
-        # its large-turn flush may use the existing upstream steering-angle
-        # target to actively return a wheel that is lagging the requested exit.
+        # Preserve the raw angle error for the large-turn flush. Separately
+        # project measured wheel motion before using angle error as maneuver
+        # feedback, so commands already arriving do not earn another c0 shove.
         angle_error_deg = angle_error_deg_raw
         angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, 0.0),
                                         angle_error_deg)
-        angle_error_curvature = -self.VM.calc_curvature(math.radians(angle_error_deg), CS.out.vEgoRaw, 0.0)
+        angle_error_curvature = ford_curvature_from_steering_angle(self.VM, angle_error_deg, CS.out.vEgoRaw)
+        projected_wheel_curvature = ford_curvature_from_steering_angle(self.VM, projected_angle_deg, CS.out.vEgoRaw)
         cmd = lateral_path_command(model, desired_curvature, path_curvature, CS.out.vEgoRaw,
                                    self.k_meas_filt, CC.latActive, driver_override,
                                    c2_last=self.apply_curvature_last,
-                                   c0_undertrack_correction=self.c0_undertrack_correction,
                                    path_angle_last=self.path_angle_last,
                                    path_offset_last=self.path_offset_last,
                                    driver_handoff=self.driver_handoff and not driver_override,
                                    angle_error_curvature=angle_error_curvature,
                                    wheel_curvature=wheel_curvature,
+                                   projected_wheel_curvature=projected_wheel_curvature,
                                    c2_latched_last=self.c2_latched,
                                    c2_recovery_frames_last=self.c2_recovery_frames,
                                    unwind_curvature_last=self.unwind_curvature,
                                    curvature_rate_last=self.curvature_rate_last)
         self.k_meas_filt = cmd.k_meas_filt
-        self.c0_undertrack_correction = cmd.c0_undertrack_correction
         self.c2_latched = cmd.c2_latched
         self.c2_recovery_frames = cmd.c2_recovery_frames
         self.unwind_curvature = cmd.unwind_curvature
