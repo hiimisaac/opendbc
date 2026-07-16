@@ -462,15 +462,16 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     curvature_rate = _limit_same_direction_attack(curvature_rate, curvature_rate_last,
                                                    FORD_PATH_C3_ATTACK_SLEW)
 
-  # modelV2's legacy path geometry can be weaker than its lag-adjusted action.
-  # While c2 owns lane following, preserve the model residual as-is. Once c2
-  # starts fading for a maneuver, c1 follows the bounded action while c0 keeps
-  # stronger same-direction near-path geometry and steering-angle feedback.
+  # modelV2's path geometry can lead or trail its lag-adjusted action. Once c2
+  # starts fading for a maneuver, keep stronger same-direction model geometry
+  # in both c0 and c1 while retaining the action as their authority floor. Do
+  # not extend stronger model c1 through a latched exit, where it can fight the
+  # steering-angle unwind after the live action has returned to cruise range.
   c1_path_angle_raw = path_angle_raw
   if c2_share < 1.0:
     path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
     path_offset_raw = _authority_floor(path_offset_raw, 0.5 * desired_curvature * d_c0 * d_c0)
-    c1_path_angle_raw = desired_curvature * d_look
+    c1_path_angle_raw = path_angle_raw if live_maneuver_share > 0.0 else desired_curvature * d_look
 
   # Subtract only the measured curvature already delivering this path. Bounding
   # it to the path's direction and magnitude makes c0/c1 one-sided: they fill
