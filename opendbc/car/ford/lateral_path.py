@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 
@@ -23,6 +24,9 @@ import math
 #   is already delivering (low-passed measured curvature). They idle at zero in
 #   steady state, cover the PSCM's ~1s c2 lag during transients, and hold the
 #   remainder as a sustained chase heading past c2's range.
+# - c0 also closes bounded steering-angle error during maneuvers. Actual wheel
+#   motion is projected 0.1 s forward first, so feedback does not keep building
+#   while the PSCM is already moving toward the requested angle.
 
 FORD_PATH_C0_CAN_CLIP = (-4.61, 4.60)
 FORD_PATH_C1_CAN_CLIP = (-0.475, 0.497)
@@ -32,15 +36,7 @@ FORD_PATH_D_LOOK_TIME = 1.0   # s, c1 heading sampled this far ahead
 FORD_PATH_D_LOOK_MIN = 7.0    # m
 FORD_PATH_D_C0 = 7.0          # m, near-field placement lookahead
 FORD_PATH_C0_GATE_BP = (0.003, 0.006)  # 1/m of desired curvature, c0 fades in
-FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT = 0.02  # 1/m, bounds added offset authority
-FORD_PATH_C0_UNDERTRACK_SPEED_BP = (2.0, 5.0, 10.0, 15.0)  # m/s
-FORD_PATH_C0_UNDERTRACK_SPEED_GAIN = (0.0, 1.0, 1.0, 0.0)
-# A short-horizon filtered copy of persistent maneuver error may add more c0.
-# This is deliberately not an integral or global gain: it is capped, gated out
-# of lane following, and released quickly when the live error disappears.
-FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT = 0.01  # 1/m of additional c0-equivalent curvature
-FORD_PATH_C0_ADAPTIVE_ATTACK_TAU = 0.5   # s, requires persistent undertracking
-FORD_PATH_C0_ADAPTIVE_RELEASE_TAU = 0.2  # s, remove authority faster than it builds
+FORD_PATH_C0_FEEDBACK_ERROR_LIMIT = 0.02  # 1/m of steering-angle tracking error
 
 # Large sustained c2 charges a slow-unwinding state in the PSCM that discharges
 # as a pull after the maneuver (observed after every large-c2 turn; absent in
@@ -96,6 +92,7 @@ FORD_PATH_C3_HORIZONS = (3.5, 5.0, 7.0)  # m
 # than maneuver attack so control resumes promptly without a coefficient step.
 FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW = 0.01  # 1/m per 20Hz frame
 FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
+FORD_PATH_ANGLE_PROJECTION_HORIZON = 0.1  # s, measured wheel-motion lookahead
 
 
 @dataclass(frozen=True)
@@ -105,11 +102,32 @@ class LateralPathCommand:
   path_angle: float   # c1
   path_offset: float  # c0
   k_meas_filt: float
-  c0_undertrack_correction: float
   handoff_complete: bool
   c2_latched: bool = False
   c2_recovery_frames: int = 0
   unwind_curvature: float = 0.0
+
+
+class SteeringAngleProjector:
+  """Project steering angle from a short, fixed-rate measurement window."""
+
+  def __init__(self, sample_dt: float = FORD_PATH_DT,
+               horizon: float = FORD_PATH_ANGLE_PROJECTION_HORIZON):
+    self.sample_dt = max(_finite(sample_dt), FORD_PATH_DT)
+    self.horizon = max(_finite(horizon), 0.0)
+    sample_count = max(round(self.horizon / self.sample_dt) + 1, 2)
+    self.samples: deque[float] = deque(maxlen=sample_count)
+
+  def update(self, actual_angle_deg: float) -> float:
+    fallback = self.samples[-1] if self.samples else 0.0
+    actual_angle_deg = _finite(actual_angle_deg, fallback)
+    self.samples.append(actual_angle_deg)
+    sample_time = (len(self.samples) - 1) * self.sample_dt
+    if sample_time <= 0.0:
+      return actual_angle_deg
+
+    steering_rate_deg_s = (self.samples[-1] - self.samples[0]) / sample_time
+    return actual_angle_deg + steering_rate_deg_s * self.horizon
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -142,6 +160,18 @@ def _limit_same_direction_attack(value: float, last: float, max_step: float) -> 
 
 def _limit_step(value: float, last: float, max_step: float) -> float:
   return _clip(value, last - max_step, last + max_step)
+
+
+def projected_tracking_error(target: float, current: float, projected: float) -> float:
+  """Discount tracking error only when measured motion is closing the target."""
+  error = _finite(target) - _finite(current)
+  projected_error = _finite(target) - _finite(projected)
+  projected_motion = _finite(projected) - _finite(current)
+  if error == 0.0 or projected_motion * error <= 0.0:
+    return error
+  if projected_error * error <= 0.0:
+    return 0.0
+  return projected_error if abs(projected_error) < abs(error) else error
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
@@ -238,12 +268,12 @@ def model_curvature_rate_consensus(model) -> float:
 def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: float,
                          k_meas_filt: float, lat_active: bool,
                          driver_override: bool, c2_last: float | None = None,
-                         c0_undertrack_correction: float = 0.0,
                          path_angle_last: float | None = None,
                          path_offset_last: float | None = None,
                          driver_handoff: bool = False,
                          angle_error_curvature: float = 0.0,
                          wheel_curvature: float = 0.0,
+                         projected_wheel_curvature: float | None = None,
                          c2_latched_last: bool = False,
                          c2_recovery_frames_last: int = 0,
                          unwind_curvature_last: float = 0.0,
@@ -261,12 +291,14 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   v_ego = _finite(v_ego)
   angle_error_curvature = _finite(angle_error_curvature)
   wheel_curvature = _finite(wheel_curvature)
+  steering_feedback_available = projected_wheel_curvature is not None
+  if projected_wheel_curvature is None:
+    projected_wheel_curvature = wheel_curvature
+  projected_wheel_curvature = _finite(projected_wheel_curvature, wheel_curvature)
   c2_latched = bool(c2_latched_last)
   c2_recovery_frames = max(int(c2_recovery_frames_last), 0)
   unwind_curvature_last = _clip(_finite(unwind_curvature_last),
                                 -FORD_PATH_UNWIND_ERROR_LIMIT, FORD_PATH_UNWIND_ERROR_LIMIT)
-  c0_undertrack_correction = _clip(_finite(c0_undertrack_correction),
-                                   -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT, FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
 
   if not lat_active:
     # Preserve the c2 flush across a quick disengage/re-engage. Ten inactive
@@ -276,7 +308,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
       if c2_recovery_frames >= FORD_PATH_C2_FLUSH_FRAMES:
         c2_latched = False
         c2_recovery_frames = 0
-    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, 0.0, True,
+    return LateralPathCommand(0.0, 0.0, 0.0, 0.0, k_meas, True,
                               c2_latched, c2_recovery_frames, 0.0)
 
   k_meas_filt = _finite(k_meas_filt)
@@ -323,12 +355,12 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   d_c0 = FORD_PATH_D_C0
   if driver_override:
     # Keep the controller synchronized to the arc the driver is physically
-    # steering. C0/C1 update with the delivered path while c2 and adaptive
+    # steering. C0/C1 update with the delivered path while c2 and feedback
     # authority stay empty, allowing a model hand-back anywhere in the curve
     # without storing a torque fight in the PSCM.
     path_angle = _clip(k_meas * d_look, *FORD_PATH_C1_CAN_CLIP)
     path_offset = _clip(0.5 * k_meas * d_c0 * d_c0, *FORD_PATH_C0_CAN_CLIP)
-    return LateralPathCommand(0.0, 0.0, path_angle, path_offset, k_meas_filt, 0.0, False,
+    return LateralPathCommand(0.0, 0.0, path_angle, path_offset, k_meas_filt, False,
                               c2_latched, c2_recovery_frames, 0.0)
 
   model_path_valid = _valid_model_path(model)
@@ -376,7 +408,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   # modelV2's legacy path geometry can be weaker than its lag-adjusted action.
   # While c2 owns lane following, preserve the model residual as-is. Once c2
   # starts fading for a maneuver, c1 follows the bounded action while c0 keeps
-  # stronger same-direction near-path geometry and undertracking authority.
+  # stronger same-direction near-path geometry and steering-angle feedback.
   c1_path_angle_raw = path_angle_raw
   if c2_share < 1.0:
     path_angle_raw = _authority_floor(path_angle_raw, desired_curvature * d_look)
@@ -425,53 +457,16 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   unwind_curvature = _limit_same_direction_attack(unwind_target, unwind_curvature_last,
                                                    FORD_PATH_UNWIND_ATTACK_SLEW)
 
-  # On logged tight turns, the model/action floor entered path mode correctly
-  # but plateaued wide until the driver intervened. Add one bounded c0 arc for
-  # the curvature still missing from the truck. This is maneuver-only, fades as
-  # measured curvature catches up, and is disabled where yaw/v is unreliable or
-  # high-speed c0 is prone to hunting.
-  undertrack_error = path_curvature - k_meas_filt
-  adaptive_target = 0.0
-  if unwind_target == 0.0 and undertrack_error * path_curvature > 0.0:
-    undertrack_error = _clip(undertrack_error, -FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT,
-                             FORD_PATH_C0_UNDERTRACK_ERROR_LIMIT)
-    path_share = 1.0 - c2_share
-    speed_gain = _interp(v_ego, FORD_PATH_C0_UNDERTRACK_SPEED_BP, FORD_PATH_C0_UNDERTRACK_SPEED_GAIN)
-    gated_error = undertrack_error * path_share * speed_gain
-    path_offset += 0.5 * gated_error * d_c0 * d_c0
-    if model_path_valid:
-      adaptive_target = _clip(gated_error, -FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
-                              FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT)
-
-  # Bound the state to actual remaining c0 authority so correction cannot wind
-  # up invisibly behind the output clip and emerge later during the unwind.
-  path_offset = _clip(path_offset, *FORD_PATH_C0_CAN_CLIP)
-  adaptive_lo = max(-FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
-                    2.0 * (FORD_PATH_C0_CAN_CLIP[0] - path_offset) / (d_c0 * d_c0))
-  adaptive_hi = min(FORD_PATH_C0_ADAPTIVE_ERROR_LIMIT,
-                    2.0 * (FORD_PATH_C0_CAN_CLIP[1] - path_offset) / (d_c0 * d_c0))
-  adaptive_target = _clip(adaptive_target, adaptive_lo, adaptive_hi)
-  c0_undertrack_correction = _clip(c0_undertrack_correction, adaptive_lo, adaptive_hi)
-
-  # Never carry learned authority into the opposite turn. Skip attacking the
-  # new direction for one frame so a reversal starts from the stateless command.
-  correction_direction = unwind_target if unwind_target != 0.0 else path_curvature
-  direction_reversed = c0_undertrack_correction * correction_direction < 0.0
-  if direction_reversed:
-    c0_undertrack_correction = 0.0
-    adaptive_target = 0.0
-    applied_correction = 0.0
-  else:
-    building = adaptive_target * c0_undertrack_correction >= 0.0 and \
-               abs(adaptive_target) > abs(c0_undertrack_correction)
-    tau = FORD_PATH_C0_ADAPTIVE_ATTACK_TAU if building else FORD_PATH_C0_ADAPTIVE_RELEASE_TAU
-    alpha = 1.0 - math.exp(-FORD_PATH_DT / tau)
-    applied_correction = c0_undertrack_correction
-    c0_undertrack_correction += alpha * (adaptive_target - c0_undertrack_correction)
-    if not building:
-      applied_correction = c0_undertrack_correction
-
-  path_offset += 0.5 * applied_correction * d_c0 * d_c0
+  # Steering-angle feedback closes the full near-field model target, including
+  # c0 geometry stronger than action curvature. Projected wheel motion can only
+  # reduce the instantaneous error; it can never amplify or reverse it.
+  feedback_target_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
+  feedback_error = projected_tracking_error(feedback_target_curvature, wheel_curvature,
+                                            projected_wheel_curvature)
+  feedback_error = _clip(feedback_error, -FORD_PATH_C0_FEEDBACK_ERROR_LIMIT,
+                         FORD_PATH_C0_FEEDBACK_ERROR_LIMIT)
+  if steering_feedback_available and unwind_target == 0.0 and feedback_error * feedback_target_curvature > 0.0:
+    path_offset += 0.5 * feedback_error * (1.0 - c2_share) * d_c0 * d_c0
 
   path_angle = _clip(path_angle + unwind_curvature * d_look, *FORD_PATH_C1_CAN_CLIP)
   path_offset += 0.5 * unwind_curvature * d_c0 * d_c0
@@ -499,5 +494,5 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     handoff_complete = path_angle == target_path_angle and path_offset == target_path_offset
 
   return LateralPathCommand(c2, curvature_rate, path_angle, path_offset, k_meas_filt,
-                            c0_undertrack_correction, handoff_complete,
+                            handoff_complete,
                             c2_latched, c2_recovery_frames, unwind_curvature)
