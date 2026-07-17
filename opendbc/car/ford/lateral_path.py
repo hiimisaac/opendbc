@@ -269,6 +269,33 @@ def _valid_model_path(model) -> bool:
     return False
 
 
+def _spatial_model_path(model):
+  """Return path distance, lateral offset, and unwrapped heading samples."""
+  if not _valid_model_path(model):
+    return None
+
+  try:
+    xs = [float(x) for x in model.position.x]
+    ys = [float(y) for y in model.position.y]
+    headings = [float(heading) for heading in model.orientation.z]
+  except (AttributeError, TypeError, ValueError):
+    return None
+
+  if not all(math.isfinite(value) for values in (xs, ys, headings) for value in values):
+    return None
+
+  distances = [0.0]
+  for i in range(1, len(xs)):
+    distances.append(distances[-1] + math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+
+  unwrapped_headings = [headings[0]]
+  for heading in headings[1:]:
+    delta = (heading - unwrapped_headings[-1] + math.pi) % (2.0 * math.pi) - math.pi
+    unwrapped_headings.append(unwrapped_headings[-1] + delta)
+
+  return distances, ys, unwrapped_headings
+
+
 def model_curvature_rate(model, horizon: float) -> float:
   """Estimate d(curvature)/d(distance) from model path heading.
 
@@ -278,34 +305,15 @@ def model_curvature_rate(model, horizon: float) -> float:
   curvature offsets. Distance is accumulated along the model path rather than
   using longitudinal x so the result remains a spatial derivative in turns.
   """
-  if not _valid_model_path(model):
+  path = _spatial_model_path(model)
+  if path is None:
     return 0.0
-
-  try:
-    xs = [float(x) for x in model.position.x]
-    ys = [float(y) for y in model.position.y]
-    headings = [float(heading) for heading in model.orientation.z]
-  except (AttributeError, TypeError, ValueError):
-    return 0.0
-
-  if not all(math.isfinite(value) for values in (xs, ys, headings) for value in values):
-    return 0.0
-
-  distances = [0.0]
-  for i in range(1, len(xs)):
-    distances.append(distances[-1] + math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+  distances, _, unwrapped_headings = path
 
   horizon = _finite(horizon)
   horizon = min(horizon, distances[-1])
   if horizon <= 0.0:
     return 0.0
-
-  # Unwrap before interpolation so a +/-pi crossing cannot look like an
-  # enormous reversal in spatial curvature slope.
-  unwrapped_headings = [headings[0]]
-  for heading in headings[1:]:
-    delta = (heading - unwrapped_headings[-1] + math.pi) % (2.0 * math.pi) - math.pi
-    unwrapped_headings.append(unwrapped_headings[-1] + delta)
 
   heading_start = unwrapped_headings[0]
   heading_mid = _interp(0.5 * horizon, distances, unwrapped_headings)
@@ -424,6 +432,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
                               c2_latched, c2_recovery_frames, 0.0)
 
   model_path_valid = _valid_model_path(model)
+  spatial_model_path = _spatial_model_path(model) if model_path_valid else None
   curvature_rate = model_curvature_rate_consensus(model) if model_path_valid else 0.0
   spatial_preview_curvature = 0.0
   if model_path_valid:
@@ -438,14 +447,16 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     # ahead, recover curvature there, then re-encode it at the normal c0/c1
     # distances. This advances phase without multiplying steady-state gain or
     # shipping a raw 12 m lateral offset to the PSCM.
-    preview_distance = min(d_look + max(v_ego, 0.0) * FORD_PATH_PREVIEW_TIME,
-                           FORD_PATH_PREVIEW_MAX)
-    preview_distance = max(d_look, min(preview_distance, _finite(model.position.x[-1], d_look)))
-    if preview_distance > d_look and v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
+    preview_distance = d_look
+    if spatial_model_path is not None:
+      preview_distances, preview_ys, preview_headings = spatial_model_path
+      preview_distance = min(d_look + max(v_ego, 0.0) * FORD_PATH_PREVIEW_TIME,
+                             FORD_PATH_PREVIEW_MAX, preview_distances[-1])
+    if spatial_model_path is not None and preview_distance > d_look and v_ego > FORD_PATH_K_MEAS_MIN_SPEED:
       c0_path_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
       c1_path_curvature = path_angle_raw / d_look
-      preview_path_angle = _interp(preview_distance, model.position.x, model.orientation.z)
-      preview_path_offset = _interp(preview_distance, model.position.x, model.position.y)
+      preview_path_angle = _interp(preview_distance, preview_distances, preview_headings)
+      preview_path_offset = _interp(preview_distance, preview_distances, preview_ys)
       preview_c0_curvature = 2.0 * preview_path_offset / (preview_distance * preview_distance)
       preview_c1_curvature = preview_path_angle / preview_distance
       preview_strength = min(abs(preview_c0_curvature), abs(preview_c1_curvature))
