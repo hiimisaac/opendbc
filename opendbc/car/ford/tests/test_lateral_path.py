@@ -61,6 +61,32 @@ def polynomial_path_model(curvature, curvature_rate,
   )
 
 
+def turning_back_path_model():
+  # A valid tight turn: the path continues forward in distance, but its
+  # longitudinal x coordinate turns back after the vehicle rotates past 90°.
+  xs = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0, 9.2, 13.5, 9.2)
+  ys = (0.0, -0.04, -0.09, -0.18, -0.38, -0.8, -1.5, -20.0, -49.0)
+  headings = tuple(-0.005 * x - 0.001 * x * x for x in xs[:-2]) + (-0.8, -1.54)
+  return SimpleNamespace(
+    position=SimpleNamespace(x=list(xs), y=list(ys)),
+    orientation=SimpleNamespace(z=list(headings)),
+  )
+
+
+def spatial_model_sample(model, distance):
+  distances = [0.0]
+  for i in range(1, len(model.position.x)):
+    distances.append(distances[-1] + math.hypot(
+      model.position.x[i] - model.position.x[i - 1],
+      model.position.y[i] - model.position.y[i - 1],
+    ))
+  upper = next(i for i, path_distance in enumerate(distances) if path_distance > distance)
+  alpha = (distance - distances[upper - 1]) / (distances[upper] - distances[upper - 1])
+  offset = model.position.y[upper - 1] + alpha * (model.position.y[upper] - model.position.y[upper - 1])
+  heading = model.orientation.z[upper - 1] + alpha * (model.orientation.z[upper] - model.orientation.z[upper - 1])
+  return offset, heading
+
+
 def multi_horizon_curvature_rate_model(rate_3_5, rate_5, rate_7):
   distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0)
   heading_3_5 = rate_3_5 * 3.5 * 3.5 / 4.0
@@ -633,13 +659,37 @@ def test_spatial_preview_reencodes_farther_model_curvature_at_near_coefficient_s
     c2_last=curvature,
   )
 
-  preview_c1_curvature = curvature + 0.5 * curvature_rate * preview_distance
-  preview_c0_curvature = curvature + curvature_rate * preview_distance / 3.0
+  preview_offset, preview_heading = spatial_model_sample(model, preview_distance)
+  preview_c1_curvature = preview_heading / preview_distance
+  preview_c0_curvature = 2.0 * preview_offset / preview_distance ** 2
   expected_angle = (preview_c1_curvature - FORD_PATH_C1_DEADZONE -
                     FORD_PATH_C1_CRUISE_DEADZONE) * 7.0
   expected_offset = 0.5 * preview_c0_curvature * 7.0 * 7.0
   assert math.isclose(cmd.path_angle, expected_angle)
   assert math.isclose(cmd.path_offset, expected_offset)
+
+
+def test_spatial_preview_follows_path_distance_when_longitudinal_x_turns_back():
+  model = turning_back_path_model()
+  desired = -0.01
+  speed = 6.0
+  preview_distance = 10.0  # 7 m base + 6 m/s * 0.5 s
+
+  cmd = lateral_path_command(
+    model, desired, 0.0, speed, 0.0, True, False,
+    c2_last=0.0,
+  )
+
+  preview_offset, preview_heading = spatial_model_sample(model, preview_distance)
+  preview_c0_curvature = 2.0 * preview_offset / preview_distance ** 2
+  preview_c1_curvature = preview_heading / preview_distance
+  c2_share = (0.012 - abs(desired)) / (0.012 - 0.006)
+  c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
+
+  assert math.isclose(cmd.path_offset, 0.5 * preview_c0_curvature * 7.0 ** 2)
+  assert math.isclose(cmd.path_angle, (preview_c1_curvature + c1_deadzone) * 7.0)
+  assert abs(cmd.path_offset) < 2.0
+  assert abs(cmd.path_angle) < 0.25
 
 
 def test_spatial_preview_can_lead_a_stale_opposite_action_during_reversal():
