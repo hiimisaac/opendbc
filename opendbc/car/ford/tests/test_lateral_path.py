@@ -537,7 +537,7 @@ def test_weak_opposition_overrides_immediately_when_wheel_diverges():
   assert override_filter.update(True, -1.125, 80.0, 120.0, 115.0)
 
 
-def test_sunnypilot_messaging_namespace_is_preferred():
+def test_standard_messaging_namespace_is_preferred():
   sentinel = object()
   imports = []
 

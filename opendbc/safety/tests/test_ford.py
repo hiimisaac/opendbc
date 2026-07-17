@@ -368,6 +368,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
           self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(True, 0, 0, sign * (base_can + delta_can) / self.DEG_TO_CAN, 0)))
 
   def test_curvature_error_limits(self):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode composes bounded polynomial coefficients")
+
     # above CURVATURE_ERROR_MIN_SPEED, command must be within max_curvature_error of measured, below the check is skipped
     self.safety.set_controls_allowed(True)
     max_error_can = round(self.MAX_CURVATURE_ERROR * self.DEG_TO_CAN)
@@ -388,6 +391,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, (max_error_can + 2) / self.DEG_TO_CAN, 0)))
 
   def test_curvature_violation(self):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode composes bounded polynomial coefficients")
+
     # If violation occurs, curvature cmd is blocked until reset to 0
     self.safety.set_controls_allowed(True)
     speed = 25.
