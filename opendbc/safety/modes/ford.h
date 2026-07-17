@@ -261,12 +261,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     int desired_path_angle = raw_path_angle - FORD_INACTIVE_PATH_ANGLE;
     int desired_path_offset = raw_path_offset - FORD_INACTIVE_PATH_OFFSET;
     int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
+    speed_mismatch_check((float)vehicle_speed_2.values[0] / VEHICLE_SPEED_FACTOR);
     // CAN FD lightweight path steering uses mode 2 with bounded c0/c1/c2 and
     // the full signed c3 signal range for spatial curvature slope.
     violation |= (lat_ctl_mode != 0U) && !steer_control_enabled;
     violation |= safety_max_limit_check(desired_path_angle, FORD_MAX_PATH_ANGLE, FORD_MIN_PATH_ANGLE);
     violation |= safety_max_limit_check(desired_path_offset, FORD_MAX_PATH_OFFSET, FORD_MIN_PATH_OFFSET);
-    violation |= safety_max_limit_check(desired_curvature, FORD_STEERING_LIMITS.max_angle, -FORD_STEERING_LIMITS.max_angle);
+    violation |= safety_max_limit_check(desired_curvature, FORD_STEERING_LIMITS.max_curvature, -FORD_STEERING_LIMITS.max_curvature);
 
     if (!steer_control_enabled) {
       unsigned int raw_curvature_rate = (msg->data[6] << 3) | (msg->data[7] >> 5);
@@ -274,6 +275,11 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0) || (desired_curvature_rate != 0);
     }
     violation |= steer_control_enabled && !controls_allowed;
+    // Retain upstream's real-time message frequency guard without applying
+    // c2 curvature/jerk checks to the composed c0/c1/c2/c3 path command.
+    if (controls_allowed && steer_control_enabled) {
+      violation |= rt_curvature_rate_limit_check(FORD_STEERING_LIMITS);
+    }
 
     if (violation) {
       tx = false;

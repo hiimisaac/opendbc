@@ -18,7 +18,7 @@ from opendbc.car.vehicle_model import VehicleModel
 
 
 def _load_messaging(import_module=importlib.import_module):
-  """Load messaging from sunnypilot first, with upstream as a fallback."""
+  """Load messaging when opendbc is embedded in an openpilot checkout."""
   for module_name in ("cereal.messaging", "openpilot.cereal.messaging"):
     try:
       return import_module(module_name)
@@ -34,8 +34,6 @@ def lmc2_mode(lat_active: bool) -> int:
 def lmc2_precision(cooperative_control: bool) -> int:
   return 0 if cooperative_control else 1
 
-
-messaging = _load_messaging()
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -93,6 +91,7 @@ class CarController(CarControllerBase):
     self.model = None
     self.model_frame = 0
     self.sm = None
+    messaging = _load_messaging()
     if messaging is not None and CP.flags & FordFlags.CANFD:
       try:
         self.sm = messaging.SubMaster(["modelV2"])
