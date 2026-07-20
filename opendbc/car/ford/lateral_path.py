@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 import math
+
+from opendbc.car.ford.lateral_path_state import FORD_PATH_DT, projected_tracking_error
 
 
 # Ford CAN FD composed path controller.
@@ -93,11 +94,6 @@ FORD_PATH_C3_HORIZONS = (3.5, 5.0, 7.0)  # m
 # path can differ sharply from the arc the driver was holding. Keep this faster
 # than maneuver attack so control resumes promptly without a coefficient step.
 FORD_PATH_DRIVER_HANDOFF_CURVATURE_SLEW = 0.01  # 1/m per 20Hz frame
-FORD_PATH_DT = 0.05           # LateralMotionControl2 runs at 20Hz
-FORD_PATH_ANGLE_PROJECTION_HORIZON = 0.35  # s, measured wheel-motion lookahead
-FORD_PATH_OVERRIDE_PROJECTION_HORIZON = 0.1  # s, preserve responsive driver-intent detection
-FORD_PATH_DRIVER_OVERRIDE_IMMEDIATE_TORQUE = 2.0  # Nm, 2x Ford's normal steering-pressed threshold
-FORD_PATH_DRIVER_OVERRIDE_CONFIRM_FRAMES = 2      # 0.1 s at 20Hz, including the first weak sample
 
 
 @dataclass(frozen=True)
@@ -111,83 +107,6 @@ class LateralPathCommand:
   c2_latched: bool = False
   c2_recovery_frames: int = 0
   unwind_curvature: float = 0.0
-
-
-class SteeringAngleProjector:
-  """Project steering angle from a short, fixed-rate measurement window."""
-
-  def __init__(self, sample_dt: float = FORD_PATH_DT,
-               horizon: float = FORD_PATH_ANGLE_PROJECTION_HORIZON):
-    self.sample_dt = max(_finite(sample_dt), FORD_PATH_DT)
-    self.horizon = max(_finite(horizon), 0.0)
-    sample_count = max(round(self.horizon / self.sample_dt) + 1, 2)
-    self.samples: deque[float] = deque(maxlen=sample_count)
-
-  def update(self, actual_angle_deg: float) -> float:
-    fallback = self.samples[-1] if self.samples else 0.0
-    actual_angle_deg = _finite(actual_angle_deg, fallback)
-    self.samples.append(actual_angle_deg)
-    sample_time = (len(self.samples) - 1) * self.sample_dt
-    if sample_time <= 0.0:
-      return actual_angle_deg
-
-    steering_rate_deg_s = (self.samples[-1] - self.samples[0]) / sample_time
-    return actual_angle_deg + steering_rate_deg_s * self.horizon
-
-
-class DriverOverrideFilter:
-  """Reject isolated weak opposing-torque pulses while the wheel closes target.
-
-  Strong input and wheel motion away from the desired angle remain immediate.
-  A real weak opposing input is delayed by only one LMC2 frame, then remains
-  confirmed until the opposing signal releases.
-  """
-
-  def __init__(self, immediate_torque: float = FORD_PATH_DRIVER_OVERRIDE_IMMEDIATE_TORQUE,
-               confirm_frames: int = FORD_PATH_DRIVER_OVERRIDE_CONFIRM_FRAMES):
-    self.immediate_torque = max(_finite(immediate_torque), 0.0)
-    self.confirm_frames = max(int(confirm_frames), 1)
-    self.weak_opposition_frames = 0
-    self.confirmed = False
-    self.pending = False
-
-  def reset(self) -> None:
-    self.weak_opposition_frames = 0
-    self.confirmed = False
-    self.pending = False
-
-  def update(self, steering_pressed: bool, steering_torque: float,
-             steering_angle_error_deg: float, actual_angle_deg: float,
-             projected_angle_deg: float) -> bool:
-    steering_torque = _finite(steering_torque)
-    steering_angle_error_deg = _finite(steering_angle_error_deg)
-    actual_angle_deg = _finite(actual_angle_deg)
-    projected_angle_deg = _finite(projected_angle_deg, actual_angle_deg)
-
-    opposing = driver_steering_opposes_command(steering_pressed, steering_torque,
-                                                steering_angle_error_deg)
-    if not opposing:
-      self.reset()
-      return False
-
-    projected_motion_deg = projected_angle_deg - actual_angle_deg
-    projected_error_deg = steering_angle_error_deg - projected_motion_deg
-    wheel_closing_target = projected_motion_deg * steering_angle_error_deg > 0.0 and \
-                           abs(projected_error_deg) < abs(steering_angle_error_deg)
-
-    if abs(steering_torque) >= self.immediate_torque or not wheel_closing_target:
-      self.confirmed = True
-      self.pending = False
-      return True
-
-    if self.confirmed:
-      self.pending = False
-      return True
-
-    self.weak_opposition_frames += 1
-    self.confirmed = self.weak_opposition_frames >= self.confirm_frames
-    self.pending = not self.confirmed
-    return self.confirmed
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -220,37 +139,6 @@ def _limit_same_direction_attack(value: float, last: float, max_step: float) -> 
 
 def _limit_step(value: float, last: float, max_step: float) -> float:
   return _clip(value, last - max_step, last + max_step)
-
-
-def projected_tracking_error(target: float, current: float, projected: float) -> float:
-  """Discount tracking error only when measured motion is closing the target."""
-  error = _finite(target) - _finite(current)
-  projected_error = _finite(target) - _finite(projected)
-  projected_motion = _finite(projected) - _finite(current)
-  if error == 0.0 or projected_motion * error <= 0.0:
-    return error
-  if projected_error * error <= 0.0:
-    return 0.0
-  return projected_error if abs(projected_error) < abs(error) else error
-
-
-def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
-                                     steering_angle_error_deg: float) -> bool:
-  """Select cooperative path tracking when the driver opposes the request.
-
-  Compare two signals in steering-wheel coordinates. Ford curvature has the
-  opposite sign from steering angle, which made the old curvature comparison
-  classify a driver helping the requested wheel motion as an override. With no
-  requested wheel motion, any pressed input takes priority.
-  """
-  if not steering_pressed:
-    return False
-
-  steering_torque = _finite(steering_torque)
-  steering_angle_error_deg = _finite(steering_angle_error_deg)
-  if steering_angle_error_deg == 0.0:
-    return True
-  return steering_torque * steering_angle_error_deg < 0.0
 
 
 def _authority_floor(path_value: float, requested_value: float) -> float:
@@ -530,9 +418,21 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
     delivered_curvature = math.copysign(min(abs(delivered_curvature), abs(path_curvature)), path_curvature)
   else:
     delivered_curvature = 0.0
-  # When c2 is faded out of a maneuver, c1 must hold the arc as an absolute
-  # chase heading, or the polynomial reads "straight" mid-turn and unwinds early.
-  k_residual = delivered_curvature * c2_share
+  # Allocate the measured-curvature residual by the fraction of this model path
+  # assigned to c2. The action curvature can be much smaller than coherent model
+  # geometry; using its maneuver schedule alone would subtract the whole delivered
+  # arc from c0/c1, release the wheel, and leave no path authority to relatch it.
+  # Count both action and transmitted c2 authority so their normal wire slew does
+  # not cause c0/c1 to stack onto an otherwise matching model path.
+  c2_path_share = c2_share
+  c0_path_curvature = 2.0 * path_offset_raw / (d_c0 * d_c0)
+  coherent_model_path = model_path_valid and c0_path_curvature * path_curvature > 0.0
+  if coherent_model_path and path_curvature != 0.0:
+    c2_path_authority = abs(c2) if c2 * path_curvature > 0.0 else 0.0
+    if c2_share == 1.0 and desired_curvature * path_curvature > 0.0:
+      c2_path_authority = max(c2_path_authority, abs(desired_curvature))
+    c2_path_share = min(c2_path_authority / abs(path_curvature), 1.0)
+  k_residual = delivered_curvature * c2_path_share
 
   c1_error = c1_path_angle_raw / d_look - k_residual
   c1_deadzone = FORD_PATH_C1_DEADZONE + FORD_PATH_C1_CRUISE_DEADZONE * c2_share
@@ -572,7 +472,7 @@ def lateral_path_command(model, desired_curvature: float, k_meas: float, v_ego: 
   feedback_error = _clip(feedback_error, -FORD_PATH_C0_FEEDBACK_ERROR_LIMIT,
                          FORD_PATH_C0_FEEDBACK_ERROR_LIMIT)
   if steering_feedback_available and unwind_target == 0.0 and feedback_error * feedback_target_curvature > 0.0:
-    path_offset += 0.5 * feedback_error * (1.0 - c2_share) * d_c0 * d_c0
+    path_offset += 0.5 * feedback_error * (1.0 - c2_path_share) * d_c0 * d_c0
 
   path_angle = _clip(path_angle + unwind_curvature * d_look, *FORD_PATH_C1_CAN_CLIP)
   path_offset += 0.5 * unwind_curvature * d_c0 * d_c0
