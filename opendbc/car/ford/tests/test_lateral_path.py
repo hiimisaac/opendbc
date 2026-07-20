@@ -9,19 +9,22 @@ from opendbc.car.ford.carcontroller import (
 )
 from opendbc.car.ford.fordcan import lmc2_curvature_rate_for_can
 from opendbc.car.ford.lateral_path import (
-  DriverOverrideFilter,
   FORD_PATH_C0_FEEDBACK_ERROR_LIMIT,
   FORD_PATH_C1_CAN_CLIP,
   FORD_PATH_C1_CRUISE_DEADZONE,
   FORD_PATH_C1_DEADZONE,
-  FORD_PATH_DT,
   FORD_PATH_K_MEAS_TAU,
-  FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
-  SteeringAngleProjector,
-  driver_steering_opposes_command,
   lateral_path_command,
   model_curvature_rate,
   model_curvature_rate_consensus,
+)
+from opendbc.car.ford.lateral_path_controller import LateralPathController
+from opendbc.car.ford.lateral_path_state import (
+  DriverOverrideFilter,
+  FORD_PATH_DT,
+  FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
+  SteeringAngleProjector,
+  driver_steering_opposes_command,
   projected_tracking_error,
 )
 
@@ -164,6 +167,26 @@ def test_inactive_zeros_command():
   assert cmd.k_meas_filt == 0.002
 
 
+def test_lateral_path_controller_owns_command_history_and_pending_hold():
+  controller = LateralPathController()
+  common = dict(model=arc_model(0.009), desired_curvature=0.009,
+                k_meas=0.0, v_ego=7.0, lat_active=True,
+                driver_override=False)
+
+  first = controller.update(**common)
+  second = controller.update(**common)
+  held = controller.update(**common, hold_command=True)
+  resumed = controller.update(**common)
+
+  assert first.curvature == 0.0002
+  assert second.curvature == 0.0004
+  assert held.curvature == second.curvature
+  assert held.path_angle == second.path_angle
+  assert held.path_offset == second.path_offset
+  assert held.curvature_rate == second.curvature_rate
+  assert math.isclose(resumed.curvature, 0.0006)
+
+
 def test_steady_state_arc_idles_c0_c1():
   k = 0.003
   cmd = lateral_path_command(arc_model(k), k, k, 20.0, k, True, False)
@@ -171,6 +194,84 @@ def test_steady_state_arc_idles_c0_c1():
   assert math.isclose(cmd.curvature, k)
   assert math.isclose(cmd.path_angle, 0.0, abs_tol=1e-9)
   assert math.isclose(cmd.path_offset, 0.0, abs_tol=1e-9)
+
+
+def test_coherent_model_path_keeps_curvature_missing_from_c2():
+  # Logged failure: the visible path remained in the turn while the smaller
+  # action curvature made c0/c1 release and let the wheel unwind. C0/C1 must
+  # retain the coherent portion of the model path that c2 is not carrying.
+  for sign in (-1.0, 1.0):
+    desired = sign * 0.0034
+    model_curvature = sign * 0.01
+    cmd = lateral_path_command(arc_model(model_curvature), desired, model_curvature, 7.0,
+                               model_curvature, True, False, c2_last=desired)
+
+    commanded_curvature = cmd.curvature + cmd.path_angle / 7.0
+    expected_curvature = abs(model_curvature) - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE
+    assert math.isclose(abs(commanded_curvature), expected_curvature)
+
+
+def test_coherent_model_path_reasserts_as_wheel_unwinds():
+  desired = 0.0034
+  model_curvature = 0.01
+  holding = lateral_path_command(
+    arc_model(model_curvature), desired, model_curvature, 7.0,
+    model_curvature, True, False, c2_last=desired,
+    wheel_curvature=model_curvature,
+    projected_wheel_curvature=model_curvature,
+  )
+  unwinding = lateral_path_command(
+    arc_model(model_curvature), desired, 0.006, 7.0,
+    0.006, True, False, c2_last=desired,
+    wheel_curvature=0.006,
+    projected_wheel_curvature=0.006,
+  )
+
+  commanded_curvature = unwinding.curvature + unwinding.path_angle / 7.0
+  assert commanded_curvature >= model_curvature - FORD_PATH_C1_DEADZONE - FORD_PATH_C1_CRUISE_DEADZONE
+  assert unwinding.path_angle > holding.path_angle
+  assert unwinding.path_offset > holding.path_offset
+
+
+def test_incoherent_model_geometry_keeps_legacy_c2_allocation():
+  curvature = 0.01
+  xs = (0.0, 7.0, 20.0)
+  model = SimpleNamespace(
+    position=SimpleNamespace(x=list(xs), y=[-0.5 * curvature * x * x for x in xs]),
+    orientation=SimpleNamespace(z=[curvature * x for x in xs]),
+  )
+
+  cmd = lateral_path_command(model, 0.0034, curvature, 7.0, curvature, True, False,
+                             c2_last=0.0034)
+
+  assert math.isclose(cmd.path_angle, 0.0, abs_tol=1e-9)
+
+
+def test_matching_model_and_action_do_not_stack_c0_c1_while_c2_slews():
+  # C2's wire ramp is not missing model authority. When action, model, and
+  # measured curvature agree, preserve the established steady-state allocation
+  # through engage, release, and reversal instead of stacking c0/c1 onto c2.
+  sequence = ((0.003, 4), (0.0, 2), (-0.003, 4))
+  c2_last = 0.0
+  path_angle_last = 0.0
+  path_offset_last = 0.0
+
+  for curvature, frames in sequence:
+    for _ in range(frames):
+      cmd = lateral_path_command(
+        arc_model(curvature), curvature, curvature, 15.0, curvature, True, False,
+        c2_last=c2_last,
+        path_angle_last=path_angle_last,
+        path_offset_last=path_offset_last,
+        wheel_curvature=curvature,
+        projected_wheel_curvature=curvature,
+      )
+
+      assert math.isclose(cmd.path_angle, 0.0, abs_tol=1e-9)
+      assert math.isclose(cmd.path_offset, 0.0, abs_tol=1e-9)
+      c2_last = cmd.curvature
+      path_angle_last = cmd.path_angle
+      path_offset_last = cmd.path_offset
 
 
 def test_transient_residual_covers_undelivered_curvature():
