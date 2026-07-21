@@ -5,8 +5,10 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG
-from opendbc.car.ford.lateral_path_controller import LateralPathController
+from opendbc.car.ford.lateral_path_controller import (
+  FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG,
+  LateralPathController,
+)
 from opendbc.car.ford.lateral_path_state import (
   DriverOverrideFilter,
   FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
@@ -33,6 +35,12 @@ def lmc2_mode(lat_active: bool) -> int:
 
 def lmc2_precision(cooperative_control: bool) -> int:
   return 0 if cooperative_control else 1
+
+
+def hold_lateral_command(steering_pressed: bool, driver_override: bool,
+                         pending: bool) -> bool:
+  """Freeze polynomial growth while driver intent is unresolved or helping."""
+  return pending or (steering_pressed and not driver_override)
 
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -163,8 +171,13 @@ class CarController(CarControllerBase):
           CC.latActive and CS.out.steeringPressed, CS.out.steeringTorque,
           angle_error_deg_raw, actual_angle_deg, override_projected_angle_deg,
         )
+        hold_command = hold_lateral_command(
+          CC.latActive and CS.out.steeringPressed,
+          driver_override,
+          self.driver_override_filter.pending,
+        )
         cooperative_control = (driver_override or self.lateral_path_controller.handoff_active or
-                               self.driver_override_filter.pending)
+                               hold_command)
         wheel_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
         path_curvature = current_curvature
         if driver_override:
@@ -184,7 +197,7 @@ class CarController(CarControllerBase):
           angle_error_curvature=angle_error_curvature,
           wheel_curvature=wheel_curvature,
           projected_wheel_curvature=projected_wheel_curvature,
-          hold_command=self.driver_override_filter.pending,
+          hold_command=hold_command,
         )
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
