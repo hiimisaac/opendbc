@@ -16,9 +16,9 @@ PATH_C3_HORIZONS = (3.5, 5.0, 7.0)
 PATH_C2_FADE_BP = (0.006, 0.012)
 PATH_C2_SETTLED_BP = (0.003, 0.006)
 PATH_C2_SLEW = 0.0002
-PATH_PREVIEW_ERROR_BP = (0.0005, 0.003)
-PATH_PREVIEW_ACTION_BP = (0.003, 0.006)
-PATH_PREVIEW_COHERENCE_BP = (0.2, 0.6)
+PATH_MODEL_MANEUVER_MIN = 0.003
+PATH_TRACKING_ERROR_DEADZONE = 0.0005
+PATH_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
@@ -125,30 +125,36 @@ def _curvature_rate(path: tuple[list[float], list[float], list[float]]) -> float
   return sorted(rates)[1] * abs(sum(rates)) / magnitude
 
 
-def _preview_target(path_curvature: float, desired_curvature: float,
-                    tracking_error: float, wheel_beyond_target: bool) -> float:
-  """Return path preview bounded by action support and measured tracking."""
-  preview_excess = path_curvature - desired_curvature
-  action_share = 0.0 if wheel_beyond_target else \
-    _interp(abs(desired_curvature), *PATH_PREVIEW_ACTION_BP, 0.0, 1.0)
-  coherence = 0.0
-  if not wheel_beyond_target and \
-      path_curvature * desired_curvature > 0.0 and path_curvature != 0.0:
-    coherence = min(abs(desired_curvature / path_curvature), 1.0)
-  coherence_share = _interp(coherence, *PATH_PREVIEW_COHERENCE_BP, 0.0, 1.0)
-  preview_share = max(action_share, coherence_share)
-  if preview_excess * tracking_error > 0.0:
-    error_share = _interp(abs(tracking_error), *PATH_PREVIEW_ERROR_BP, 0.0, 1.0)
-    preview_share = max(preview_share, error_share)
-  return desired_curvature + preview_share * preview_excess
+def _stronger_same_direction(first: float, second: float) -> float:
+  if first * second > 0.0:
+    return first if abs(first) >= abs(second) else second
+  return first
+
+
+def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
+  """True only when the target asks to leave the wheel's delivered arc."""
+  return target * measured_curvature <= 0.0 or \
+         abs(target) + PATH_UNWIND_ERROR_DEADZONE < abs(measured_curvature)
+
+
+def _undertracking_correction(target: float, measured_curvature: float) -> float:
+  """Bounded model-relative correction that can only add missing authority."""
+  tracking_error = target - measured_curvature
+  if tracking_error * target <= 0.0:
+    return 0.0
+  return _clip(
+    _deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE),
+    (-PATH_TRACKING_ERROR_LIMIT, PATH_TRACKING_ERROR_LIMIT),
+  )
 
 
 class LatControlPath:
   """Map action, path preview, and measured wheel curvature to one polynomial.
 
   The previous command is the only persistent controller state. The action head
-  owns the current target; path geometry can add authority while it closes the
-  measured tracking error or the action still supports the upcoming maneuver.
+  carries gentle curvature. Coherent maneuver geometry owns C0/C1 until both
+  the model and action have moved inside the wheel's delivered arc. A bounded
+  model-relative correction adds only authority the wheel has not delivered.
   """
 
   def __init__(self):
@@ -186,36 +192,58 @@ class LatControlPath:
       self._last_command = command
       return command
 
-    tracking_error = desired_curvature - measured_curvature
-    wheel_beyond_target = tracking_error * measured_curvature < 0.0
     offset_curvature = 2.0 * path_offset / PATH_C0_DISTANCE ** 2 if valid else 0.0
     angle_curvature = path_angle / lookahead if valid else 0.0
-
-    if valid:
-      offset_target = _preview_target(
-        offset_curvature, desired_curvature, tracking_error, wheel_beyond_target,
-      )
-      angle_target = _preview_target(
-        angle_curvature, desired_curvature, tracking_error, wheel_beyond_target,
-      )
+    coherent_model_maneuver = valid and offset_curvature * angle_curvature > 0.0 and \
+                              min(abs(offset_curvature), abs(angle_curvature)) >= PATH_MODEL_MANEUVER_MIN
+    if coherent_model_maneuver:
+      # Offset and heading are two views of the same near-field arc. Use their
+      # weaker coherent curvature as the target so a finite 90-degree path does
+      # not get counted twice as independent C0 and C1 tracking error.
+      model_target = math.copysign(min(abs(offset_curvature), abs(angle_curvature)), offset_curvature)
+      angle_target = _stronger_same_direction(model_target, desired_curvature)
+      action_reversal = abs(desired_curvature) >= PATH_MODEL_MANEUVER_MIN and \
+                        model_target * desired_curvature < 0.0
+      wheel_reversal = abs(measured_curvature) >= PATH_MODEL_MANEUVER_MIN and \
+                       model_target * measured_curvature < 0.0
+      if action_reversal or wheel_reversal:
+        offset_target = model_target
+      else:
+        c0_model_share = _interp(abs(desired_curvature), 0.003, 0.006, 0.0, 1.0)
+        offset_target = desired_curvature + c0_model_share * (model_target - desired_curvature)
+    elif valid:
+      model_target = desired_curvature
+      offset_target = desired_curvature
+      angle_target = desired_curvature
     else:
+      model_target = 0.0
       offset_target = 0.0
       angle_target = 0.0
 
+    wheel_beyond_action = _target_is_behind_wheel(desired_curvature, measured_curvature)
+    wheel_beyond_model = not coherent_model_maneuver or _target_is_behind_wheel(model_target, measured_curvature)
+    wheel_beyond_target = wheel_beyond_action and wheel_beyond_model
+
     # Once the wheel is beyond the action target, actively remove the old turn.
-    # This correction cannot relatch stale preview because it is applied only in
-    # the direction opposite measured wheel curvature.
-    unwind = 0.0
+    # Model geometry must independently agree that the delivered arc is stale;
+    # a falling action alone cannot release a turn the model still requires.
     if wheel_beyond_target:
-      unwind = _clip(
-        _deadzone(tracking_error, PATH_UNWIND_ERROR_DEADZONE),
+      offset_target += _clip(
+        _deadzone(offset_target - measured_curvature, PATH_UNWIND_ERROR_DEADZONE),
         (-PATH_UNWIND_LIMIT, PATH_UNWIND_LIMIT),
       )
-      offset_target += unwind
-      angle_target += unwind
+      angle_target += _clip(
+        _deadzone(angle_target - measured_curvature, PATH_UNWIND_ERROR_DEADZONE),
+        (-PATH_UNWIND_LIMIT, PATH_UNWIND_LIMIT),
+      )
+    else:
+      model_tracking_correction = _undertracking_correction(model_target, measured_curvature)
+      offset_target += model_tracking_correction
+      angle_target += model_tracking_correction
 
     c2_action_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 1.0, 0.0)
-    unresolved = max(abs(desired_curvature), abs(measured_curvature), abs(tracking_error))
+    action_tracking_error = desired_curvature - measured_curvature
+    unresolved = max(abs(desired_curvature), abs(measured_curvature), abs(action_tracking_error))
     c2_settled_share = _interp(unresolved, *PATH_C2_SETTLED_BP, 1.0, 0.0)
     c2_share = min(c2_action_share, c2_settled_share)
     allocated_c2 = _clip(desired_curvature * c2_share, PATH_C2_LIMITS)
@@ -223,7 +251,7 @@ class LatControlPath:
     curvature = _limit_attack(curvature, self._last_command.curvature, PATH_C2_SLEW)
 
     maneuver_demand = max(abs(desired_curvature), abs(offset_curvature), abs(angle_curvature))
-    c0_share = _interp(maneuver_demand, 0.003, 0.006, 0.0, 1.0)
+    c0_share = 1.0 if wheel_beyond_target else _interp(maneuver_demand, 0.003, 0.006, 0.0, 1.0)
     if valid:
       path_offset_command = _clip(
         0.5 * (offset_target - allocated_c2) * PATH_C0_DISTANCE ** 2 * c0_share,

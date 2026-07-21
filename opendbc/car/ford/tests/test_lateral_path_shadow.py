@@ -37,18 +37,53 @@ def test_model_geometry_retains_path_authority_missing_from_action():
     driver_override=False,
   )
 
-  assert command.path_offset > 0.15
+  assert command.path_offset > 0.1
   assert command.path_angle > 0.05
   assert math.isclose(first.curvature, 0.0002)
+
+
+def test_falling_action_does_not_unwind_while_model_still_requires_turn():
+  controller = LatControlPath()
+
+  for _ in range(10):
+    controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+  command = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+
+  assert command.path_offset >= 0.0
+  assert command.path_angle > 0.0
+
+
+def test_model_relative_undertracking_adds_bounded_path_correction():
+  controller = LatControlPath()
+
+  command = None
+  for _ in range(20):
+    command = controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+
+  assert command is not None
+  assert command.path_offset > 0.5 * 0.015 * 7.0 ** 2
+  assert command.path_angle > 0.015 * 7.0
+
+
+def test_tiny_action_sign_noise_cannot_promote_model_to_full_c0_reversal():
+  controller = LatControlPath()
+
+  command = None
+  for _ in range(20):
+    command = controller.update(polynomial_model(0.09), -0.0001, 0.05, 7.0, True, False)
+
+  assert command is not None
+  assert 0.0 < command.path_offset <= 0.5 * 0.012 * 7.0 ** 2
+  assert command.path_angle > 0.0
 
 
 def test_action_unwind_releases_stale_preview_without_relatching():
   controller = LatControlPath()
 
   attack = controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
-  release = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
-  unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
-  continued_unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  release = controller.update(polynomial_model(0.001), 0.0, 0.015, 7.0, True, False)
+  unwind = controller.update(polynomial_model(0.001), 0.0, 0.015, 7.0, True, False)
+  continued_unwind = controller.update(polynomial_model(0.001), 0.0, 0.015, 7.0, True, False)
 
   assert attack.path_offset > 0.0
   assert attack.path_angle > 0.0
@@ -63,7 +98,7 @@ def test_action_unwind_releases_stale_preview_without_relatching():
 def test_small_same_direction_action_cannot_preserve_preview_while_unwinding():
   controller = LatControlPath()
 
-  command = controller.update(polynomial_model(0.015), 0.00275, 0.015, 7.0, True, False)
+  command = controller.update(polynomial_model(0.001), 0.00275, 0.015, 7.0, True, False)
 
   assert command.path_offset <= 0.0
   assert command.path_angle <= 0.0
@@ -72,7 +107,7 @@ def test_small_same_direction_action_cannot_preserve_preview_while_unwinding():
 def test_unwind_has_no_relatch_discontinuity_above_straightening_threshold():
   controller = LatControlPath()
 
-  command = controller.update(polynomial_model(0.015), 0.0031, 0.015, 7.0, True, False)
+  command = controller.update(polynomial_model(0.001), 0.0031, 0.015, 7.0, True, False)
 
   assert command.path_offset <= 0.0
   assert command.path_angle <= 0.0
@@ -82,8 +117,8 @@ def test_action_bounce_cannot_relatch_after_unwind_begins():
   controller = LatControlPath()
 
   controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
-  unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
-  bounced_action = controller.update(polynomial_model(0.015), 0.0045, 0.015, 7.0, True, False)
+  unwind = controller.update(polynomial_model(0.001), 0.0, 0.015, 7.0, True, False)
+  bounced_action = controller.update(polynomial_model(0.001), 0.0045, 0.015, 7.0, True, False)
 
   assert unwind.path_offset < 0.0
   assert unwind.path_angle < 0.0
@@ -95,7 +130,7 @@ def test_action_drop_starts_unwind_without_a_straight_intermediate_frame():
   controller = LatControlPath()
 
   controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
-  direct_unwind = controller.update(polynomial_model(0.015), 0.0045, 0.015, 7.0, True, False)
+  direct_unwind = controller.update(polynomial_model(0.001), 0.0045, 0.015, 7.0, True, False)
 
   assert direct_unwind.path_offset < 0.0
   assert direct_unwind.path_angle < 0.0
@@ -105,14 +140,14 @@ def test_unwind_releases_when_action_genuinely_moves_beyond_the_wheel():
   controller = LatControlPath()
 
   controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
-  controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  controller.update(polynomial_model(0.001), 0.0, 0.015, 7.0, True, False)
   renewed_turn = controller.update(polynomial_model(0.020), 0.020, 0.015, 7.0, True, False)
 
   assert renewed_turn.path_offset > 0.0
   assert renewed_turn.path_angle > 0.0
 
 
-def test_preview_authority_fades_to_the_action_supported_floor():
+def test_model_relative_correction_fades_as_wheel_reaches_path():
   def angle_equivalent(measured_curvature: float) -> float:
     controller = LatControlPath()
     command = None
@@ -122,11 +157,11 @@ def test_preview_authority_fades_to_the_action_supported_floor():
     return command.curvature + command.path_angle / 7.0
 
   far_from_target = angle_equivalent(0.0)
-  near_target = angle_equivalent(0.0035)
-  at_target = angle_equivalent(0.0045)
+  near_target = angle_equivalent(0.010)
+  at_target = angle_equivalent(0.015)
 
   assert far_from_target > near_target
-  assert math.isclose(near_target, at_target)
+  assert near_target > at_target
   assert at_target > 0.0045
 
 
