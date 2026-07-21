@@ -17,6 +17,19 @@ def polynomial_model(curvature: float, curvature_rate: float = 0.0):
   )
 
 
+def split_geometry_model(offset_curvature: float, angle_curvature: float):
+  distances = (0.0, 1.75, 2.5, 3.5, 5.0, 7.0, 12.0, 20.0)
+  return SimpleNamespace(
+    position=SimpleNamespace(
+      x=list(distances),
+      y=[0.5 * offset_curvature * s ** 2 for s in distances],
+    ),
+    orientation=SimpleNamespace(
+      z=[angle_curvature * s for s in distances],
+    ),
+  )
+
+
 def test_model_geometry_retains_path_authority_missing_from_action():
   controller = LatControlPath()
 
@@ -63,6 +76,86 @@ def test_model_relative_undertracking_adds_bounded_path_correction():
   assert command is not None
   assert command.path_offset > 0.5 * 0.015 * 7.0 ** 2
   assert command.path_angle > 0.015 * 7.0
+
+
+def test_c0_and_c1_preserve_independent_model_geometry():
+  stronger_c0_controller = LatControlPath()
+  matched_geometry_controller = LatControlPath()
+
+  for _ in range(20):
+    stronger_c0 = stronger_c0_controller.update(
+      split_geometry_model(0.03, 0.015), 0.012, 0.0, 7.0, True, False,
+    )
+    matched_geometry = matched_geometry_controller.update(
+      split_geometry_model(0.015, 0.015), 0.012, 0.0, 7.0, True, False,
+    )
+
+  assert stronger_c0.path_offset > matched_geometry.path_offset
+  assert abs(stronger_c0.path_angle - matched_geometry.path_angle) < 0.001
+
+
+def test_desired_angle_conflict_continuously_unwinds_stale_preview():
+  controller = LatControlPath()
+
+  controller.update(
+    polynomial_model(-0.004), -0.0009, -0.013, 3.0, True, False,
+    projected_measured_curvature=-0.013,
+    desired_angle_curvature=0.0002,
+  )
+  command = controller.update(
+    polynomial_model(-0.08), 0.0001, -0.027, 3.0, True, False,
+    projected_measured_curvature=-0.027,
+    desired_angle_curvature=0.0002,
+  )
+
+  assert command.path_offset > 0.0
+  assert command.path_angle > 0.0
+  assert controller.preview_conflict_share > 0.0
+
+
+def test_low_speed_preview_is_not_mistaken_for_stale_release():
+  baseline_controller = LatControlPath()
+  angle_feedback_controller = LatControlPath()
+
+  for controller in (baseline_controller, angle_feedback_controller):
+    controller.update(
+      polynomial_model(0.004), 0.0001, 0.055, 1.5, True, False,
+      projected_measured_curvature=0.055,
+      desired_angle_curvature=0.0 if controller is angle_feedback_controller else None,
+    )
+
+  baseline = baseline_controller.update(
+    polynomial_model(0.08), 0.0001, 0.055, 1.5, True, False,
+    projected_measured_curvature=0.055,
+  )
+  angle_feedback = angle_feedback_controller.update(
+    polynomial_model(0.08), 0.0001, 0.055, 1.5, True, False,
+    projected_measured_curvature=0.055,
+    desired_angle_curvature=0.0,
+  )
+
+  assert angle_feedback == baseline
+  assert angle_feedback_controller.preview_conflict_share == 0.0
+
+
+def test_small_desired_angle_error_does_not_weaken_model_preview():
+  baseline_controller = LatControlPath()
+  angle_feedback_controller = LatControlPath()
+
+  for _ in range(20):
+    baseline = baseline_controller.update(
+      polynomial_model(0.08), 0.06, 0.065, 5.0, True, False,
+      projected_measured_curvature=0.065,
+      desired_angle_curvature=0.065,
+    )
+    angle_feedback = angle_feedback_controller.update(
+      polynomial_model(0.08), 0.06, 0.065, 5.0, True, False,
+      projected_measured_curvature=0.065,
+      desired_angle_curvature=0.063,
+    )
+
+  assert math.isclose(angle_feedback.path_offset, baseline.path_offset)
+  assert math.isclose(angle_feedback.path_angle, baseline.path_angle)
 
 
 def test_projected_wheel_motion_reduces_only_added_c0_tracking_correction():
