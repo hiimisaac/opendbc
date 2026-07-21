@@ -7,6 +7,7 @@ import opendbc.safety.tests.common as common
 from opendbc.car.lateral import MAX_LATERAL_ACCEL, MAX_LATERAL_JERK
 from opendbc.car.ford.values import FordSafetyFlags
 from opendbc.car.structs import CarParams
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import CANPackerSafety
 
@@ -573,6 +574,174 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD)
     self.safety.init_tests()
+
+
+class TestFordCANFDMadsSafety(common.SafetyTestBase):
+  def setUp(self):
+    self.packer = CANPackerSafety("ford_lincoln_base_pt")
+    self.safety = libsafety_py.libsafety
+    self._configure_safety(FordSafetyFlags.CANFD | FordSafetyFlags.LONG_CONTROL)
+
+  def _configure_safety(self, flags: int):
+    self.flags = flags
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, flags)
+    self.safety.init_tests()
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, flags)
+    self.safety.set_heartbeat_engaged(True)
+    self.cnt_speed = 0
+    self.cnt_speed_2 = 0
+    self.cnt_yaw = 0
+
+  def _main_status_msg(self, state: int, brake: bool = False):
+    return self.packer.make_can_msg_safety("EngBrakeData", 0, {
+      "BpedDrvAppl_D_Actl": 2 if brake else 1,
+      "CcStat_D_Actl": state,
+    })
+
+  def _prime_rx_checks(self, cruise_state: int):
+    messages = (
+      self.packer.make_can_msg_safety("BrakeSysFeatures", 0, {
+        "Veh_V_ActlBrk": 0,
+        "VehVActlBrk_D_Qf": 3,
+        "VehVActlBrk_No_Cnt": self.cnt_speed,
+      }, fix_checksum=checksum),
+      self.packer.make_can_msg_safety("EngVehicleSpThrottle2", 0, {
+        "Veh_V_ActlEng": 0,
+        "VehVActlEng_D_Qf": 3,
+        "VehVActlEng_No_Cnt": self.cnt_speed_2,
+      }, fix_checksum=checksum),
+      self.packer.make_can_msg_safety("Yaw_Data_FD1", 0, {
+        "VehYaw_W_Actl": 0,
+        "VehYawWActl_D_Qf": 3,
+        "VehRollYaw_No_Cnt": self.cnt_yaw,
+      }, fix_checksum=checksum),
+      self._main_status_msg(cruise_state),
+      self.packer.make_can_msg_safety("EngVehicleSpThrottle", 0, {"ApedPos_Pc_ActlArb": 0}),
+      self.packer.make_can_msg_safety("DesiredTorqBrk", 0, {"VehStop_D_Stat": 1}),
+    )
+    for msg in messages:
+      self._rx(msg)
+    self.safety.safety_tick_current_safety_config()
+    self._rx(self._main_status_msg(cruise_state))
+
+  def _lat_ctl_msg(self, enabled: bool):
+    if self.flags & FordSafetyFlags.CANFD:
+      return self.packer.make_can_msg_safety("LateralMotionControl2", 0, {
+        "LatCtl_D2_Rq": 2 if enabled else 0,
+        "LatCtlPathOffst_L_Actl": 0,
+        "LatCtlPath_An_Actl": 0,
+        "LatCtlCrv_NoRate2_Actl": 0,
+        "LatCtlCurv_No_Actl": 0,
+      })
+    return self.packer.make_can_msg_safety("LateralMotionControl", 0, {
+      "LatCtl_D_Rq": 1 if enabled else 0,
+      "LatCtlPathOffst_L_Actl": 0,
+      "LatCtlPath_An_Actl": 0,
+      "LatCtlCurv_NoRate_Actl": 0,
+      "LatCtlCurv_No_Actl": 0,
+    })
+
+  def _acc_command_msg(self, gas: float):
+    return self.packer.make_can_msg_safety("ACCDATA", 0, {
+      "AccPrpl_A_Rq": gas,
+      "AccPrpl_A_Pred": gas,
+      "AccBrkTot_A_Rq": 0,
+      "AccBrkPrchg_B_Rq": 0,
+      "AccBrkDecel_B_Rq": 0,
+      "CmbbDeny_B_Actl": 0,
+    })
+
+  def test_main_available_authorizes_lateral_without_longitudinal(self):
+    self._prime_rx_checks(3)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_lateral_only_allows_steering_but_blocks_longitudinal(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_acc_engaged_authorizes_lateral_and_longitudinal(self):
+    self._prime_rx_checks(5)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertTrue(self._tx(self._acc_command_msg(0.1)))
+
+  def test_main_off_revokes_both_authorizations(self):
+    self._prime_rx_checks(5)
+    self._rx(self._main_status_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_cold_start_requires_complete_rx_checks(self):
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_stale_safety_rx_revokes_and_cannot_reauthorize_lateral(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self.safety.set_timer(2_000_000)
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_disengaged_heartbeat_blocks_lateral_authorization(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self.safety.set_heartbeat_engaged(False)
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_brake_disengages_longitudinal_but_keeps_lateral_with_main_on(self):
+    self._prime_rx_checks(5)
+    self._rx(self._main_status_msg(3, brake=True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_invalid_safety_rx_revokes_lateral(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    invalid_speed = self.packer.make_can_msg_safety("BrakeSysFeatures", 0, {
+      "Veh_V_ActlBrk": 0,
+      "VehVActlBrk_D_Qf": 0,
+      "VehVActlBrk_No_Cnt": 1,
+    }, fix_checksum=checksum)
+    self.assertFalse(self._rx(invalid_speed))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_fault_and_unavailable_cruise_states_do_not_authorize_lateral(self):
+    self._prime_rx_checks(3)
+    for cruise_state in (0, 1, 2, 6, 7):
+      self._rx(self._main_status_msg(cruise_state))
+      self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_alternative_experience_is_required(self):
+    self._prime_rx_checks(3)
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.DEFAULT)
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_lateral_only_authorization_supports_all_ford_safety_configs(self):
+    for flags in (0, FordSafetyFlags.CANFD, FordSafetyFlags.CANFD | FordSafetyFlags.LONG_CONTROL):
+      with self.subTest(flags=flags):
+        self._configure_safety(flags)
+        self._prime_rx_checks(3)
+        self.assertTrue(self.safety.get_controls_allowed_lateral())
+        self.assertTrue(self._tx(self._lat_ctl_msg(True)))
 
 
 if __name__ == "__main__":

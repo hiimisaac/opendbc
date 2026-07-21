@@ -149,6 +149,14 @@ static void ford_rx_hook(const CANPacket_t *msg) {
       unsigned int cruise_state = msg->data[1] & 0x07U;
       bool cruise_engaged = (cruise_state == 4U) || (cruise_state == 5U);
       pcm_cruise_check(cruise_engaged);
+
+      // CcStat 3 means the physical cruise main switch is on while ACC is
+      // inactive. MADS uses that state as an independent, fail-closed source
+      // of lateral authorization; normal controls_allowed remains tied to
+      // states 4/5 and therefore continues to gate longitudinal actuation.
+      const bool mads_requested = ((alternative_experience & ALT_EXP_ENABLE_MADS) != 0) &&
+                                  ((cruise_state == 3U) || cruise_engaged);
+      controls_allowed_lateral = mads_requested && heartbeat_engaged && !safety_rx_checks_invalid;
     }
   }
 }
@@ -274,10 +282,11 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
       int desired_curvature_rate = raw_curvature_rate - FORD_CANFD_INACTIVE_CURVATURE_RATE;
       violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0) || (desired_curvature_rate != 0);
     }
-    violation |= steer_control_enabled && !controls_allowed;
+    const bool lateral_allowed = controls_allowed || controls_allowed_lateral;
+    violation |= steer_control_enabled && !lateral_allowed;
     // Retain upstream's real-time message frequency guard without applying
     // c2 curvature/jerk checks to the composed c0/c1/c2/c3 path command.
-    if (controls_allowed && steer_control_enabled) {
+    if (lateral_allowed && steer_control_enabled) {
       violation |= rt_curvature_rate_limit_check(FORD_STEERING_LIMITS);
     }
 
