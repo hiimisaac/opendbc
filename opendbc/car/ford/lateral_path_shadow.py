@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import math
 
+from opendbc.car.ford.lateral_path_state import projected_tracking_error
+
 
 PATH_C0_LIMITS = (-4.61, 4.60)
 PATH_C1_LIMITS = (-0.475, 0.497)
@@ -18,7 +20,8 @@ PATH_C2_SETTLED_BP = (0.003, 0.006)
 PATH_C2_SLEW = 0.0002
 PATH_MODEL_MANEUVER_MIN = 0.003
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
-PATH_TRACKING_ERROR_LIMIT = 0.012
+PATH_C0_TRACKING_ERROR_LIMIT = 0.02
+PATH_C1_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
@@ -137,15 +140,28 @@ def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
          abs(target) + PATH_UNWIND_ERROR_DEADZONE < abs(measured_curvature)
 
 
-def _undertracking_correction(target: float, measured_curvature: float) -> float:
-  """Bounded model-relative correction that can only add missing authority."""
-  tracking_error = target - measured_curvature
+def _undertracking_correction(target: float, measured_curvature: float,
+                              projected_curvature: float, limit: float) -> float:
+  """Bounded correction after discounting wheel motion already closing target."""
+  tracking_error = projected_tracking_error(target, measured_curvature, projected_curvature)
   if tracking_error * target <= 0.0:
     return 0.0
   return _clip(
     _deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE),
-    (-PATH_TRACKING_ERROR_LIMIT, PATH_TRACKING_ERROR_LIMIT),
+    (-limit, limit),
   )
+
+
+def _projected_c0_correction(target: float, measured_curvature: float,
+                             projected_curvature: float, limit: float) -> float:
+  """Preserve the proven feedback floor and project only added C0 authority."""
+  base_correction = _undertracking_correction(
+    target, measured_curvature, measured_curvature, PATH_C1_TRACKING_ERROR_LIMIT,
+  )
+  projected_correction = _undertracking_correction(
+    target, measured_curvature, projected_curvature, limit,
+  )
+  return _stronger_same_direction(base_correction, projected_correction)
 
 
 class LatControlPath:
@@ -161,9 +177,13 @@ class LatControlPath:
     self._last_command = LateralPathCommand()
 
   def update(self, model, desired_curvature: float, measured_curvature: float, v_ego: float,
-             active: bool, driver_override: bool) -> LateralPathCommand:
+             active: bool, driver_override: bool,
+             projected_measured_curvature: float | None = None) -> LateralPathCommand:
     desired_curvature = _finite(desired_curvature)
     measured_curvature = _finite(measured_curvature)
+    if projected_measured_curvature is None:
+      projected_measured_curvature = measured_curvature
+    projected_measured_curvature = _finite(projected_measured_curvature)
     v_ego = max(_finite(v_ego), 0.0)
 
     if not active:
@@ -194,6 +214,7 @@ class LatControlPath:
 
     offset_curvature = 2.0 * path_offset / PATH_C0_DISTANCE ** 2 if valid else 0.0
     angle_curvature = path_angle / lookahead if valid else 0.0
+    model_action_disagreement = False
     coherent_model_maneuver = valid and offset_curvature * angle_curvature > 0.0 and \
                               min(abs(offset_curvature), abs(angle_curvature)) >= PATH_MODEL_MANEUVER_MIN
     if coherent_model_maneuver:
@@ -206,6 +227,10 @@ class LatControlPath:
                         model_target * desired_curvature < 0.0
       wheel_reversal = abs(measured_curvature) >= PATH_MODEL_MANEUVER_MIN and \
                        model_target * measured_curvature < 0.0
+      # Even sub-threshold action sign noise is enough to keep C0 on the
+      # conservative correction bound. It must not promote the model preview
+      # to the larger same-direction tracking correction.
+      model_action_disagreement = model_target * desired_curvature < 0.0 or wheel_reversal
       if action_reversal or wheel_reversal:
         offset_target = model_target
       else:
@@ -237,9 +262,18 @@ class LatControlPath:
         (-PATH_UNWIND_LIMIT, PATH_UNWIND_LIMIT),
       )
     else:
-      model_tracking_correction = _undertracking_correction(model_target, measured_curvature)
-      offset_target += model_tracking_correction
-      angle_target += model_tracking_correction
+      # C0 is the fast placement servo. Project only its authority above the
+      # established C1-sized feedback floor, so measured motion can prevent an
+      # extra placement shove without weakening the heading command. This is
+      # the same separation used by the live controller's projected feedback.
+      offset_target += _projected_c0_correction(
+        model_target, measured_curvature, projected_measured_curvature,
+        PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT,
+      )
+      angle_target += _undertracking_correction(
+        model_target, measured_curvature, measured_curvature,
+        PATH_C1_TRACKING_ERROR_LIMIT,
+      )
 
     c2_action_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 1.0, 0.0)
     action_tracking_error = desired_curvature - measured_curvature

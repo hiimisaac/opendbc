@@ -65,6 +65,42 @@ def test_model_relative_undertracking_adds_bounded_path_correction():
   assert command.path_angle > 0.015 * 7.0
 
 
+def test_projected_wheel_motion_reduces_only_added_c0_tracking_correction():
+  lagging_controller = LatControlPath()
+  closing_controller = LatControlPath()
+
+  for _ in range(10):
+    lagging = lagging_controller.update(
+      polynomial_model(0.015), 0.012, 0.002, 7.0, True, False,
+      projected_measured_curvature=0.002,
+    )
+    closing = closing_controller.update(
+      polynomial_model(0.015), 0.012, 0.002, 7.0, True, False,
+      projected_measured_curvature=0.010,
+    )
+
+  assert 0.0 < closing.path_offset < lagging.path_offset
+  assert math.isclose(closing.path_angle, lagging.path_angle)
+
+
+def test_projected_wheel_motion_preserves_c0_feedback_floor():
+  controller = LatControlPath()
+  conservative_controller = LatControlPath()
+
+  for _ in range(10):
+    command = controller.update(
+      polynomial_model(0.015), 0.012, 0.002, 7.0, True, False,
+      projected_measured_curvature=0.020,
+    )
+    conservative = conservative_controller.update(
+      polynomial_model(0.015), 0.012, 0.002, 7.0, True, False,
+      projected_measured_curvature=0.002,
+    )
+  assert command.path_offset > 0.0
+  assert command.path_offset < conservative.path_offset
+  assert math.isclose(command.path_angle, conservative.path_angle)
+
+
 def test_tiny_action_sign_noise_cannot_promote_model_to_full_c0_reversal():
   controller = LatControlPath()
 

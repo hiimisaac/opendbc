@@ -74,6 +74,9 @@ class CarController(CarControllerBase):
     self.VM = VehicleModel(CP)
 
     self.apply_curvature_last = 0
+    self.path_offset_last = 0.0
+    self.path_angle_last = 0.0
+    self.curvature_rate_last = 0.0
     self.anti_overshoot_curvature_last = 0
     self.lateral_path_controller = LateralPathController()
     self.steering_angle_projector = SteeringAngleProjector()
@@ -203,6 +206,9 @@ class CarController(CarControllerBase):
         )
 
       self.apply_curvature_last = apply_curvature
+      self.path_offset_last = path_offset
+      self.path_angle_last = path_angle
+      self.curvature_rate_last = curvature_rate
 
       if self.CP.flags & FordFlags.CANFD:
         mode = lmc2_mode(CC.latActive)
@@ -284,6 +290,10 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.curvature = self.apply_curvature_last
+    new_actuators.lateralPath.pathOffset = self.path_offset_last
+    new_actuators.lateralPath.pathAngle = self.path_angle_last
+    new_actuators.lateralPath.curvature = self.apply_curvature_last
+    new_actuators.lateralPath.curvatureRate = self.curvature_rate_last
     new_actuators.accel = self.accel
     new_actuators.gas = self.gas
 
