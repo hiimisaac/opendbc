@@ -1,10 +1,12 @@
+import math
 import random
 import unittest
 
 from hypothesis import settings, given, strategies as st
 
-from opendbc.car.structs import CarParams
+from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
+from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
@@ -41,6 +43,26 @@ ECU_PART_NUMBER = {
 
 
 class TestFordFW(unittest.TestCase):
+  def test_canfd_uses_path_control(self):
+    canfd = CarInterface.get_non_essential_params(CAR.FORD_F_150_MK14)
+    non_canfd = CarInterface.get_non_essential_params(CAR.FORD_ESCAPE_MK4)
+
+    assert canfd.steerControlType == CarParams.SteerControlType.path
+    assert non_canfd.steerControlType == CarParams.SteerControlType.angle
+
+  def test_lateral_path_actuator_round_trip(self):
+    actuators = CarControl.Actuators(lateralPath={
+      "pathOffset": 0.3,
+      "pathAngle": -0.2,
+      "curvature": 0.01,
+      "curvatureRate": -0.0004,
+    })
+
+    assert math.isclose(actuators.lateralPath.pathOffset, 0.3, rel_tol=1e-6)
+    assert math.isclose(actuators.lateralPath.pathAngle, -0.2, rel_tol=1e-6)
+    assert math.isclose(actuators.lateralPath.curvature, 0.01, rel_tol=1e-6)
+    assert math.isclose(actuators.lateralPath.curvatureRate, -0.0004, rel_tol=1e-6)
+
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
       assert ecu in ECU_ADDRESSES, "Unknown ECU"
