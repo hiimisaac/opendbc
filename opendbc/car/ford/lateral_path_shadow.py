@@ -22,6 +22,10 @@ PATH_MODEL_MANEUVER_MIN = 0.003
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
+PATH_PREVIEW_CONFLICT_BP = (0.006, 0.012)
+PATH_PREVIEW_ACTION_RELEASE_BP = (0.0015, 0.003)
+PATH_PREVIEW_RELEASE_COMMAND_BP = (0.001, 0.003)
+PATH_PREVIEW_CONFLICT_SPEED_BP = (2.0, 3.0)
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
@@ -56,6 +60,10 @@ def _interp(value: float, lower: float, upper: float, lower_value: float, upper_
 
 def _deadzone(value: float, deadzone: float) -> float:
   return math.copysign(max(abs(value) - deadzone, 0.0), value)
+
+
+def _blend(first: float, second: float, second_share: float) -> float:
+  return first + _clip(second_share, (0.0, 1.0)) * (second - first)
 
 
 def _limit_attack(value: float, last: float, max_step: float) -> float:
@@ -164,6 +172,31 @@ def _projected_c0_correction(target: float, measured_curvature: float,
   return _stronger_same_direction(base_correction, projected_correction)
 
 
+def _command_equivalent_curvature(command: LateralPathCommand, distance: float) -> float:
+  path_offset = command.path_offset + command.path_angle * distance + \
+                0.5 * command.curvature * distance ** 2 + command.curvature_rate * distance ** 3 / 6.0
+  return 2.0 * path_offset / distance ** 2
+
+
+def _preview_conflict_share(model_target: float, desired_curvature: float,
+                            desired_angle_curvature: float, measured_curvature: float,
+                            previous_command_curvature: float, v_ego: float) -> float:
+  """Continuously reject preview that fights a delivered-wheel unwind."""
+  desired_angle_error = desired_angle_curvature - measured_curvature
+  wheel_follows_preview = measured_curvature * model_target > 0.0
+  angle_error_opposes_preview = desired_angle_error * model_target < 0.0
+  command_has_begun_release = previous_command_curvature * model_target < 0.0
+  if not wheel_follows_preview or not angle_error_opposes_preview or not command_has_begun_release:
+    return 0.0
+  angle_conflict_share = _interp(abs(desired_angle_error), *PATH_PREVIEW_CONFLICT_BP, 0.0, 1.0)
+  action_release_share = _interp(abs(desired_curvature), *PATH_PREVIEW_ACTION_RELEASE_BP, 1.0, 0.0)
+  released_command_share = _interp(
+    abs(previous_command_curvature), *PATH_PREVIEW_RELEASE_COMMAND_BP, 0.0, 1.0,
+  )
+  moving_confidence = _interp(v_ego, *PATH_PREVIEW_CONFLICT_SPEED_BP, 0.0, 1.0)
+  return angle_conflict_share * action_release_share * released_command_share * moving_confidence
+
+
 class LatControlPath:
   """Map action, path preview, and measured wheel curvature to one polynomial.
 
@@ -175,19 +208,30 @@ class LatControlPath:
 
   def __init__(self):
     self._last_command = LateralPathCommand()
+    self._preview_conflict_share = 0.0
+
+  @property
+  def preview_conflict_share(self) -> float:
+    return self._preview_conflict_share
 
   def update(self, model, desired_curvature: float, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
-             projected_measured_curvature: float | None = None) -> LateralPathCommand:
+             projected_measured_curvature: float | None = None,
+             desired_angle_curvature: float | None = None) -> LateralPathCommand:
     desired_curvature = _finite(desired_curvature)
     measured_curvature = _finite(measured_curvature)
     if projected_measured_curvature is None:
       projected_measured_curvature = measured_curvature
     projected_measured_curvature = _finite(projected_measured_curvature)
+    desired_angle_feedback_available = desired_angle_curvature is not None
+    if desired_angle_curvature is None:
+      desired_angle_curvature = desired_curvature
+    desired_angle_curvature = _finite(desired_angle_curvature)
     v_ego = max(_finite(v_ego), 0.0)
 
     if not active:
       self._last_command = LateralPathCommand()
+      self._preview_conflict_share = 0.0
       return self._last_command
 
     lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
@@ -210,19 +254,31 @@ class LatControlPath:
         path_angle=_clip(measured_curvature * lookahead, PATH_C1_LIMITS),
       )
       self._last_command = command
+      self._preview_conflict_share = 0.0
       return command
 
     offset_curvature = 2.0 * path_offset / PATH_C0_DISTANCE ** 2 if valid else 0.0
     angle_curvature = path_angle / lookahead if valid else 0.0
+    previous_command_curvature = _command_equivalent_curvature(self._last_command, PATH_C0_DISTANCE)
     model_action_disagreement = False
+    preview_conflict_share = 0.0
     coherent_model_maneuver = valid and offset_curvature * angle_curvature > 0.0 and \
                               min(abs(offset_curvature), abs(angle_curvature)) >= PATH_MODEL_MANEUVER_MIN
     if coherent_model_maneuver:
-      # Offset and heading are two views of the same near-field arc. Use their
-      # weaker coherent curvature as the target so a finite 90-degree path does
-      # not get counted twice as independent C0 and C1 tracking error.
-      model_target = math.copysign(min(abs(offset_curvature), abs(angle_curvature)), offset_curvature)
-      angle_target = _stronger_same_direction(model_target, desired_curvature)
+      raw_model_target = math.copysign(min(abs(offset_curvature), abs(angle_curvature)), offset_curvature)
+      if desired_angle_feedback_available:
+        preview_conflict_share = _preview_conflict_share(
+          raw_model_target, desired_curvature, desired_angle_curvature, measured_curvature,
+          previous_command_curvature, v_ego,
+        )
+      # C0 lateral placement and C1 heading are independent polynomial
+      # geometry. Preserve both instead of collapsing them to the weaker view.
+      # When delivered wheel motion and desired angle agree that the preview is
+      # stale, continuously fade the complete preview toward the angle target.
+      offset_model_target = _blend(offset_curvature, desired_angle_curvature, preview_conflict_share)
+      angle_model_target = _blend(angle_curvature, desired_angle_curvature, preview_conflict_share)
+      model_target = _blend(raw_model_target, desired_angle_curvature, preview_conflict_share)
+      angle_target = _stronger_same_direction(angle_model_target, desired_curvature)
       action_reversal = abs(desired_curvature) >= PATH_MODEL_MANEUVER_MIN and \
                         model_target * desired_curvature < 0.0
       wheel_reversal = abs(measured_curvature) >= PATH_MODEL_MANEUVER_MIN and \
@@ -232,10 +288,10 @@ class LatControlPath:
       # to the larger same-direction tracking correction.
       model_action_disagreement = model_target * desired_curvature < 0.0 or wheel_reversal
       if action_reversal or wheel_reversal:
-        offset_target = model_target
+        offset_target = offset_model_target
       else:
         c0_model_share = _interp(abs(desired_curvature), 0.003, 0.006, 0.0, 1.0)
-        offset_target = desired_curvature + c0_model_share * (model_target - desired_curvature)
+        offset_target = desired_curvature + c0_model_share * (offset_model_target - desired_curvature)
     elif valid:
       model_target = desired_curvature
       offset_target = desired_curvature
@@ -267,11 +323,13 @@ class LatControlPath:
       # extra placement shove without weakening the heading command. This is
       # the same separation used by the live controller's projected feedback.
       offset_target += _projected_c0_correction(
-        model_target, measured_curvature, projected_measured_curvature,
+        offset_model_target if coherent_model_maneuver else model_target,
+        measured_curvature, projected_measured_curvature,
         PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT,
       )
       angle_target += _undertracking_correction(
-        model_target, measured_curvature, measured_curvature,
+        angle_model_target if coherent_model_maneuver else model_target,
+        measured_curvature, measured_curvature,
         PATH_C1_TRACKING_ERROR_LIMIT,
       )
 
@@ -303,6 +361,7 @@ class LatControlPath:
     c3_preview_share = _interp(maneuver_demand, *PATH_C2_FADE_BP, 0.0, 1.0) if coherent_reversal else 0.0
     c3_share = max(c3_action_share, c3_preview_share)
     curvature_rate_command = _clip(spatial_curvature_rate * c3_share, PATH_C3_LIMITS)
+    curvature_rate_command *= 1.0 - preview_conflict_share
 
     path_offset_command = _limit_attack(
       path_offset_command,
@@ -328,4 +387,5 @@ class LatControlPath:
       curvature_rate=curvature_rate_command,
     )
     self._last_command = command
+    self._preview_conflict_share = preview_conflict_share
     return command
