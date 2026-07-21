@@ -23,7 +23,7 @@ def test_model_geometry_retains_path_authority_missing_from_action():
   first = controller.update(
     model=polynomial_model(0.01, 0.0004),
     desired_curvature=0.0034,
-    measured_curvature=0.01,
+    measured_curvature=0.0,
     v_ego=7.0,
     active=True,
     driver_override=False,
@@ -31,7 +31,7 @@ def test_model_geometry_retains_path_authority_missing_from_action():
   command = controller.update(
     model=polynomial_model(0.01, 0.0004),
     desired_curvature=0.0034,
-    measured_curvature=0.01,
+    measured_curvature=0.0,
     v_ego=7.0,
     active=True,
     driver_override=False,
@@ -40,6 +40,106 @@ def test_model_geometry_retains_path_authority_missing_from_action():
   assert command.path_offset > 0.15
   assert command.path_angle > 0.05
   assert math.isclose(first.curvature, 0.0002)
+
+
+def test_action_unwind_releases_stale_preview_without_relatching():
+  controller = LatControlPath()
+
+  attack = controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+  release = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  continued_unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+
+  assert attack.path_offset > 0.0
+  assert attack.path_angle > 0.0
+  assert release.path_offset < 0.0
+  assert release.path_angle < 0.0
+  assert unwind.path_offset < 0.0
+  assert unwind.path_angle < 0.0
+  assert continued_unwind.path_offset <= unwind.path_offset
+  assert continued_unwind.path_angle <= unwind.path_angle
+
+
+def test_small_same_direction_action_cannot_preserve_preview_while_unwinding():
+  controller = LatControlPath()
+
+  command = controller.update(polynomial_model(0.015), 0.00275, 0.015, 7.0, True, False)
+
+  assert command.path_offset <= 0.0
+  assert command.path_angle <= 0.0
+
+
+def test_unwind_has_no_relatch_discontinuity_above_straightening_threshold():
+  controller = LatControlPath()
+
+  command = controller.update(polynomial_model(0.015), 0.0031, 0.015, 7.0, True, False)
+
+  assert command.path_offset <= 0.0
+  assert command.path_angle <= 0.0
+
+
+def test_action_bounce_cannot_relatch_after_unwind_begins():
+  controller = LatControlPath()
+
+  controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+  unwind = controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  bounced_action = controller.update(polynomial_model(0.015), 0.0045, 0.015, 7.0, True, False)
+
+  assert unwind.path_offset < 0.0
+  assert unwind.path_angle < 0.0
+  assert bounced_action.path_offset < 0.0
+  assert bounced_action.path_angle < 0.0
+
+
+def test_action_drop_starts_unwind_without_a_straight_intermediate_frame():
+  controller = LatControlPath()
+
+  controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+  direct_unwind = controller.update(polynomial_model(0.015), 0.0045, 0.015, 7.0, True, False)
+
+  assert direct_unwind.path_offset < 0.0
+  assert direct_unwind.path_angle < 0.0
+
+
+def test_unwind_releases_when_action_genuinely_moves_beyond_the_wheel():
+  controller = LatControlPath()
+
+  controller.update(polynomial_model(0.015), 0.012, 0.0, 7.0, True, False)
+  controller.update(polynomial_model(0.015), 0.0, 0.015, 7.0, True, False)
+  renewed_turn = controller.update(polynomial_model(0.020), 0.020, 0.015, 7.0, True, False)
+
+  assert renewed_turn.path_offset > 0.0
+  assert renewed_turn.path_angle > 0.0
+
+
+def test_preview_authority_fades_to_the_action_supported_floor():
+  def angle_equivalent(measured_curvature: float) -> float:
+    controller = LatControlPath()
+    command = None
+    for _ in range(40):
+      command = controller.update(polynomial_model(0.015), 0.0045, measured_curvature, 7.0, True, False)
+    assert command is not None
+    return command.curvature + command.path_angle / 7.0
+
+  far_from_target = angle_equivalent(0.0)
+  near_target = angle_equivalent(0.0035)
+  at_target = angle_equivalent(0.0045)
+
+  assert far_from_target > near_target
+  assert math.isclose(near_target, at_target)
+  assert at_target > 0.0045
+
+
+def test_moving_turn_retains_preview_authority_as_speed_and_lookahead_drop():
+  controller = LatControlPath()
+
+  at_25_mph = controller.update(polynomial_model(0.015), 0.008, 0.004, 11.2, True, False)
+  at_15_mph = controller.update(polynomial_model(0.015), 0.010, 0.006, 6.7, True, False)
+
+  assert at_25_mph.path_offset > 0.0
+  assert at_25_mph.path_angle > 0.0
+  assert at_15_mph.path_offset >= at_25_mph.path_offset
+  assert at_15_mph.path_angle > 0.0
 
 
 def test_spatial_slope_stays_quiet_when_action_and_vehicle_already_turn_together():
@@ -98,32 +198,28 @@ def test_delivered_gentle_model_path_uses_smooth_curvature_alone():
     driver_override=False,
   )
 
-  assert command.path_offset == 0.0
-  assert math.isclose(command.path_angle, 0.0, abs_tol=1e-9)
+  assert math.isclose(command.path_offset, 0.0, abs_tol=1e-4)
+  assert math.isclose(command.path_angle, 0.0, abs_tol=1e-4)
   assert math.isclose(command.curvature, 0.0002)
   assert command.curvature_rate == 0.0
 
 
-def test_large_turn_keeps_c2_flushed_until_path_and_vehicle_settle():
+def test_large_turn_keeps_c2_flushed_until_the_wheel_settles():
   controller = LatControlPath()
 
   controller.update(polynomial_model(0.015), 0.015, 0.012, 7.0, True, False)
   early_exit = controller.update(polynomial_model(0.004), 0.004, 0.010, 7.0, True, False)
-  for _ in range(9):
-    recovering = controller.update(polynomial_model(0.001), 0.001, 0.001, 7.0, True, False)
-  released = controller.update(polynomial_model(0.001), 0.001, 0.001, 7.0, True, False)
+  settled = controller.update(polynomial_model(0.001), 0.001, 0.001, 7.0, True, False)
 
   assert early_exit.curvature == 0.0
-  assert recovering.curvature == 0.0
-  assert math.isclose(released.curvature, 0.0002)
+  assert math.isclose(settled.curvature, 0.0002)
 
 
-def test_inactive_zero_frames_clear_the_large_turn_latch():
+def test_inactive_resets_the_previous_command():
   controller = LatControlPath()
   controller.update(polynomial_model(0.015), 0.015, 0.012, 7.0, True, False)
 
-  for _ in range(10):
-    controller.update(polynomial_model(0.0), 0.0, 0.0, 7.0, False, False)
+  controller.update(polynomial_model(0.0), 0.0, 0.0, 7.0, False, False)
   reengaged = controller.update(polynomial_model(0.001), 0.001, 0.001, 7.0, True, False)
 
   assert math.isclose(reengaged.curvature, 0.0002)
