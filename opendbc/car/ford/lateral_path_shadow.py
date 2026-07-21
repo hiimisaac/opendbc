@@ -1,4 +1,4 @@
-"""Model-aware LMC2 candidate used only by the isolated shadow logger."""
+"""Action-tracking LMC2 candidate used only by the isolated shadow logger."""
 
 from dataclasses import dataclass
 import math
@@ -8,17 +8,21 @@ PATH_C0_LIMITS = (-4.61, 4.60)
 PATH_C1_LIMITS = (-0.475, 0.497)
 PATH_C2_LIMITS = (-0.02, 0.02)
 PATH_C3_LIMITS = (-0.001024, 0.001023)
-PATH_C2_FADE_BP = (0.006, 0.012)
-PATH_C2_SLEW = 0.0002
-PATH_C2_LATCH_ENTER = PATH_C2_FADE_BP[1]
-PATH_C2_LATCH_EXIT_TARGET = 0.002
-PATH_C2_LATCH_EXIT_ERROR = 0.001
-PATH_C2_RECOVERY_FRAMES = 10
-PATH_MANEUVER_CURVATURE_SLEW = 0.006
-PATH_C3_SLEW = 0.0002
+
 PATH_C0_DISTANCE = 7.0
 PATH_MIN_LOOKAHEAD = 7.0
 PATH_C3_HORIZONS = (3.5, 5.0, 7.0)
+
+PATH_C2_FADE_BP = (0.006, 0.012)
+PATH_C2_SETTLED_BP = (0.003, 0.006)
+PATH_C2_SLEW = 0.0002
+PATH_PREVIEW_ERROR_BP = (0.0005, 0.003)
+PATH_PREVIEW_ACTION_BP = (0.003, 0.006)
+PATH_PREVIEW_COHERENCE_BP = (0.2, 0.6)
+PATH_UNWIND_ERROR_DEADZONE = 0.0005
+PATH_UNWIND_LIMIT = 0.006
+PATH_MANEUVER_CURVATURE_SLEW = 0.006
+PATH_C3_SLEW = 0.0002
 
 
 @dataclass(frozen=True)
@@ -47,8 +51,15 @@ def _interp(value: float, lower: float, upper: float, lower_value: float, upper_
   return lower_value + alpha * (upper_value - lower_value)
 
 
-def _limit_same_direction_attack(value: float, last: float, max_step: float) -> float:
-  if value * last >= 0.0 and abs(value) > abs(last):
+def _deadzone(value: float, deadzone: float) -> float:
+  return math.copysign(max(abs(value) - deadzone, 0.0), value)
+
+
+def _limit_attack(value: float, last: float, max_step: float) -> float:
+  """Bound authority growth, release immediately, and reverse without a jump."""
+  if value * last < 0.0:
+    return math.copysign(min(abs(value), max_step), value)
+  if abs(value) > abs(last):
     return math.copysign(min(abs(value), abs(last) + max_step), value)
   return value
 
@@ -114,41 +125,48 @@ def _curvature_rate(path: tuple[list[float], list[float], list[float]]) -> float
   return sorted(rates)[1] * abs(sum(rates)) / magnitude
 
 
+def _preview_target(path_curvature: float, desired_curvature: float,
+                    tracking_error: float, wheel_beyond_target: bool) -> float:
+  """Return path preview bounded by action support and measured tracking."""
+  preview_excess = path_curvature - desired_curvature
+  action_share = 0.0 if wheel_beyond_target else \
+    _interp(abs(desired_curvature), *PATH_PREVIEW_ACTION_BP, 0.0, 1.0)
+  coherence = 0.0
+  if not wheel_beyond_target and \
+      path_curvature * desired_curvature > 0.0 and path_curvature != 0.0:
+    coherence = min(abs(desired_curvature / path_curvature), 1.0)
+  coherence_share = _interp(coherence, *PATH_PREVIEW_COHERENCE_BP, 0.0, 1.0)
+  preview_share = max(action_share, coherence_share)
+  if preview_excess * tracking_error > 0.0:
+    error_share = _interp(abs(tracking_error), *PATH_PREVIEW_ERROR_BP, 0.0, 1.0)
+    preview_share = max(preview_share, error_share)
+  return desired_curvature + preview_share * preview_excess
+
+
 class LatControlPath:
-  """Convert model path intent into one bounded local polynomial command."""
+  """Map action, path preview, and measured wheel curvature to one polynomial.
+
+  The previous command is the only persistent controller state. The action head
+  owns the current target; path geometry can add authority while it closes the
+  measured tracking error or the action still supports the upcoming maneuver.
+  """
 
   def __init__(self):
-    self._last_curvature = 0.0
     self._last_command = LateralPathCommand()
-    self._c2_latched = False
-    self._c2_recovery_frames = 0
 
   def update(self, model, desired_curvature: float, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool) -> LateralPathCommand:
     desired_curvature = _finite(desired_curvature)
     measured_curvature = _finite(measured_curvature)
     v_ego = max(_finite(v_ego), 0.0)
-    if not active:
-      if self._c2_latched:
-        self._c2_recovery_frames += 1
-        if self._c2_recovery_frames >= PATH_C2_RECOVERY_FRAMES:
-          self._c2_latched = False
-          self._c2_recovery_frames = 0
-      self._last_curvature = 0.0
-      self._last_command = LateralPathCommand()
-      return LateralPathCommand()
 
-    lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
-    if driver_override:
-      self._last_curvature = 0.0
-      self._last_command = LateralPathCommand(
-        valid=True,
-        path_offset=_clip(0.5 * measured_curvature * PATH_C0_DISTANCE ** 2, PATH_C0_LIMITS),
-        path_angle=_clip(measured_curvature * lookahead, PATH_C1_LIMITS),
-      )
+    if not active:
+      self._last_command = LateralPathCommand()
       return self._last_command
 
+    lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
     path = _model_path(model)
+    valid = path is not None
     if path is None:
       path_offset = 0.0
       path_angle = 0.0
@@ -159,84 +177,93 @@ class LatControlPath:
       path_angle = _sample(lookahead, distances, headings)
       spatial_curvature_rate = _curvature_rate(path)
 
-    if abs(desired_curvature) >= PATH_C2_LATCH_ENTER:
-      self._c2_latched = True
-      self._c2_recovery_frames = 0
-    elif self._c2_latched:
-      near_target = abs(desired_curvature) <= PATH_C2_LATCH_EXIT_TARGET
-      tracking = abs(desired_curvature - measured_curvature) <= PATH_C2_LATCH_EXIT_ERROR
-      if near_target and tracking:
-        self._c2_recovery_frames += 1
-        if self._c2_recovery_frames >= PATH_C2_RECOVERY_FRAMES:
-          self._c2_latched = False
-          self._c2_recovery_frames = 0
-      else:
-        self._c2_recovery_frames = 0
-
-    instantaneous_c2_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 1.0, 0.0)
-    c2_share = 0.0 if self._c2_latched else instantaneous_c2_share
-    target_curvature = _clip(desired_curvature * c2_share, PATH_C2_LIMITS)
-    if target_curvature * self._last_curvature >= 0.0 and abs(target_curvature) > abs(self._last_curvature):
-      target_curvature = math.copysign(
-        min(abs(target_curvature), abs(self._last_curvature) + PATH_C2_SLEW),
-        target_curvature,
+    if driver_override:
+      command = LateralPathCommand(
+        valid=valid,
+        path_offset=_clip(0.5 * measured_curvature * PATH_C0_DISTANCE ** 2, PATH_C0_LIMITS),
+        path_angle=_clip(measured_curvature * lookahead, PATH_C1_LIMITS),
       )
-    elif target_curvature * self._last_curvature < 0.0:
-      target_curvature = 0.0
-    self._last_curvature = target_curvature
+      self._last_command = command
+      return command
 
-    path_curvature = path_angle / lookahead
-    offset_curvature = 2.0 * path_offset / (PATH_C0_DISTANCE ** 2)
-    delivered_curvature = 0.0
-    if measured_curvature * path_curvature > 0.0:
-      delivered_curvature = math.copysign(
-        min(abs(measured_curvature), abs(path_curvature)), path_curvature,
+    tracking_error = desired_curvature - measured_curvature
+    wheel_beyond_target = tracking_error * measured_curvature < 0.0
+    offset_curvature = 2.0 * path_offset / PATH_C0_DISTANCE ** 2 if valid else 0.0
+    angle_curvature = path_angle / lookahead if valid else 0.0
+
+    if valid:
+      offset_target = _preview_target(
+        offset_curvature, desired_curvature, tracking_error, wheel_beyond_target,
       )
+      angle_target = _preview_target(
+        angle_curvature, desired_curvature, tracking_error, wheel_beyond_target,
+      )
+    else:
+      offset_target = 0.0
+      angle_target = 0.0
 
-    c2_path_share = c2_share
-    if path_curvature != 0.0 and path_curvature * desired_curvature > 0.0:
-      c2_authority = abs(target_curvature)
-      if c2_share == 1.0:
-        c2_authority = max(c2_authority, abs(desired_curvature))
-      c2_path_share = min(c2_authority / abs(path_curvature), 1.0)
-    delivered_c2_curvature = delivered_curvature * c2_path_share
+    # Once the wheel is beyond the action target, actively remove the old turn.
+    # This correction cannot relatch stale preview because it is applied only in
+    # the direction opposite measured wheel curvature.
+    unwind = 0.0
+    if wheel_beyond_target:
+      unwind = _clip(
+        _deadzone(tracking_error, PATH_UNWIND_ERROR_DEADZONE),
+        (-PATH_UNWIND_LIMIT, PATH_UNWIND_LIMIT),
+      )
+      offset_target += unwind
+      angle_target += unwind
 
-    maneuver_curvature = max(abs(desired_curvature), abs(path_curvature), abs(offset_curvature))
-    c0_share = _interp(maneuver_curvature, 0.003, 0.006, 0.0, 1.0)
-    live_c3_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 0.0, 1.0)
-    coherent_reversal = measured_curvature * path_curvature < 0.0 and \
-                        spatial_curvature_rate * path_curvature > 0.0 and \
-                        offset_curvature * path_curvature > 0.0
-    preview_c3_share = _interp(maneuver_curvature, *PATH_C2_FADE_BP, 0.0, 1.0) if coherent_reversal else 0.0
-    c3_share = max(live_c3_share, preview_c3_share)
+    c2_action_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 1.0, 0.0)
+    unresolved = max(abs(desired_curvature), abs(measured_curvature), abs(tracking_error))
+    c2_settled_share = _interp(unresolved, *PATH_C2_SETTLED_BP, 1.0, 0.0)
+    c2_share = min(c2_action_share, c2_settled_share)
+    allocated_c2 = _clip(desired_curvature * c2_share, PATH_C2_LIMITS)
+    curvature = allocated_c2
+    curvature = _limit_attack(curvature, self._last_command.curvature, PATH_C2_SLEW)
 
-    path_offset_command = _clip(
-      (path_offset - 0.5 * delivered_c2_curvature * PATH_C0_DISTANCE ** 2) * c0_share,
-      PATH_C0_LIMITS,
-    )
-    path_angle_command = _clip(path_angle - delivered_c2_curvature * lookahead, PATH_C1_LIMITS)
+    maneuver_demand = max(abs(desired_curvature), abs(offset_curvature), abs(angle_curvature))
+    c0_share = _interp(maneuver_demand, 0.003, 0.006, 0.0, 1.0)
+    if valid:
+      path_offset_command = _clip(
+        0.5 * (offset_target - allocated_c2) * PATH_C0_DISTANCE ** 2 * c0_share,
+        PATH_C0_LIMITS,
+      )
+      path_angle_command = _clip((angle_target - allocated_c2) * lookahead, PATH_C1_LIMITS)
+    else:
+      path_offset_command = 0.0
+      path_angle_command = 0.0
+
+    c3_action_share = _interp(abs(desired_curvature), *PATH_C2_FADE_BP, 0.0, 1.0)
+    coherent_reversal = measured_curvature * angle_curvature < 0.0 and \
+                        spatial_curvature_rate * angle_curvature > 0.0 and \
+                        offset_curvature * angle_curvature > 0.0
+    c3_preview_share = _interp(maneuver_demand, *PATH_C2_FADE_BP, 0.0, 1.0) if coherent_reversal else 0.0
+    c3_share = max(c3_action_share, c3_preview_share)
     curvature_rate_command = _clip(spatial_curvature_rate * c3_share, PATH_C3_LIMITS)
-    path_offset_command = _limit_same_direction_attack(
+
+    path_offset_command = _limit_attack(
       path_offset_command,
       self._last_command.path_offset,
       0.5 * PATH_MANEUVER_CURVATURE_SLEW * PATH_C0_DISTANCE ** 2,
     )
-    path_angle_command = _limit_same_direction_attack(
+    path_angle_command = _limit_attack(
       path_angle_command,
       self._last_command.path_angle,
       PATH_MANEUVER_CURVATURE_SLEW * lookahead,
     )
-    curvature_rate_command = _limit_same_direction_attack(
+    curvature_rate_command = _limit_attack(
       curvature_rate_command,
       self._last_command.curvature_rate,
       PATH_C3_SLEW,
     )
 
-    self._last_command = LateralPathCommand(
-      valid=path is not None,
+    command = LateralPathCommand(
+      valid=valid,
       path_offset=path_offset_command,
       path_angle=path_angle_command,
-      curvature=target_curvature,
+      curvature=curvature,
       curvature_rate=curvature_rate_command,
     )
-    return self._last_command
+    self._last_command = command
+    return command
