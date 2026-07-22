@@ -24,6 +24,8 @@ PATH_PREVIEW_CONFLICT_BP = (0.006, 0.012)
 PATH_PREVIEW_ACTION_RELEASE_BP = (0.0015, 0.003)
 PATH_PREVIEW_RELEASE_COMMAND_BP = (0.001, 0.003)
 PATH_PREVIEW_CONFLICT_SPEED_BP = (2.0, 3.0)
+PATH_C3_UNWIND_ERROR_BP = (0.0005, 0.002)
+PATH_C3_UNWIND_TARGET_MIN = 0.003
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
@@ -196,6 +198,23 @@ def _preview_conflict_share(model_target: float, desired_curvature: float,
   return angle_conflict_share * action_release_share * released_command_share * moving_confidence
 
 
+def _spatial_unwind_compatibility_share(curvature_rate: float, desired_angle_curvature: float,
+                                        measured_curvature: float) -> float:
+  """Fade C3 unwind while the delivered wheel still undertracks the angle target."""
+  action_is_small = abs(desired_angle_curvature) < PATH_C3_UNWIND_TARGET_MIN
+  c3_deepens_action = curvature_rate * desired_angle_curvature >= 0.0
+  if action_is_small or c3_deepens_action:
+    return 1.0
+
+  tracking_error = desired_angle_curvature - measured_curvature
+  wheel_reached_target = tracking_error * desired_angle_curvature <= 0.0
+  if wheel_reached_target:
+    return 1.0
+
+  conflict_share = _interp(abs(tracking_error), *PATH_C3_UNWIND_ERROR_BP, 0.0, 1.0)
+  return 1.0 - conflict_share
+
+
 class LatControlPath:
   """Map action, path preview, and measured wheel curvature to one polynomial.
 
@@ -362,6 +381,10 @@ class LatControlPath:
     c3_share = max(c3_action_share, c3_preview_share)
     curvature_rate_command = _clip(spatial_curvature_rate * c3_share, PATH_C3_LIMITS)
     curvature_rate_command *= 1.0 - preview_conflict_share
+    if desired_angle_feedback_available:
+      curvature_rate_command *= _spatial_unwind_compatibility_share(
+        curvature_rate_command, desired_angle_curvature, measured_curvature,
+      )
 
     path_offset_command = _limit_attack(
       path_offset_command,
