@@ -355,6 +355,83 @@ def test_spatial_slope_leads_a_coherent_moving_reversal():
   assert command.curvature_rate < -0.0001
 
 
+def test_spatial_unwind_waits_while_desired_angle_is_undertracked():
+  controller = LatControlPath()
+
+  command = controller.update(
+    path=with_action(polynomial_model(0.01, -0.0004), 0.01),
+    measured_curvature=0.006,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert command.curvature_rate == 0.0
+
+
+def test_spatial_unwind_fades_continuously_with_desired_angle_error():
+  small_error_controller = LatControlPath()
+  medium_error_controller = LatControlPath()
+
+  small_error = small_error_controller.update(
+    path=with_action(polynomial_model(0.01, -0.0004), 0.01),
+    measured_curvature=0.0098,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+  medium_error = medium_error_controller.update(
+    path=with_action(polynomial_model(0.01, -0.0004), 0.01),
+    measured_curvature=0.00875,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert small_error.curvature_rate < medium_error.curvature_rate < 0.0
+
+
+def test_spatial_unwind_remains_when_wheel_is_beyond_desired_angle():
+  controller = LatControlPath()
+
+  command = controller.update(
+    path=with_action(polynomial_model(0.01, -0.0004), 0.01),
+    measured_curvature=0.012,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert command.curvature_rate < -0.0001
+
+
+def test_spatial_deepening_is_not_weakened_by_desired_angle_error():
+  baseline_controller = LatControlPath()
+  angle_feedback_controller = LatControlPath()
+
+  baseline = baseline_controller.update(
+    path=with_action(polynomial_model(0.01, 0.0004), 0.01),
+    measured_curvature=0.006,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+  )
+  angle_feedback = angle_feedback_controller.update(
+    path=with_action(polynomial_model(0.01, 0.0004), 0.01),
+    measured_curvature=0.006,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert angle_feedback.curvature_rate == baseline.curvature_rate
+
+
 def test_growing_path_authority_is_bounded_but_release_is_immediate():
   controller = LatControlPath()
 
