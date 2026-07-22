@@ -368,6 +368,75 @@ def test_delivered_gentle_model_path_uses_smooth_curvature_alone():
   assert command.curvature_rate == 0.0
 
 
+def test_low_amplitude_model_geometry_enters_without_a_heading_step():
+  controller = LatControlPath()
+
+  below_threshold = controller.update(
+    model=polynomial_model(0.0029),
+    desired_curvature=0.0,
+    measured_curvature=0.0,
+    v_ego=15.0,
+    active=True,
+    driver_override=False,
+  )
+  above_threshold = controller.update(
+    model=polynomial_model(0.0031),
+    desired_curvature=0.0,
+    measured_curvature=0.0,
+    v_ego=15.0,
+    active=True,
+    driver_override=False,
+  )
+
+  assert below_threshold.path_angle == 0.0
+  assert 0.0 < above_threshold.path_angle < 0.01
+
+
+def test_strong_path_placement_is_not_weakened_by_a_small_heading_component():
+  controller = LatControlPath()
+  reference_controller = LatControlPath()
+
+  command = None
+  reference = None
+  for _ in range(20):
+    command = controller.update(
+      model=split_geometry_model(0.03, 0.0031),
+      desired_curvature=0.012,
+      measured_curvature=0.0,
+      v_ego=7.0,
+      active=True,
+      driver_override=False,
+    )
+    reference = reference_controller.update(
+      model=split_geometry_model(0.03, 0.006),
+      desired_curvature=0.012,
+      measured_curvature=0.0,
+      v_ego=7.0,
+      active=True,
+      driver_override=False,
+    )
+
+  assert command is not None
+  assert reference is not None
+  assert math.isclose(command.path_offset, reference.path_offset)
+
+
+def test_conditioning_cannot_reverse_coherent_geometry_toward_the_action():
+  controller = LatControlPath()
+
+  command = controller.update(
+    model=polynomial_model(-0.0031),
+    desired_curvature=0.0032,
+    measured_curvature=-0.0007,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+  )
+
+  assert command.path_offset < -0.01
+  assert command.path_angle < -0.04
+
+
 def test_large_turn_keeps_c2_flushed_until_the_wheel_settles():
   controller = LatControlPath()
 
