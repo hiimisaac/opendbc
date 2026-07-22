@@ -233,6 +233,7 @@ class LatControlPath:
              desired_angle_curvature: float | None = None) -> LateralPathCommand:
     desired_curvature = _finite(getattr(path, "curvature", 0.0)) if path is not None else 0.0
     measured_curvature = _finite(measured_curvature)
+    projected_feedback_available = projected_measured_curvature is not None
     if projected_measured_curvature is None:
       projected_measured_curvature = measured_curvature
     projected_measured_curvature = _finite(projected_measured_curvature)
@@ -382,8 +383,15 @@ class LatControlPath:
     curvature_rate_command = _clip(spatial_curvature_rate * c3_share, PATH_C3_LIMITS)
     curvature_rate_command *= 1.0 - preview_conflict_share
     if desired_angle_feedback_available:
+      compatibility_target = desired_angle_curvature
+      compatibility_wheel = measured_curvature
+      if projected_feedback_available:
+        # C3 is d(curvature)/distance. Project its moving target over the same
+        # horizon as the wheel so unwind is faded before the wheel undershoots.
+        compatibility_target += curvature_rate_command * v_ego * FORD_PATH_ANGLE_PROJECTION_HORIZON
+        compatibility_wheel = projected_measured_curvature
       curvature_rate_command *= _spatial_unwind_compatibility_share(
-        curvature_rate_command, desired_angle_curvature, measured_curvature,
+        curvature_rate_command, compatibility_target, compatibility_wheel,
       )
 
     path_offset_command = _limit_attack(

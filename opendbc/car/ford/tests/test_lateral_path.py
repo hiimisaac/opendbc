@@ -409,6 +409,38 @@ def test_spatial_unwind_remains_when_wheel_is_beyond_desired_angle():
   assert command.curvature_rate < -0.0001
 
 
+def test_spatial_unwind_brakes_before_projected_wheel_crosses_moving_target():
+  controller = LatControlPath()
+
+  command = controller.update(
+    path=with_action(polynomial_model(0.01, -0.001), 0.01),
+    measured_curvature=0.012,
+    projected_measured_curvature=0.006,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert command.curvature_rate == 0.0
+
+
+def test_spatial_unwind_follows_projected_target_instead_of_braking_early():
+  controller = LatControlPath()
+
+  command = controller.update(
+    path=with_action(polynomial_model(0.01, -0.001), 0.01),
+    measured_curvature=0.012,
+    projected_measured_curvature=0.009,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    desired_angle_curvature=0.01,
+  )
+
+  assert command.curvature_rate == -0.0002
+
+
 def test_spatial_deepening_is_not_weakened_by_desired_angle_error():
   baseline_controller = LatControlPath()
   angle_feedback_controller = LatControlPath()
