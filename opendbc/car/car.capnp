@@ -370,6 +370,7 @@ struct CarControl {
       pathAngle @1: Float32;      # c1 [rad]
       curvature @2: Float32;      # c2 [1/m]
       curvatureRate @3: Float32;  # c3 [1/m^2]
+      valid @4: Bool;
     }
 
     # longitudinal commands
