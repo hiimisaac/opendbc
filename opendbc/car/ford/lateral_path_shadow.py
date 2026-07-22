@@ -19,6 +19,7 @@ PATH_C2_FADE_BP = (0.006, 0.012)
 PATH_C2_SETTLED_BP = (0.003, 0.006)
 PATH_C2_SLEW = 0.0002
 PATH_MODEL_MANEUVER_MIN = 0.003
+PATH_MODEL_GEOMETRY_FULL = 0.012
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
@@ -262,21 +263,36 @@ class LatControlPath:
     previous_command_curvature = _command_equivalent_curvature(self._last_command, PATH_C0_DISTANCE)
     model_action_disagreement = False
     preview_conflict_share = 0.0
-    coherent_model_maneuver = valid and offset_curvature * angle_curvature > 0.0 and \
-                              min(abs(offset_curvature), abs(angle_curvature)) >= PATH_MODEL_MANEUVER_MIN
+    geometry_magnitude = min(abs(offset_curvature), abs(angle_curvature))
+    geometry_demand = max(abs(offset_curvature), abs(angle_curvature))
+    geometry_is_coherent = valid and offset_curvature * angle_curvature > 0.0 and \
+                           geometry_magnitude >= PATH_MODEL_MANEUVER_MIN
+    action_opposes_geometry = offset_curvature * desired_curvature < 0.0
+    if geometry_is_coherent:
+      model_geometry_share = 1.0 if action_opposes_geometry else _interp(
+        geometry_demand, PATH_MODEL_MANEUVER_MIN, PATH_MODEL_GEOMETRY_FULL, 0.0, 1.0,
+      )
+    else:
+      model_geometry_share = 0.0
+    coherent_model_maneuver = model_geometry_share > 0.0
     if coherent_model_maneuver:
-      raw_model_target = math.copysign(min(abs(offset_curvature), abs(angle_curvature)), offset_curvature)
+      raw_model_curvature = math.copysign(geometry_magnitude, offset_curvature)
+      geometry_reference = desired_curvature if raw_model_curvature * desired_curvature >= 0.0 else 0.0
+      raw_model_target = _blend(geometry_reference, raw_model_curvature, model_geometry_share)
       if desired_angle_feedback_available:
         preview_conflict_share = _preview_conflict_share(
-          raw_model_target, desired_curvature, desired_angle_curvature, measured_curvature,
+          raw_model_curvature, desired_curvature, desired_angle_curvature, measured_curvature,
           previous_command_curvature, v_ego,
         )
       # C0 lateral placement and C1 heading are independent polynomial
-      # geometry. Preserve both instead of collapsing them to the weaker view.
+      # geometry. Introduce low-amplitude preview continuously, then preserve
+      # both instead of collapsing them to the weaker view.
       # When delivered wheel motion and desired angle agree that the preview is
       # stale, continuously fade the complete preview toward the angle target.
-      offset_model_target = _blend(offset_curvature, desired_angle_curvature, preview_conflict_share)
-      angle_model_target = _blend(angle_curvature, desired_angle_curvature, preview_conflict_share)
+      offset_model_target = _blend(geometry_reference, offset_curvature, model_geometry_share)
+      angle_model_target = _blend(geometry_reference, angle_curvature, model_geometry_share)
+      offset_model_target = _blend(offset_model_target, desired_angle_curvature, preview_conflict_share)
+      angle_model_target = _blend(angle_model_target, desired_angle_curvature, preview_conflict_share)
       model_target = _blend(raw_model_target, desired_angle_curvature, preview_conflict_share)
       angle_target = _stronger_same_direction(angle_model_target, desired_curvature)
       action_reversal = abs(desired_curvature) >= PATH_MODEL_MANEUVER_MIN and \
