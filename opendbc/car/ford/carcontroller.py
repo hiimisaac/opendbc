@@ -1,30 +1,13 @@
-import importlib
 import math
 
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG
-from opendbc.car.ford.lateral_path_controller import LateralPathController
-from opendbc.car.ford.lateral_path_state import (
-  DriverOverrideFilter,
-  FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
-  SteeringAngleProjector,
-)
+from opendbc.car.ford.lateral_path import LatControlPath, driver_steering_opposes_command, SteeringAngleProjector
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
-
-
-def _load_messaging(import_module=importlib.import_module):
-  """Load messaging when opendbc is embedded in an openpilot checkout."""
-  for module_name in ("cereal.messaging", "openpilot.cereal.messaging"):
-    try:
-      return import_module(module_name)
-    except ImportError:
-      pass
-  return None
 
 
 def lmc2_mode(lat_active: bool) -> int:
@@ -77,22 +60,10 @@ class CarController(CarControllerBase):
     self.path_offset_last = 0.0
     self.path_angle_last = 0.0
     self.curvature_rate_last = 0.0
+    self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
-    self.lateral_path_controller = LateralPathController()
+    self.lateral_path_controller = LatControlPath()
     self.steering_angle_projector = SteeringAngleProjector()
-    self.driver_override_angle_projector = SteeringAngleProjector(
-      horizon=FORD_PATH_OVERRIDE_PROJECTION_HORIZON,
-    )
-    self.driver_override_filter = DriverOverrideFilter()
-    self.model = None
-    self.model_frame = 0
-    self.sm = None
-    messaging = _load_messaging()
-    if messaging is not None and CP.flags & FordFlags.CANFD:
-      try:
-        self.sm = messaging.SubMaster(["modelV2"])
-      except Exception:
-        self.sm = None
 
     self.accel = 0.0
     self.gas = 0.0
@@ -105,12 +76,6 @@ class CarController(CarControllerBase):
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
-
-    if self.sm is not None:
-      self.sm.update(0)
-      if self.sm.updated["modelV2"]:
-        self.model = self.sm["modelV2"]
-        self.model_frame = self.frame
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -139,12 +104,14 @@ class CarController(CarControllerBase):
     curvature_rate = 0.0
     ramp_type = 3
     driver_override = False
+    cooperative_control = False
 
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
       desired_curvature = 0.0
 
       if CC.latActive:
-        desired_curvature = actuators.curvature
+        desired_curvature = (actuators.lateralPath.curvature if self.CP.flags & FordFlags.CANFD else
+                             actuators.curvature)
 
         # Bronco and some other cars consistently overshoot curvature requests.
         # Apply the same input shaping before either Ford lateral command path.
@@ -153,46 +120,35 @@ class CarController(CarControllerBase):
           desired_curvature = self.anti_overshoot_curvature_last
 
       if self.CP.flags & FordFlags.CANFD:
-        current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
-        model = self.model if (self.frame - self.model_frame) * DT_CTRL < 0.5 else None
         angle_error_deg_raw = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
-        # During an opposing override, synchronize the path to the steering
-        # angle the driver is holding. Unlike yaw/v, this remains usable at low
-        # speed and follows the driver's input without waiting for vehicle yaw.
         actual_angle_deg = CS.out.steeringAngleDeg
         projected_angle_deg = self.steering_angle_projector.update(actual_angle_deg)
-        override_projected_angle_deg = self.driver_override_angle_projector.update(actual_angle_deg)
-        driver_override = self.driver_override_filter.update(
-          CC.latActive and CS.out.steeringPressed, CS.out.steeringTorque,
-          angle_error_deg_raw, actual_angle_deg, override_projected_angle_deg,
+        driver_override = driver_steering_opposes_command(
+          CC.latActive and CS.out.steeringPressed,
+          CS.out.steeringTorque,
+          angle_error_deg_raw,
         )
-        cooperative_control = (driver_override or self.lateral_path_controller.handoff_active or
-                               self.driver_override_filter.pending)
-        wheel_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
-        path_curvature = current_curvature
-        if driver_override:
-          path_curvature = wheel_curvature
-
-        # Preserve the raw angle error for the large-turn flush. Separately
-        # project measured wheel motion before using angle error as maneuver
-        # feedback, so commands already arriving do not earn another c0 shove.
-        angle_error_deg = angle_error_deg_raw
-        angle_error_deg = math.copysign(max(abs(angle_error_deg) - FORD_PATH_UNWIND_ANGLE_DEADZONE_DEG, 0.0),
-                                        angle_error_deg)
-        angle_error_curvature = ford_curvature_from_steering_angle(self.VM, angle_error_deg, CS.out.vEgoRaw)
+        cooperative_control = driver_override
+        measured_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
         projected_wheel_curvature = ford_curvature_from_steering_angle(self.VM, projected_angle_deg, CS.out.vEgoRaw)
+        desired_angle_curvature = ford_curvature_from_steering_angle(
+          self.VM, actuators.steeringAngleDeg, CS.out.vEgoRaw,
+        )
+        path_target = actuators.lateralPath
+        if desired_curvature != path_target.curvature:
+          path_target = path_target.as_builder()
+          path_target.curvature = desired_curvature
         cmd = self.lateral_path_controller.update(
-          model, desired_curvature, path_curvature, CS.out.vEgoRaw,
+          path_target, measured_curvature, CS.out.vEgoRaw,
           CC.latActive, driver_override,
-          angle_error_curvature=angle_error_curvature,
-          wheel_curvature=wheel_curvature,
-          projected_wheel_curvature=projected_wheel_curvature,
-          hold_command=self.driver_override_filter.pending,
+          projected_measured_curvature=projected_wheel_curvature,
+          desired_angle_curvature=desired_angle_curvature,
         )
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle
         path_offset = cmd.path_offset
+        self.path_valid_last = cmd.valid
       elif CC.latActive:
         current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
         # Preserve upstream's curvature error and ISO lateral jerk limits for
@@ -290,6 +246,7 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.curvature = self.apply_curvature_last
+    new_actuators.lateralPath.valid = self.path_valid_last
     new_actuators.lateralPath.pathOffset = self.path_offset_last
     new_actuators.lateralPath.pathAngle = self.path_angle_last
     new_actuators.lateralPath.curvature = self.apply_curvature_last
