@@ -1,13 +1,30 @@
 import math
+
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
+from opendbc.car.ford.lateral_path import LatControlPath, driver_steering_opposes_command, SteeringAngleProjector
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
+from opendbc.car.vehicle_model import VehicleModel
+
+
+def lmc2_mode(lat_active: bool) -> int:
+  return 2 if lat_active else 0
+
+
+def lmc2_precision(cooperative_control: bool) -> int:
+  return 0 if cooperative_control else 1
+
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
+
+def ford_curvature_from_steering_angle(VM, steering_angle_deg: float, v_ego: float) -> float:
+  """Convert steering-wheel angle to Ford's opposite-sign curvature."""
+  return -float(VM.calc_curvature(math.radians(steering_angle_deg), v_ego, 0.0))
+
 
 def anti_overshoot(apply_curvature, apply_curvature_last, v_ego):
   diff = 0.1
@@ -37,9 +54,17 @@ class CarController(CarControllerBase):
     super().__init__(dbc_names, CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.CAN = fordcan.CanBus(CP)
+    self.VM = VehicleModel(CP)
 
     self.apply_curvature_last = 0
+    self.path_offset_last = 0.0
+    self.path_angle_last = 0.0
+    self.curvature_rate_last = 0.0
+    self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
+    self.lateral_path_controller = LatControlPath()
+    self.steering_angle_projector = SteeringAngleProjector()
+
     self.accel = 0.0
     self.gas = 0.0
     self.brake_request = False
@@ -73,35 +98,82 @@ class CarController(CarControllerBase):
 
     ### lateral control ###
     # send steer msg at 20Hz
-    if (self.frame % CarControllerParams.STEER_STEP) == 0:
-      # Bronco and some other cars consistently overshoot curv requests
-      # Apply some deadzone + smoothing convergence to avoid oscillations
-      if self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
-        self.anti_overshoot_curvature_last = anti_overshoot(actuators.curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
-        apply_curvature = self.anti_overshoot_curvature_last
-      else:
-        apply_curvature = actuators.curvature
+    apply_curvature = 0.0
+    path_angle = 0.0
+    path_offset = 0.0
+    curvature_rate = 0.0
+    ramp_type = 3
+    driver_override = False
+    cooperative_control = False
 
-      # apply rate limits, curvature error limit, and clip to signal range
-      current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
-      # No blending at low speed due to lack of torque wind-up and inaccurate current curvature
-      if CS.out.vEgoRaw > 9:
-        apply_curvature = float(np.clip(apply_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
-                                        current_curvature + CarControllerParams.CURVATURE_ERROR))
-      apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(apply_curvature, self.apply_curvature_last, CS.out.vEgoRaw,
-                                                                          0., CC.latActive, CarControllerParams.STEER_STEP)
-      self.apply_curvature_last = apply_curvature
+    if (self.frame % CarControllerParams.STEER_STEP) == 0:
+      desired_curvature = 0.0
+
+      if CC.latActive:
+        desired_curvature = (actuators.lateralPath.curvature if self.CP.flags & FordFlags.CANFD else
+                             actuators.curvature)
+
+        # Bronco and some other cars consistently overshoot curvature requests.
+        # Apply the same input shaping before either Ford lateral command path.
+        if self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
+          self.anti_overshoot_curvature_last = anti_overshoot(desired_curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
+          desired_curvature = self.anti_overshoot_curvature_last
 
       if self.CP.flags & FordFlags.CANFD:
-        # TODO: extended mode
-        # Ford uses four individual signals to dictate how to drive to the car. Curvature alone (limited to 0.02 m^-1)
-        # can actuate the steering for a large portion of any lateral movements. However, in order to get further control on
-        # steer actuation, the other three signals are necessary. Ford controls vehicles differently than most other makes.
-        # A detailed explanation on ford control can be found here:
-        # https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
-        mode = 1 if CC.latActive else 0
+        angle_error_deg_raw = actuators.steeringAngleDeg - CS.out.steeringAngleDeg
+        actual_angle_deg = CS.out.steeringAngleDeg
+        projected_angle_deg = self.steering_angle_projector.update(actual_angle_deg)
+        driver_override = driver_steering_opposes_command(
+          CC.latActive and CS.out.steeringPressed,
+          CS.out.steeringTorque,
+          angle_error_deg_raw,
+        )
+        cooperative_control = driver_override
+        measured_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
+        projected_wheel_curvature = ford_curvature_from_steering_angle(self.VM, projected_angle_deg, CS.out.vEgoRaw)
+        desired_angle_curvature = ford_curvature_from_steering_angle(
+          self.VM, actuators.steeringAngleDeg, CS.out.vEgoRaw,
+        )
+        path_target = actuators.lateralPath
+        if desired_curvature != path_target.curvature:
+          path_target = path_target.as_builder()
+          path_target.curvature = desired_curvature
+        cmd = self.lateral_path_controller.update(
+          path_target, measured_curvature, CS.out.vEgoRaw,
+          CC.latActive, driver_override,
+          projected_measured_curvature=projected_wheel_curvature,
+          desired_angle_curvature=desired_angle_curvature,
+        )
+        apply_curvature = cmd.curvature
+        curvature_rate = cmd.curvature_rate
+        path_angle = cmd.path_angle
+        path_offset = cmd.path_offset
+        self.path_valid_last = cmd.valid
+      elif CC.latActive:
+        current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
+        # Preserve upstream's curvature error and ISO lateral jerk limits for
+        # non-CAN FD Ford platforms. CAN FD uses the bounded LMC2 polynomial.
+        if CS.out.vEgoRaw > 9:
+          desired_curvature = float(np.clip(desired_curvature, current_curvature - CarControllerParams.CURVATURE_ERROR,
+                                            current_curvature + CarControllerParams.CURVATURE_ERROR))
+        apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(
+          desired_curvature, self.apply_curvature_last, CS.out.vEgoRaw,
+          0., CC.latActive, CarControllerParams.STEER_STEP,
+        )
+
+      self.apply_curvature_last = apply_curvature
+      self.path_offset_last = path_offset
+      self.path_angle_last = path_angle
+      self.curvature_rate_last = curvature_rate
+
+      if self.CP.flags & FordFlags.CANFD:
+        mode = lmc2_mode(CC.latActive)
+        precision = lmc2_precision(cooperative_control)
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
-        can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
+        can_sends.append(fordcan.create_lat_ctl2_msg(
+          self.packer, self.CAN, mode, ramp_type, precision, -path_offset, -path_angle,
+          -apply_curvature, -curvature_rate, counter
+        ))
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
 
@@ -174,6 +246,11 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.curvature = self.apply_curvature_last
+    new_actuators.lateralPath.valid = self.path_valid_last
+    new_actuators.lateralPath.pathOffset = self.path_offset_last
+    new_actuators.lateralPath.pathAngle = self.path_angle_last
+    new_actuators.lateralPath.curvature = self.apply_curvature_last
+    new_actuators.lateralPath.curvatureRate = self.curvature_rate_last
     new_actuators.accel = self.accel
     new_actuators.gas = self.gas
 

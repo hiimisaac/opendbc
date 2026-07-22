@@ -366,6 +366,15 @@ struct CarControl {
     torque @2: Float32;  # [0.0, 1.0]
     steeringAngleDeg @3: Float32;
     curvature @7: Float32;
+    lateralPath @9: LateralPath;
+
+    struct LateralPath {
+      pathOffset @0: Float32;     # c0 [m]
+      pathAngle @1: Float32;      # c1 [rad]
+      curvature @2: Float32;      # c2 [1/m]
+      curvatureRate @3: Float32;  # c3 [1/m^2]
+      valid @4: Bool;
+    }
 
     # longitudinal commands
     accel @4: Float32;  # m/s^2
@@ -653,6 +662,7 @@ struct CarParams {
     torque @0;
     angle @1;
     curvature @2;
+    path @3;
   }
 
   enum TransmissionType {

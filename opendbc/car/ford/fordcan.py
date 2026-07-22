@@ -1,6 +1,18 @@
+import math
+
 from opendbc.car import CanBusBase, structs
 
 HUDControl = structs.CarControl.HUDControl
+
+LMC2_CURVATURE_RATE_MIN = -0.001024
+LMC2_CURVATURE_RATE_MAX = 0.001023
+
+
+def lmc2_curvature_rate_for_can(curvature_rate: float) -> float:
+  """Saturate only at the signed 11-bit signal boundary to prevent wrapping."""
+  if not math.isfinite(curvature_rate):
+    return 0.0
+  return min(max(curvature_rate, LMC2_CURVATURE_RATE_MIN), LMC2_CURVATURE_RATE_MAX)
 
 
 class CanBus(CanBusBase):
@@ -85,8 +97,9 @@ def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, path_offset: float
   return packer.make_can_msg("LateralMotionControl", CAN.main, values)
 
 
-def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, path_offset: float, path_angle: float, curvature: float,
-                        curvature_rate: float, counter: int):
+def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, ramp_type: int = 0, precision: int = 1,
+                        path_offset: float = 0., path_angle: float = 0., curvature: float = 0.,
+                        curvature_rate: float = 0., counter: int = 0):
   """
   Create a CAN message for the new Ford Lane Centering command.
 
@@ -99,12 +112,12 @@ def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, path_offset: float, path
   values = {
     "LatCtl_D2_Rq": mode,                       # Mode: 0=None, 1=PathFollowingLimitedMode, 2=PathFollowingExtendedMode,
                                                 #       3=SafeRampOut, 4-7=NotUsed [0|7]
-    "LatCtlRampType_D_Rq": 0,                   # 0=Slow, 1=Medium, 2=Fast, 3=Immediate [0|3]
-    "LatCtlPrecision_D_Rq": 1,                  # 0=Comfortable, 1=Precise, 2/3=NotUsed [0|3]
+    "LatCtlRampType_D_Rq": ramp_type,           # 0=Slow, 1=Medium, 2=Fast, 3=Immediate [0|3]
+    "LatCtlPrecision_D_Rq": precision,           # 0=Comfortable, 1=Precise, 2/3=NotUsed [0|3]
     "LatCtlPathOffst_L_Actl": path_offset,      # [-5.12|5.11] meter
     "LatCtlPath_An_Actl": path_angle,           # [-0.5|0.5235] radians
     "LatCtlCurv_No_Actl": curvature,            # [-0.02|0.02094] 1/meter
-    "LatCtlCrv_NoRate2_Actl": curvature_rate,   # [-0.001024|0.001023] 1/meter^2
+    "LatCtlCrv_NoRate2_Actl": lmc2_curvature_rate_for_can(curvature_rate),  # [-0.001024|0.001023] 1/meter^2
     "HandsOffCnfm_B_Rq": 0,                     # 0=Inactive, 1=Active [0|1]
     "LatCtlPath_No_Cnt": counter,               # [0|15]
     "LatCtlPath_No_Cs": 0,                      # [0|255]

@@ -7,6 +7,7 @@ import opendbc.safety.tests.common as common
 from opendbc.car.lateral import MAX_LATERAL_ACCEL, MAX_LATERAL_JERK
 from opendbc.car.ford.values import FordSafetyFlags
 from opendbc.car.structs import CarParams
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import CANPackerSafety
 
@@ -169,7 +170,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   # LCA command
   def _lat_ctl_msg(self, enabled: bool, path_offset: float, path_angle: float, curvature: float, curvature_rate: float,
-                   increment_timer: bool = True):
+                   increment_timer: bool = True, mode: int | None = None):
     if increment_timer:
       self.safety.set_timer(self.cnt_lat_ctl * int(1e6 / self.LATERAL_FREQUENCY))
       self.__class__.cnt_lat_ctl += 1
@@ -184,7 +185,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
       return self.packer.make_can_msg_safety("LateralMotionControl", 0, values)
     elif self.STEER_MESSAGE == MSG_LateralMotionControl2:
       values = {
-        "LatCtl_D2_Rq": 1 if enabled else 0,
+        "LatCtl_D2_Rq": (2 if enabled else 0) if mode is None else mode,
         "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
         "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
         "LatCtlCrv_NoRate2_Actl": curvature_rate,  # Curvature rate [-0.001024|0.001023] 1/meter^2
@@ -256,6 +257,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
         self.assertEqual(self.safety.get_curvature_meas_max(), 0)
 
   def test_max_lateral_acceleration(self):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
+
     # Ford CAN FD can achieve a higher max lateral acceleration than CAN so we limit curvature based on speed
     max_curvature_can = round(self.MAX_CURVATURE * self.DEG_TO_CAN)
     for speed in np.arange(0, 40, 0.5):
@@ -274,14 +278,13 @@ class TestFordSafetyBase(common.CarSafetyTest):
           self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(True, 0, 0, signed_curvature, 0)))
 
   def test_steer_allowed(self):
-    path_offsets = np.arange(-5.12, 5.11, 2.5).round()
-    path_angles = np.arange(-0.5, 0.5235, 0.25).round(1)
+    path_offsets = [-5.12, -5.11, -2.5, 0., 2.5, 5.1, 5.11]
+    path_angles = [-0.5, -0.4995, -0.25, 0., 0.25, 0.523, 0.5235]
     curvature_rates = np.arange(-0.001024, 0.00102375, 0.001).round(3)
     curvatures = np.arange(-0.02, 0.02094, 0.01).round(2)
 
     for speed in (self.CURVATURE_ERROR_MIN_SPEED - 1,
                   self.CURVATURE_ERROR_MIN_SPEED + 1):
-      max_curvature_can = self._get_max_curvature_can(speed)
       for controls_allowed in (True, False):
         for steer_control_enabled in (True, False):
           for path_offset in path_offsets:
@@ -292,19 +295,57 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   self._set_prev_desired_angle(curvature)
                   self._reset_curvature_measurement(curvature, speed)
 
-                  should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
+                  # CAN FD lightweight path mode allows bounded c0/c1/c2 and the full encoded c3 range;
+                  # non-CAN FD requires c0/c1/c3 inactive.
+                  if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+                    should_tx = -0.5 <= path_angle <= 0.5235
+                    should_tx = should_tx and -5.12 <= path_offset <= 5.11
+                    should_tx = should_tx and -0.02 <= curvature <= 0.02
+                    if steer_control_enabled:
+                      should_tx = should_tx and controls_allowed
+                    else:
+                      should_tx = should_tx and path_angle == 0 and path_offset == 0 and curvature == 0 and curvature_rate == 0
+                  else:
+                    should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
+
                   # when request bit is 0, only allow curvature of 0 since the signal range
                   # is not large enough to enforce it tracking measured
                   should_tx = should_tx and (controls_allowed if steer_control_enabled else curvature == 0)
-                  should_tx = should_tx and abs(round(curvature * self.DEG_TO_CAN)) <= max_curvature_can
 
                   with self.subTest(controls_allowed=controls_allowed, steer_control_enabled=steer_control_enabled,
                                     path_offset=float(path_offset), path_angle=float(path_angle), curvature_rate=float(curvature_rate),
                                     curvature=float(curvature)):
                     self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(steer_control_enabled, path_offset, path_angle, curvature, curvature_rate)))
 
+  def test_canfd_path_mode(self):
+    if self.STEER_MESSAGE != MSG_LateralMotionControl2:
+      self.skipTest("CAN FD only")
+
+    for controls_allowed in (True, False):
+      for mode in range(8):
+        self.safety.set_controls_allowed(controls_allowed)
+        path_offset = 0.5 if mode == 2 else 0.
+        path_angle = 0.1 if mode == 2 else 0.
+        should_tx = mode == 0 or (mode == 2 and controls_allowed)
+        self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(mode == 2, path_offset, path_angle, 0., 0., mode=mode)))
+
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._lat_ctl_msg(False, 0.5, 0.1, 0., 0., mode=0)))
+    # Lightweight path mode allows bounded c2 and the full encoded c3 range.
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., 0.01, 0., mode=2)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., -0.02, 0., mode=2)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., 0., 0.001, mode=2)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., 0., -0.001024, mode=2)))
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0., 0., 0., 0.001023, mode=2)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True, 0., 0., 0.02094, 0., mode=2)))
+    # non-zero c2/c3 must still be inactive when not enabled
+    self.assertFalse(self._tx(self._lat_ctl_msg(False, 0., 0., 0.01, 0., mode=0)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(False, 0., 0., 0., 0.001, mode=0)))
+
   def test_curvature_rate_limits(self):
     """Curvature command must satisfy the ISO 11270 lateral jerk limit per frame."""
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode uses c2 as a memory pump")
     self.safety.set_controls_allowed(True)
     max_encoded_can = int(self.MAX_CURVATURE * self.DEG_TO_CAN)
 
@@ -328,6 +369,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
           self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(True, 0, 0, sign * (base_can + delta_can) / self.DEG_TO_CAN, 0)))
 
   def test_curvature_error_limits(self):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode composes bounded polynomial coefficients")
+
     # above CURVATURE_ERROR_MIN_SPEED, command must be within max_curvature_error of measured, below the check is skipped
     self.safety.set_controls_allowed(True)
     max_error_can = round(self.MAX_CURVATURE_ERROR * self.DEG_TO_CAN)
@@ -348,6 +392,9 @@ class TestFordSafetyBase(common.CarSafetyTest):
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, (max_error_can + 2) / self.DEG_TO_CAN, 0)))
 
   def test_curvature_violation(self):
+    if self.STEER_MESSAGE == MSG_LateralMotionControl2:
+      self.skipTest("CAN FD path mode composes bounded polynomial coefficients")
+
     # If violation occurs, curvature cmd is blocked until reset to 0
     self.safety.set_controls_allowed(True)
     speed = 25.
@@ -527,6 +574,174 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
     self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD)
     self.safety.init_tests()
+
+
+class TestFordCANFDMadsSafety(common.SafetyTestBase):
+  def setUp(self):
+    self.packer = CANPackerSafety("ford_lincoln_base_pt")
+    self.safety = libsafety_py.libsafety
+    self._configure_safety(FordSafetyFlags.CANFD | FordSafetyFlags.LONG_CONTROL)
+
+  def _configure_safety(self, flags: int):
+    self.flags = flags
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, flags)
+    self.safety.init_tests()
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.ford, flags)
+    self.safety.set_heartbeat_engaged(True)
+    self.cnt_speed = 0
+    self.cnt_speed_2 = 0
+    self.cnt_yaw = 0
+
+  def _main_status_msg(self, state: int, brake: bool = False):
+    return self.packer.make_can_msg_safety("EngBrakeData", 0, {
+      "BpedDrvAppl_D_Actl": 2 if brake else 1,
+      "CcStat_D_Actl": state,
+    })
+
+  def _prime_rx_checks(self, cruise_state: int):
+    messages = (
+      self.packer.make_can_msg_safety("BrakeSysFeatures", 0, {
+        "Veh_V_ActlBrk": 0,
+        "VehVActlBrk_D_Qf": 3,
+        "VehVActlBrk_No_Cnt": self.cnt_speed,
+      }, fix_checksum=checksum),
+      self.packer.make_can_msg_safety("EngVehicleSpThrottle2", 0, {
+        "Veh_V_ActlEng": 0,
+        "VehVActlEng_D_Qf": 3,
+        "VehVActlEng_No_Cnt": self.cnt_speed_2,
+      }, fix_checksum=checksum),
+      self.packer.make_can_msg_safety("Yaw_Data_FD1", 0, {
+        "VehYaw_W_Actl": 0,
+        "VehYawWActl_D_Qf": 3,
+        "VehRollYaw_No_Cnt": self.cnt_yaw,
+      }, fix_checksum=checksum),
+      self._main_status_msg(cruise_state),
+      self.packer.make_can_msg_safety("EngVehicleSpThrottle", 0, {"ApedPos_Pc_ActlArb": 0}),
+      self.packer.make_can_msg_safety("DesiredTorqBrk", 0, {"VehStop_D_Stat": 1}),
+    )
+    for msg in messages:
+      self._rx(msg)
+    self.safety.safety_tick_current_safety_config()
+    self._rx(self._main_status_msg(cruise_state))
+
+  def _lat_ctl_msg(self, enabled: bool):
+    if self.flags & FordSafetyFlags.CANFD:
+      return self.packer.make_can_msg_safety("LateralMotionControl2", 0, {
+        "LatCtl_D2_Rq": 2 if enabled else 0,
+        "LatCtlPathOffst_L_Actl": 0,
+        "LatCtlPath_An_Actl": 0,
+        "LatCtlCrv_NoRate2_Actl": 0,
+        "LatCtlCurv_No_Actl": 0,
+      })
+    return self.packer.make_can_msg_safety("LateralMotionControl", 0, {
+      "LatCtl_D_Rq": 1 if enabled else 0,
+      "LatCtlPathOffst_L_Actl": 0,
+      "LatCtlPath_An_Actl": 0,
+      "LatCtlCurv_NoRate_Actl": 0,
+      "LatCtlCurv_No_Actl": 0,
+    })
+
+  def _acc_command_msg(self, gas: float):
+    return self.packer.make_can_msg_safety("ACCDATA", 0, {
+      "AccPrpl_A_Rq": gas,
+      "AccPrpl_A_Pred": gas,
+      "AccBrkTot_A_Rq": 0,
+      "AccBrkPrchg_B_Rq": 0,
+      "AccBrkDecel_B_Rq": 0,
+      "CmbbDeny_B_Actl": 0,
+    })
+
+  def test_main_available_authorizes_lateral_without_longitudinal(self):
+    self._prime_rx_checks(3)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_lateral_only_allows_steering_but_blocks_longitudinal(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_acc_engaged_authorizes_lateral_and_longitudinal(self):
+    self._prime_rx_checks(5)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertTrue(self._tx(self._acc_command_msg(0.1)))
+
+  def test_main_off_revokes_both_authorizations(self):
+    self._prime_rx_checks(5)
+    self._rx(self._main_status_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_cold_start_requires_complete_rx_checks(self):
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_stale_safety_rx_revokes_and_cannot_reauthorize_lateral(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self.safety.set_timer(2_000_000)
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_disengaged_heartbeat_blocks_lateral_authorization(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self.safety.set_heartbeat_engaged(False)
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_brake_disengages_longitudinal_but_keeps_lateral_with_main_on(self):
+    self._prime_rx_checks(5)
+    self._rx(self._main_status_msg(3, brake=True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self._tx(self._acc_command_msg(0.1)))
+
+  def test_invalid_safety_rx_revokes_lateral(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    invalid_speed = self.packer.make_can_msg_safety("BrakeSysFeatures", 0, {
+      "Veh_V_ActlBrk": 0,
+      "VehVActlBrk_D_Qf": 0,
+      "VehVActlBrk_No_Cnt": 1,
+    }, fix_checksum=checksum)
+    self.assertFalse(self._rx(invalid_speed))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_fault_and_unavailable_cruise_states_do_not_authorize_lateral(self):
+    self._prime_rx_checks(3)
+    for cruise_state in (0, 1, 2, 6, 7):
+      self._rx(self._main_status_msg(cruise_state))
+      self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_mads_alternative_experience_is_required(self):
+    self._prime_rx_checks(3)
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.DEFAULT)
+    self._rx(self._main_status_msg(3))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_lateral_only_authorization_supports_all_ford_safety_configs(self):
+    for flags in (0, FordSafetyFlags.CANFD, FordSafetyFlags.CANFD | FordSafetyFlags.LONG_CONTROL):
+      with self.subTest(flags=flags):
+        self._configure_safety(flags)
+        self._prime_rx_checks(3)
+        self.assertTrue(self.safety.get_controls_allowed_lateral())
+        self.assertTrue(self._tx(self._lat_ctl_msg(True)))
 
 
 if __name__ == "__main__":
