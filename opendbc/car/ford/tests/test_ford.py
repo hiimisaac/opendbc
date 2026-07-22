@@ -1,5 +1,6 @@
 import math
 import random
+from types import SimpleNamespace
 import unittest
 
 from hypothesis import settings, given, strategies as st
@@ -7,7 +8,9 @@ from hypothesis import settings, given, strategies as st
 from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
-from opendbc.car.ford.values import CAR, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
+from opendbc.car.ford.carcontroller import CarController
+from opendbc.car.ford.lateral_path import LateralPathCommand
+from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import parameterized
 
@@ -62,6 +65,57 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(actuators.lateralPath.pathAngle, -0.2, rel_tol=1e-6)
     assert math.isclose(actuators.lateralPath.curvature, 0.01, rel_tol=1e-6)
     assert math.isclose(actuators.lateralPath.curvatureRate, -0.0004, rel_tol=1e-6)
+
+  def test_canfd_controller_consumes_lateral_path_actuator(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    controller.frame = CarControllerParams.STEER_STEP
+
+    class RecordingPathController:
+      def __init__(self):
+        self.path = None
+
+      def update(self, path, *args, **kwargs):
+        self.path = path
+        return LateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
+
+    path_controller = RecordingPathController()
+    controller.lateral_path_controller = path_controller
+
+    CC = CarControl(latActive=True)
+    CC.actuators.steeringAngleDeg = 10.0
+    CC.actuators.lateralPath.valid = True
+    CC.actuators.lateralPath.pathOffset = 0.4
+    CC.actuators.lateralPath.pathAngle = 0.1
+    CC.actuators.lateralPath.curvature = 0.01
+    CC.actuators.lateralPath.curvatureRate = 0.0002
+    CC.hudControl.leadDistanceBars = 0
+
+    CS = SimpleNamespace(
+      out=SimpleNamespace(
+        cruiseState=SimpleNamespace(available=False, standstill=False),
+        steeringAngleDeg=0.0,
+        steeringPressed=False,
+        steeringTorque=0.0,
+        vEgoRaw=7.0,
+        vEgo=7.0,
+        yawRate=0.0,
+      ),
+      buttons_stock_values={},
+      acc_tja_status_stock_values={"Tja_D_Stat": 0},
+      lkas_status_stock_values={},
+    )
+    controller.lkas_enabled_last = True
+    controller.lead_distance_bars_last = 0
+
+    output, can_sends = controller.update(CC.as_reader(), CS, 0)
+
+    assert path_controller.path is not None
+    assert math.isclose(path_controller.path.pathOffset, 0.4, rel_tol=1e-6)
+    assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
+    assert len(can_sends) == 1
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
