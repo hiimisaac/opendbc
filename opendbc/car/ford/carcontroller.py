@@ -4,7 +4,8 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import LatControlPath, driver_steering_opposes_command, SteeringAngleProjector
+from opendbc.car.ford.lateral_path import driver_steering_opposes_command, SteeringAngleProjector
+from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -62,7 +63,7 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
-    self.lateral_path_controller = LatControlPath()
+    self.lateral_path_controller = ProjectedLatControlPath()
     self.steering_angle_projector = SteeringAngleProjector()
 
     self.accel = 0.0
