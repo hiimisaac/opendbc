@@ -179,6 +179,25 @@ def _command_equivalent_curvature(command: LateralPathCommand, distance: float) 
   return 2.0 * path_offset / distance ** 2
 
 
+def _preserve_model_direction(path_offset: float, path_angle: float, curvature: float,
+                              curvature_rate: float, model_curvature: float) -> float:
+  """Use C0 to keep a meaningful model path from crossing through zero."""
+  command = LateralPathCommand(
+    valid=True,
+    path_offset=path_offset,
+    path_angle=path_angle,
+    curvature=curvature,
+    curvature_rate=curvature_rate,
+  )
+  command_curvature = _command_equivalent_curvature(command, PATH_MIN_LOOKAHEAD)
+  if model_curvature * command_curvature >= 0.0:
+    return path_offset
+
+  guarded_curvature = math.copysign(PATH_TRACKING_ERROR_DEADZONE, model_curvature)
+  correction = 0.5 * (guarded_curvature - command_curvature) * PATH_MIN_LOOKAHEAD ** 2
+  return _clip(path_offset + correction, PATH_C0_LIMITS)
+
+
 def _preview_conflict_share(model_target: float, desired_curvature: float,
                             desired_angle_curvature: float, measured_curvature: float,
                             previous_command_curvature: float, v_ego: float) -> float:
@@ -270,18 +289,42 @@ class LatControlPath:
     preview_conflict_share = 0.0
     geometry_magnitude = min(abs(offset_curvature), abs(angle_curvature))
     geometry_demand = max(abs(offset_curvature), abs(angle_curvature))
-    geometry_is_coherent = valid and offset_curvature * angle_curvature > 0.0 and \
-                           geometry_magnitude >= PATH_MODEL_MANEUVER_MIN
+    # C0 placement and C1 heading remain coherent when they agree on direction.
+    # Requiring both views to clear the maneuver threshold created a turn-exit
+    # cliff: one fading term could discard the complete, still-valid polynomial.
+    geometry_is_coherent = valid and offset_curvature * angle_curvature > 0.0
+    model_command = LateralPathCommand(
+      valid=valid,
+      path_offset=path_offset,
+      path_angle=path_angle,
+      curvature=desired_curvature,
+      curvature_rate=spatial_curvature_rate,
+    )
+    model_equivalent_curvature = _command_equivalent_curvature(model_command, PATH_MIN_LOOKAHEAD)
+    geometry_equivalent_curvature = offset_curvature + 2.0 * path_angle / PATH_MIN_LOOKAHEAD
+    desired_angle_error = desired_angle_curvature - measured_curvature
+    strong_angle_rejection = desired_angle_feedback_available and \
+                             desired_angle_error * model_equivalent_curvature < 0.0 and \
+                             abs(desired_angle_error) >= PATH_PREVIEW_CONFLICT_BP[1] and \
+                             v_ego >= PATH_PREVIEW_CONFLICT_SPEED_BP[1]
+    delivered_model_exit = geometry_is_coherent and \
+                           abs(geometry_equivalent_curvature) > PATH_MODEL_MANEUVER_MIN and \
+                           model_equivalent_curvature * geometry_equivalent_curvature > 0.0 and \
+                           measured_curvature * geometry_equivalent_curvature > 0.0 and \
+                           abs(measured_curvature) >= PATH_TRACKING_ERROR_DEADZONE and \
+                           not strong_angle_rejection
     action_opposes_geometry = offset_curvature * desired_curvature < 0.0
     if geometry_is_coherent:
+      model_geometry_demand = max(geometry_demand, abs(geometry_equivalent_curvature)) if delivered_model_exit else geometry_demand
       model_geometry_share = 1.0 if action_opposes_geometry else _interp(
-        geometry_demand, PATH_MODEL_MANEUVER_MIN, PATH_MODEL_GEOMETRY_FULL, 0.0, 1.0,
+        model_geometry_demand, PATH_MODEL_MANEUVER_MIN, PATH_MODEL_GEOMETRY_FULL, 0.0, 1.0,
       )
     else:
       model_geometry_share = 0.0
     coherent_model_maneuver = model_geometry_share > 0.0
     if coherent_model_maneuver:
-      raw_model_curvature = math.copysign(geometry_magnitude, offset_curvature)
+      raw_model_curvature = geometry_equivalent_curvature if delivered_model_exit else \
+                            math.copysign(geometry_magnitude, offset_curvature)
       geometry_reference = desired_curvature if raw_model_curvature * desired_curvature >= 0.0 else 0.0
       raw_model_target = _blend(geometry_reference, raw_model_curvature, model_geometry_share)
       if desired_angle_feedback_available:
@@ -409,6 +452,13 @@ class LatControlPath:
       self._last_command.curvature_rate,
       PATH_C3_SLEW,
     )
+
+    meaningful_model_geometry = delivered_model_exit and preview_conflict_share < 1.0
+    if meaningful_model_geometry:
+      path_offset_command = _preserve_model_direction(
+        path_offset_command, path_angle_command, curvature, curvature_rate_command,
+        model_equivalent_curvature,
+      )
 
     command = LateralPathCommand(
       valid=valid,
