@@ -1,4 +1,4 @@
-"""Constrained Ford LMC2 polynomial projection controller."""
+"""Coherent Ford LMC2 polynomial controller."""
 
 from __future__ import annotations
 
@@ -13,20 +13,20 @@ PATH_LIMITS = (
   (-0.001024, 0.001023),
 )
 PATH_MIN_LOOKAHEAD = 7.0
-PATH_PROJECTION_DISTANCES = (3.0, 7.0, 15.0, 30.0)
-PATH_PROJECTION_SCALES = (4.6, 0.5, 0.02, 0.001)
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
 PATH_C2_SLEW = 0.0002
 PATH_C3_SLEW = 0.0002
-PATH_PROJECTION_ITERATIONS = 96
 PATH_C2_FADE_BP = (0.006, 0.012)
 PATH_C2_SETTLED_BP = (0.003, 0.006)
 PATH_PREVIEW_BP = (0.003, 0.012)
-PATH_STALE_PREVIEW_ERROR = 0.012
-PATH_STALE_PREVIEW_SPEED = 3.0
+PATH_C0_BP = (0.003, 0.006)
+PATH_TRACKING_ERROR_DEADZONE = 0.0005
+PATH_C0_TRACKING_ERROR_LIMIT = 0.02
+PATH_C1_TRACKING_ERROR_LIMIT = 0.012
+PATH_UNWIND_ERROR_DEADZONE = 0.0005
+PATH_UNWIND_LIMIT = 0.006
 PATH_C3_UNWIND_ERROR_BP = (0.0005, 0.002)
 PATH_C3_UNWIND_TARGET_MIN = 0.003
-PATH_MODEL_MANEUVER_MIN = 0.003
 PATH_DIRECTION_MARGIN = 0.0005
 
 
@@ -59,6 +59,14 @@ def _interp(value: float, lower: float, upper: float, lower_value: float, upper_
   return lower_value + alpha * (upper_value - lower_value)
 
 
+def _deadzone(value: float, deadzone: float) -> float:
+  return math.copysign(max(abs(value) - deadzone, 0.0), value)
+
+
+def _blend(first: float, second: float, second_share: float) -> float:
+  return first + _clip(second_share, (0.0, 1.0)) * (second - first)
+
+
 def _limit_attack(value: float, last: float, max_step: float) -> float:
   if value * last < 0.0:
     return math.copysign(min(abs(value), max_step), value)
@@ -71,9 +79,6 @@ def _basis(distance: float) -> tuple[float, float, float, float]:
   return 2.0 / distance ** 2, 2.0 / distance, 1.0, distance / 3.0
 
 
-PROJECTION_BASIS = tuple(_basis(distance) for distance in PATH_PROJECTION_DISTANCES)
-
-
 def _attack_bounds(last: float, step: float, limits: tuple[float, float]) -> tuple[float, float]:
   if last > 0.0:
     return max(limits[0], -step), min(limits[1], last + step)
@@ -82,42 +87,116 @@ def _attack_bounds(last: float, step: float, limits: tuple[float, float]) -> tup
   return max(limits[0], -step), min(limits[1], step)
 
 
-def _project_coefficients(target: tuple[float, float, float, float],
-                          bounds: tuple[tuple[float, float], ...]) -> tuple[float, float, float, float]:
-  """Solve a four-variable box-constrained polynomial least-squares problem."""
-  scaled_basis = tuple(
-    tuple(row[i] * PATH_PROJECTION_SCALES[i] for i in range(4))
-    for row in PROJECTION_BASIS
-  )
-  target_samples = tuple(sum(row[i] * target[i] for i in range(4)) for row in PROJECTION_BASIS)
-  hessian = tuple(
-    tuple(sum(row[i] * row[j] for row in scaled_basis) for j in range(4))
-    for i in range(4)
-  )
-  gradient = tuple(
-    sum(scaled_basis[row][i] * target_samples[row] for row in range(4))
-    for i in range(4)
-  )
-  scaled_bounds = tuple(
-    (bounds[i][0] / PATH_PROJECTION_SCALES[i], bounds[i][1] / PATH_PROJECTION_SCALES[i])
-    for i in range(4)
-  )
-  values = [
-    _clip(target[i] / PATH_PROJECTION_SCALES[i], scaled_bounds[i])
-    for i in range(4)
-  ]
-
-  for _ in range(PATH_PROJECTION_ITERATIONS):
-    for i in range(4):
-      residual = gradient[i] - sum(hessian[i][j] * values[j] for j in range(4) if j != i)
-      values[i] = _clip(residual / hessian[i][i], scaled_bounds[i])
-
-  return tuple(values[i] * PATH_PROJECTION_SCALES[i] for i in range(4))
-
-
 def _equivalent_curvature(coefficients: tuple[float, float, float, float], distance: float = 7.0) -> float:
   basis = _basis(distance)
   return sum(basis[i] * coefficients[i] for i in range(4))
+
+
+def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
+  """Whether the target asks to leave the wheel's currently delivered arc."""
+  return target * measured_curvature <= 0.0 or \
+         abs(target) + PATH_UNWIND_ERROR_DEADZONE < abs(measured_curvature)
+
+
+def _undertracking_correction(target: float, measured_curvature: float, limit: float) -> float:
+  """Add authority only while the delivered wheel remains behind the target."""
+  tracking_error = target - measured_curvature
+  if tracking_error * target <= 0.0:
+    return 0.0
+  return _clip(
+    _deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE),
+    (-limit, limit),
+  )
+
+
+def _unwind_target(target: float, measured_curvature: float) -> float:
+  """Move a delivered target toward zero without crossing its model direction."""
+  corrected = target + _clip(
+    _deadzone(target - measured_curvature, PATH_UNWIND_ERROR_DEADZONE),
+    (-PATH_UNWIND_LIMIT, PATH_UNWIND_LIMIT),
+  )
+  return 0.0 if corrected * target < 0.0 else corrected
+
+
+def _compose_path_target(raw_target: tuple[float, float, float, float],
+                         measured_curvature: float, desired_angle_curvature: float,
+                         v_ego: float, valid: bool,
+                         allocated_c2: float, allocated_c3: float) \
+                         -> tuple[tuple[float, float, float, float], float, bool]:
+  """Resolve model samples and action into one non-duplicated Ford polynomial.
+
+  pathOffset and pathAngle are independent observations of the model trajectory,
+  while curvature and curvatureRate are action and slope. Convert the first two
+  to curvature observations, resolve one current-frame intent, and allocate C2
+  exactly once before encoding the remaining maneuver authority into C0/C1.
+  """
+  lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
+  desired_curvature = raw_target[2]
+  offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2 if valid else desired_curvature
+  angle_curvature = raw_target[1] / lookahead if valid else desired_curvature
+  geometry_demand = max(abs(offset_curvature), abs(angle_curvature))
+  geometry_is_coherent = valid and offset_curvature * angle_curvature > 0.0
+
+  if geometry_is_coherent:
+    geometry_share = _interp(geometry_demand, *PATH_PREVIEW_BP, 0.0, 1.0)
+    geometry_curvature = math.copysign(
+      min(abs(offset_curvature), abs(angle_curvature)),
+      offset_curvature,
+    )
+    geometry_reference = desired_curvature if geometry_curvature * desired_curvature >= 0.0 else 0.0
+    model_target = _blend(geometry_reference, geometry_curvature, geometry_share)
+    offset_target = _blend(geometry_reference, offset_curvature, geometry_share)
+    angle_target = _blend(geometry_reference, angle_curvature, geometry_share)
+  else:
+    geometry_share = 0.0
+    model_target = desired_curvature
+    offset_target = desired_curvature
+    angle_target = desired_curvature
+
+  stale_model_geometry = geometry_share > 0.0 and \
+                         model_target * raw_target[3] < 0.0 and \
+                         model_target * desired_angle_curvature < 0.0 and \
+                         measured_curvature * model_target > 0.0
+  if stale_model_geometry:
+    geometry_share = 0.0
+    model_target = desired_angle_curvature
+    offset_target = desired_angle_curvature
+    angle_target = desired_angle_curvature
+
+  coherent_model_maneuver = geometry_share > 0.0
+  wheel_beyond_action = _target_is_behind_wheel(desired_curvature, measured_curvature)
+  wheel_beyond_model = not coherent_model_maneuver or \
+                       _target_is_behind_wheel(model_target, measured_curvature)
+  wheel_beyond_target = wheel_beyond_action and wheel_beyond_model
+
+  if wheel_beyond_target:
+    offset_target = _unwind_target(offset_target, measured_curvature)
+    angle_target = _unwind_target(angle_target, measured_curvature)
+  else:
+    model_action_disagreement = model_target * desired_curvature < 0.0 or \
+                                model_target * measured_curvature < 0.0
+    offset_target += _undertracking_correction(
+      offset_target,
+      measured_curvature,
+      PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT,
+    )
+    angle_target += _undertracking_correction(
+      angle_target,
+      measured_curvature,
+      PATH_C1_TRACKING_ERROR_LIMIT,
+    )
+
+  maneuver_demand = max(abs(desired_curvature), geometry_demand)
+  c0_share = 1.0 if wheel_beyond_target else \
+             _interp(maneuver_demand, *PATH_C0_BP, 0.0, 1.0)
+  target = (
+    0.5 * (offset_target - allocated_c2) * PATH_MIN_LOOKAHEAD ** 2 * c0_share,
+    (angle_target - allocated_c2) * lookahead,
+    allocated_c2,
+    allocated_c3,
+  )
+  preserve_model_direction = coherent_model_maneuver
+  return target, model_target, preserve_model_direction
 
 
 def _preserve_model_direction(coefficients: tuple[float, float, float, float],
@@ -153,7 +232,7 @@ def _c3_compatibility_share(curvature_rate: float, desired_curvature: float,
 
 
 class ProjectedLatControlPath:
-  """Return the closest feasible Ford polynomial through one stable interface."""
+  """Return one coherent, bounded Ford polynomial through a stable interface."""
 
   def __init__(self):
     self._last_command = LateralPathCommand()
@@ -193,34 +272,7 @@ class ProjectedLatControlPath:
       return command
 
     raw_target = target
-    model_curvature = _equivalent_curvature(raw_target)
     lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
-    offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
-    angle_curvature = raw_target[1] / lookahead
-    geometry_curvature = offset_curvature + 2.0 * raw_target[1] / PATH_MIN_LOOKAHEAD
-    desired_angle_error = desired_angle_curvature - projected_measured_curvature
-    strong_angle_rejection = model_curvature * desired_angle_error < 0.0 and \
-                             abs(desired_angle_error) >= PATH_STALE_PREVIEW_ERROR and \
-                             v_ego >= PATH_STALE_PREVIEW_SPEED
-    delivered_model_geometry = valid and offset_curvature * angle_curvature > 0.0 and \
-                               abs(geometry_curvature) > PATH_MODEL_MANEUVER_MIN and \
-                               model_curvature * geometry_curvature > 0.0 and \
-                               measured_curvature * geometry_curvature > 0.0 and \
-                               abs(measured_curvature) >= PATH_DIRECTION_MARGIN and \
-                               not strong_angle_rejection
-    if strong_angle_rejection:
-      target = (
-        0.5 * desired_angle_curvature * PATH_MIN_LOOKAHEAD ** 2,
-        desired_angle_curvature * lookahead,
-        target[2],
-        0.0,
-      )
-    elif valid:
-      offset_curvature = 2.0 * target[0] / PATH_MIN_LOOKAHEAD ** 2
-      angle_curvature = target[1] / lookahead
-      preview_share = _interp(max(abs(offset_curvature), abs(angle_curvature)),
-                              *PATH_PREVIEW_BP, 0.0, 1.0)
-      target = (target[0] * preview_share, target[1] * preview_share, target[2], target[3])
 
     attack_steps = (
       0.5 * PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2,
@@ -232,23 +284,30 @@ class ProjectedLatControlPath:
       _attack_bounds(last, step, limits)
       for last, step, limits in zip(self._last_command.coefficients(), attack_steps, PATH_LIMITS, strict=True)
     ]
-    action_tracking_error = target[2] - measured_curvature
-    unresolved = max(abs(target[2]), abs(measured_curvature), abs(action_tracking_error))
+    action_tracking_error = raw_target[2] - measured_curvature
+    unresolved = max(abs(raw_target[2]), abs(measured_curvature), abs(action_tracking_error))
     c2_share = min(
-      _interp(abs(target[2]), *PATH_C2_FADE_BP, 1.0, 0.0),
+      _interp(abs(raw_target[2]), *PATH_C2_FADE_BP, 1.0, 0.0),
       _interp(unresolved, *PATH_C2_SETTLED_BP, 1.0, 0.0),
     )
-    safe_c2 = _limit_attack(_clip(target[2] * c2_share, PATH_LIMITS[2]),
+    safe_c2 = _limit_attack(_clip(raw_target[2] * c2_share, PATH_LIMITS[2]),
                             self._last_command.curvature, PATH_C2_SLEW)
     bounds[2] = (safe_c2, safe_c2)
-    c3_share = _c3_compatibility_share(target[3], desired_angle_curvature, projected_measured_curvature)
-    safe_c3 = _limit_attack(_clip(target[3] * c3_share, PATH_LIMITS[3]),
+    c3_share = _c3_compatibility_share(raw_target[3], desired_angle_curvature, projected_measured_curvature)
+    safe_c3 = _limit_attack(_clip(raw_target[3] * c3_share, PATH_LIMITS[3]),
                             self._last_command.curvature_rate, PATH_C3_SLEW)
     bounds[3] = (safe_c3, safe_c3)
 
+    target, model_curvature, preserve_model_direction = _compose_path_target(
+      raw_target, measured_curvature, desired_angle_curvature,
+      v_ego, valid, safe_c2, safe_c3,
+    )
     coefficient_bounds = tuple(bounds)
-    coefficients = _project_coefficients(target, coefficient_bounds)
-    if delivered_model_geometry:
+    coefficients = tuple(
+      _clip(value, bound)
+      for value, bound in zip(target, coefficient_bounds, strict=True)
+    )
+    if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
