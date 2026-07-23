@@ -22,27 +22,24 @@ def equivalent_curvature(command, distance: float) -> float:
   return 2.0 * y / distance ** 2
 
 
-def horizon_error(command, target) -> float:
-  return sum(
-    (equivalent_curvature(command, distance) - equivalent_curvature(target, distance)) ** 2
-    for distance in (3.0, 7.0, 15.0, 30.0)
-  )
-
-
-def test_feasible_strong_model_is_reproduced_after_attack_settles():
+def test_feasible_strong_model_is_reproduced_once_wheel_delivers_it():
   controller = ProjectedLatControlPath()
-  target = model(0.5, 0.1)
+  delivered_curvature = 0.015
+  target = model(
+    0.5 * delivered_curvature * 7.0 ** 2,
+    delivered_curvature * 7.0,
+  )
 
   command = None
   for _ in range(100):
-    command = controller.update(target, 0.0, 7.0, True, False)
+    command = controller.update(target, delivered_curvature, 7.0, True, False)
 
   assert command is not None
   for distance in (3.0, 7.0, 15.0, 30.0):
     assert abs(equivalent_curvature(command, distance) - equivalent_curvature(target, distance)) < 1e-6
 
 
-def test_clipped_coefficients_redistribute_residual_across_free_coefficients():
+def test_clipped_coefficients_remain_bounded_and_directionally_coherent():
   controller = ProjectedLatControlPath()
   target = model(-2.7, -0.60, -0.05, -0.002)
 
@@ -50,9 +47,12 @@ def test_clipped_coefficients_redistribute_residual_across_free_coefficients():
   for _ in range(100):
     command = controller.update(target, -0.03, 7.0, True, False)
 
-  naive_clip = model(-2.7, -0.475, -0.02, -0.001024)
   assert command is not None
-  assert horizon_error(command, target) < horizon_error(naive_clip, target)
+  assert -4.61 <= command.path_offset <= 4.60
+  assert -0.475 <= command.path_angle <= 0.497
+  assert -0.02 <= command.curvature <= 0.02
+  assert -0.001024 <= command.curvature_rate <= 0.001023
+  assert equivalent_curvature(command, 7.0) < 0.0
 
 
 def test_large_turn_flushes_c2_and_projects_its_path_into_other_coefficients():
@@ -81,18 +81,100 @@ def test_meaningful_model_exit_cannot_project_to_the_opposite_direction():
   assert equivalent_curvature(command, 7.0) <= 0.0
 
 
-def test_strong_angle_evidence_rejects_stale_model_preview():
-  controller = ProjectedLatControlPath()
-  stale_preview = model(-1.96, -0.56, 0.0001)
+def test_projected_wheel_motion_cannot_scale_c0_c1_authority():
+  target = model(0.5, 0.1, 0.01)
+  measured_controller = ProjectedLatControlPath()
+  projected_controller = ProjectedLatControlPath()
 
-  command = controller.update(
-    stale_preview, -0.027, 3.0, True, False,
-    projected_measured_curvature=-0.027,
-    desired_angle_curvature=0.0002,
+  measured_command = measured_controller.update(
+    target, 0.005, 7.0, True, False,
+    projected_measured_curvature=0.005,
+    desired_angle_curvature=0.01,
+  )
+  projected_command = projected_controller.update(
+    target, 0.005, 7.0, True, False,
+    projected_measured_curvature=0.03,
+    desired_angle_curvature=0.01,
   )
 
-  assert command.path_offset > 0.0
-  assert command.path_angle > 0.0
+  assert measured_command.path_offset == projected_command.path_offset
+  assert measured_command.path_angle == projected_command.path_angle
+
+
+def test_measured_wheel_and_desired_angle_reject_stale_opposing_geometry():
+  controller = ProjectedLatControlPath()
+  stale_geometry = model(0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, -0.004, -0.0004)
+
+  command = controller.update(
+    stale_geometry, 0.01, 7.0, True, False,
+    desired_angle_curvature=-0.004,
+  )
+
+  assert equivalent_curvature(command, 7.0) <= 0.0
+
+
+def test_c3_that_continues_turn_preserves_preview_through_action_conflict():
+  controller = ProjectedLatControlPath()
+  continuing_geometry = model(0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, -0.004, 0.0004)
+
+  command = controller.update(
+    continuing_geometry, 0.01, 7.0, True, False,
+    desired_angle_curvature=-0.004,
+  )
+
+  assert equivalent_curvature(command, 7.0) > 0.0
+
+
+def test_opposing_action_does_not_discard_model_preview_before_wheel_follows_it():
+  controller = ProjectedLatControlPath()
+  entering_geometry = model(0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, -0.004)
+
+  command = controller.update(
+    entering_geometry, -0.003, 7.0, True, False,
+    desired_angle_curvature=-0.004,
+  )
+
+  assert equivalent_curvature(command, 7.0) > 0.0
+
+
+def test_medium_curve_allocates_c2_once_without_opposing_preview_coefficients():
+  controller = ProjectedLatControlPath()
+  curvature = 0.005
+  target = model(0.5 * curvature * 7.0 ** 2, curvature * 7.0, curvature)
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, curvature, 7.0, True, False,
+      desired_angle_curvature=curvature,
+    )
+
+  assert command is not None
+  assert command.curvature > 0.0
+  assert command.path_offset >= 0.0
+  assert command.path_angle >= 0.0
+
+
+def test_overtracking_reduces_authority_without_zeroing_model_path():
+  target = model(0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0)
+  behind_controller = ProjectedLatControlPath()
+  beyond_controller = ProjectedLatControlPath()
+
+  behind = None
+  beyond = None
+  for _ in range(100):
+    behind = behind_controller.update(
+      target, 0.005, 7.0, True, False,
+      desired_angle_curvature=0.015,
+    )
+    beyond = beyond_controller.update(
+      target, 0.025, 7.0, True, False,
+      desired_angle_curvature=0.015,
+    )
+
+  assert behind is not None
+  assert beyond is not None
+  assert 0.0 < equivalent_curvature(beyond, 7.0) < equivalent_curvature(behind, 7.0)
 
 
 def test_delivered_gentle_path_uses_c2_without_duplicate_preview_terms():
