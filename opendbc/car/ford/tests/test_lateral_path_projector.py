@@ -81,7 +81,7 @@ def test_meaningful_model_exit_cannot_project_to_the_opposite_direction():
   assert equivalent_curvature(command, 7.0) <= 0.0
 
 
-def test_spatial_unwind_reduces_overtracking_without_reversing_model_path():
+def test_strong_angle_rejection_follows_desired_angle_over_stale_model_path():
   uncapped_controller = ProjectedLatControlPath()
   unwind_controller = ProjectedLatControlPath()
   stale_preview = model(-1.96, -0.56, 0.0001)
@@ -97,9 +97,8 @@ def test_spatial_unwind_reduces_overtracking_without_reversing_model_path():
     desired_angle_curvature=0.0002,
   )
 
-  assert equivalent_curvature(stale_preview, 7.0) * equivalent_curvature(unwind, 7.0) > 0.0
-  assert abs(equivalent_curvature(unwind, 7.0)) < abs(equivalent_curvature(uncapped, 7.0))
-  assert abs(unwind.path_offset / unwind.path_angle - uncapped.path_offset / uncapped.path_angle) < 1e-6
+  assert equivalent_curvature(uncapped, 7.0) < 0.0
+  assert equivalent_curvature(unwind, 7.0) > 0.0
 
 
 def test_overtracked_wheel_cannot_be_commanded_deeper_without_changing_path_shape():
@@ -130,25 +129,35 @@ def test_overtracked_wheel_cannot_be_commanded_deeper_without_changing_path_shap
   assert max(coefficient_shares) - min(coefficient_shares) < 1e-9
 
 
-def test_regrab_attack_bounds_start_from_delivered_scaled_command():
+def test_regrab_attack_bounds_continue_from_unscaled_base_command():
   controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
   target = model(0.8, 0.2, 0.002, 0.0002)
 
-  capped = controller.update(
-    target, 0.0025, 7.0, True, False,
-    projected_measured_curvature=0.0025,
-    desired_angle_curvature=0.0015,
-  )
+  for _ in range(10):
+    controller.update(
+      target, 0.0025, 7.0, True, False,
+      projected_measured_curvature=0.0025,
+      desired_angle_curvature=0.0015,
+    )
+    reference_controller.update(
+      target, 0.0025, 7.0, True, False,
+      projected_measured_curvature=0.0025,
+      desired_angle_curvature=0.01,
+    )
+
   regrab = controller.update(
     target, 0.0025, 7.0, True, False,
     projected_measured_curvature=0.0025,
-    desired_angle_curvature=0.003,
+    desired_angle_curvature=0.01,
+  )
+  reference = reference_controller.update(
+    target, 0.0025, 7.0, True, False,
+    projected_measured_curvature=0.0025,
+    desired_angle_curvature=0.01,
   )
 
-  assert regrab.path_offset <= capped.path_offset + 0.147 + 1e-9
-  assert regrab.path_angle <= capped.path_angle + 0.042 + 1e-9
-  assert regrab.curvature <= capped.curvature + 0.0002 + 1e-9
-  assert regrab.curvature_rate <= capped.curvature_rate + 0.0002 + 1e-9
+  assert regrab == reference
 
 
 def test_overtracking_ceiling_applies_while_spatial_path_is_still_deepening():
@@ -186,7 +195,7 @@ def test_overtracking_ceiling_also_applies_below_maneuver_curvature():
 
 def test_crossing_model_uses_desired_direction_for_overtracking_ceiling():
   controller = ProjectedLatControlPath()
-  crossing_path = model(1.0, -1.0 / 7.0)
+  crossing_path = model(1.0, -1.0 / 7.0, -1e-8)
 
   command = controller.update(
     crossing_path, 0.002, 7.0, True, False,
@@ -194,27 +203,281 @@ def test_crossing_model_uses_desired_direction_for_overtracking_ceiling():
     desired_angle_curvature=0.001,
   )
 
-  assert abs(equivalent_curvature(crossing_path, 7.0)) < 1e-12
-  assert equivalent_curvature(command, 7.0) <= 0.002 + 1e-6
+  assert -1e-7 < equivalent_curvature(crossing_path, 7.0) < 0.0
+  assert 0.0 <= equivalent_curvature(command, 7.0) <= 0.001 + 1e-6
 
 
-def test_turn_in_authority_is_unchanged_before_wheel_reaches_desired_angle():
-  reference_controller = ProjectedLatControlPath()
-  turn_in_controller = ProjectedLatControlPath()
-  target = model(0.8, 0.2)
+def test_target_crossing_is_continuous_in_both_directions():
+  for direction in (-1.0, 1.0):
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    desired = direction * 0.003
+    epsilon = direction * 1e-6
+    commands = [
+      ProjectedLatControlPath().update(
+        target, desired + projected_offset, 7.0, True, False,
+        projected_measured_curvature=desired,
+        desired_angle_curvature=desired,
+      )
+      for projected_offset in (-epsilon, epsilon)
+    ]
 
-  reference = reference_controller.update(
-    target, 0.002, 7.0, True, False,
-    projected_measured_curvature=0.002,
-    desired_angle_curvature=0.002,
+    assert abs(equivalent_curvature(commands[0], 7.0) - equivalent_curvature(commands[1], 7.0)) <= 1e-4
+    scales = (4.6, 0.5, 0.02, 0.001)
+    normalized_deltas = [
+      abs(first - second) / scale
+      for first, second, scale in zip(
+        (commands[0].path_offset, commands[0].path_angle, commands[0].curvature, commands[0].curvature_rate),
+        (commands[1].path_offset, commands[1].path_angle, commands[1].curvature, commands[1].curvature_rate),
+        scales,
+        strict=True,
+      )
+    ]
+    assert max(normalized_deltas) <= 0.01
+
+
+def test_constant_target_projection_jitter_cannot_form_an_authority_relay():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    desired = direction * 0.003
+    epsilon = direction * 1e-6
+    for _ in range(100):
+      controller.update(
+        target, desired, 7.0, True, False,
+        projected_measured_curvature=desired - epsilon,
+        desired_angle_curvature=desired,
+      )
+
+    commands = [
+      controller.update(
+        target, desired, 7.0, True, False,
+        projected_measured_curvature=desired + (epsilon if i % 2 else -epsilon),
+        desired_angle_curvature=desired,
+      )
+      for i in range(20)
+    ]
+    equivalent_curvatures = [direction * equivalent_curvature(command, 7.0) for command in commands]
+    assert max(equivalent_curvatures) - min(equivalent_curvatures) <= 5e-4
+
+    scales = (4.6, 0.5, 0.02, 0.001)
+    for previous, current in zip(commands[:-1], commands[1:], strict=True):
+      normalized_deltas = [
+        abs(first - second) / scale
+        for first, second, scale in zip(
+          (previous.path_offset, previous.path_angle, previous.curvature, previous.curvature_rate),
+          (current.path_offset, current.path_angle, current.curvature, current.curvature_rate),
+          scales,
+          strict=True,
+        )
+      ]
+      assert max(normalized_deltas) <= 0.01
+
+
+def test_constant_target_measured_bump_cannot_form_an_authority_relay():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    desired = direction * 0.003
+    for _ in range(100):
+      controller.update(
+        target, desired, 7.0, True, False,
+        projected_measured_curvature=desired,
+        desired_angle_curvature=desired,
+      )
+
+    measured_curvatures = (
+      desired + direction * 0.0001,
+      desired - direction * 0.0012,
+      desired + direction * 0.0001,
+      desired - direction * 0.0012,
+    )
+    commands = [
+      controller.update(
+        target, measured, 7.0, True, False,
+        projected_measured_curvature=desired,
+        desired_angle_curvature=desired,
+      )
+      for measured in measured_curvatures
+    ]
+    delivered_curvatures = [direction * equivalent_curvature(command, 7.0) for command in commands]
+
+    assert max(delivered_curvatures) <= 2.0 * direction * desired
+
+
+def test_tiny_desired_noise_cannot_bypass_measured_relatch_confirmation():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    desired = direction * 0.003
+    for _ in range(100):
+      controller.update(
+        target, desired, 7.0, True, False,
+        projected_measured_curvature=desired,
+        desired_angle_curvature=desired,
+      )
+
+    controller.update(
+      target, desired + direction * 0.0001, 7.0, True, False,
+      projected_measured_curvature=desired,
+      desired_angle_curvature=desired,
+    )
+    noisy_desired = desired + direction * 1e-8
+    command = controller.update(
+      target, desired - direction * 0.0012, 7.0, True, False,
+      projected_measured_curvature=desired,
+      desired_angle_curvature=noisy_desired,
+    )
+
+    assert direction * equivalent_curvature(command, 7.0) <= 2.0 * direction * noisy_desired
+
+
+def test_sustained_undertracking_relatches_after_one_confirmation_frame():
+  controller = ProjectedLatControlPath()
+  target = model(0.8, 0.2, 0.002, 0.0002)
+  desired = 0.003
+  for _ in range(100):
+    controller.update(
+      target, desired, 7.0, True, False,
+      projected_measured_curvature=desired,
+      desired_angle_curvature=desired,
+    )
+
+  controller.update(
+    target, desired + 0.0001, 7.0, True, False,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
   )
-  turn_in = turn_in_controller.update(
-    target, 0.002, 7.0, True, False,
-    projected_measured_curvature=0.002,
+  confirmation = controller.update(
+    target, desired - 0.0012, 7.0, True, False,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
+  )
+  relatched = controller.update(
+    target, desired - 0.0012, 7.0, True, False,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
+  )
+
+  assert equivalent_curvature(confirmation, 7.0) <= 2.0 * desired
+  assert relatched.path_offset > 0.79
+  assert relatched.path_angle > 0.19
+
+
+def test_safe_shallower_command_bypasses_relatch_confirmation():
+  limited_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  deep_target = model(0.8, 0.2, 0.002, 0.0002)
+  desired = 0.003
+  for _ in range(100):
+    limited_controller.update(
+      deep_target, desired, 7.0, True, False,
+      projected_measured_curvature=desired,
+      desired_angle_curvature=desired,
+    )
+    reference_controller.update(
+      deep_target, desired, 7.0, True, False,
+      projected_measured_curvature=desired,
+      desired_angle_curvature=desired,
+    )
+
+  safe_target = model(0.0, 0.0, 0.002)
+  safe_release = limited_controller.update(
+    safe_target, desired, 7.0, True, False,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
+  )
+  untapered_reference = reference_controller.update(
+    safe_target, desired, 7.0, True, False,
+    projected_measured_curvature=desired,
+  )
+
+  assert safe_release == untapered_reference
+
+
+def test_turn_in_preserves_37f_attack_speed_and_authority():
+  expected_attack = (
+    (0.147, 0.042, 0.0002, 0.0002),
+    (0.294, 0.084, 0.0004, 0.0002),
+    (0.441, 0.126, 0.0006, 0.0002),
+    (0.588, 0.168, 0.0008, 0.0002),
+    (0.735, 0.210, 0.0010, 0.0002),
+  )
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    for expected in expected_attack:
+      command = controller.update(
+        target, direction * 0.002, 7.0, True, False,
+        projected_measured_curvature=direction * 0.002,
+        desired_angle_curvature=direction * 0.01,
+      )
+      assert all(
+        abs(actual - direction * wanted) <= 1e-12
+        for actual, wanted in zip(
+          (command.path_offset, command.path_angle, command.curvature, command.curvature_rate),
+          expected,
+          strict=True,
+        )
+      )
+
+    for _ in range(95):
+      command = controller.update(
+        target, direction * 0.002, 7.0, True, False,
+        projected_measured_curvature=direction * 0.002,
+        desired_angle_curvature=direction * 0.01,
+      )
+    assert all(
+      abs(actual - direction * wanted) <= 1e-9
+      for actual, wanted in zip(
+        (command.path_offset, command.path_angle, command.curvature, command.curvature_rate),
+        (0.8, 0.2, 0.002, 0.0002),
+        strict=True,
+      )
+    )
+
+
+def test_at_or_past_target_cannot_command_deeper():
+  for direction in (-1.0, 1.0):
+    target = model(direction * 0.8, direction * 0.2, direction * 0.002, direction * 0.0002)
+    desired = direction * 0.003
+    for past_target in (0.0, 1e-6, 1e-3):
+      wheel_curvature = desired + direction * past_target
+      command = ProjectedLatControlPath().update(
+        target, wheel_curvature, 7.0, True, False,
+        projected_measured_curvature=wheel_curvature,
+        desired_angle_curvature=desired,
+      )
+      command_along = direction * equivalent_curvature(command, 7.0)
+      assert 0.0 <= command_along <= direction * wheel_curvature + 1e-6
+
+
+def test_arrival_brake_does_not_poison_the_37f_attack_plan():
+  target = model(0.8, 0.2, 0.002, 0.0002)
+  braked_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  for _ in range(10):
+    braked_controller.update(
+      target, 0.003, 7.0, True, False,
+      projected_measured_curvature=0.003,
+      desired_angle_curvature=0.003,
+    )
+    reference_controller.update(
+      target, 0.003, 7.0, True, False,
+      projected_measured_curvature=0.003,
+      desired_angle_curvature=0.01,
+    )
+
+  braked_regrab = braked_controller.update(
+    target, 0.003, 7.0, True, False,
+    projected_measured_curvature=0.003,
     desired_angle_curvature=0.01,
   )
-
-  assert turn_in == reference
+  reference = reference_controller.update(
+    target, 0.003, 7.0, True, False,
+    projected_measured_curvature=0.003,
+    desired_angle_curvature=0.01,
+  )
+  assert braked_regrab == reference
 
 
 def test_delivered_gentle_path_uses_c2_without_duplicate_preview_terms():
@@ -258,7 +521,7 @@ def test_projection_constraints_cannot_flip_delivered_model_geometry():
   assert equivalent_curvature(command, 7.0) <= 0.0
 
 
-def test_attack_limited_mixed_model_cannot_countercommand_meaningful_path():
+def test_strong_angle_rejection_can_countercommand_a_stale_mixed_model():
   controller = ProjectedLatControlPath()
   mixed_path = model(-1.815954395, 0.330586332, 0.018214388, 0.000487307)
 
@@ -269,7 +532,7 @@ def test_attack_limited_mixed_model_cannot_countercommand_meaningful_path():
   )
 
   assert equivalent_curvature(mixed_path, 7.0) > 0.003
-  assert equivalent_curvature(command, 7.0) >= 0.0
+  assert equivalent_curvature(command, 7.0) < 0.0
 
 
 def test_driver_override_projects_the_delivered_wheel_path():
