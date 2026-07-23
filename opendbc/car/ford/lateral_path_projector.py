@@ -189,9 +189,15 @@ def _compose_path_target(raw_target: tuple[float, float, float, float],
   maneuver_demand = max(abs(desired_curvature), geometry_demand)
   c0_share = 1.0 if wheel_beyond_target else \
              _interp(maneuver_demand, *PATH_C0_BP, 0.0, 1.0)
+  offset_residual = offset_target - allocated_c2
+  angle_residual = angle_target - allocated_c2
+  if offset_target * allocated_c2 > 0.0 and abs(offset_target) < abs(allocated_c2):
+    offset_residual = 0.0
+  if angle_target * allocated_c2 > 0.0 and abs(angle_target) < abs(allocated_c2):
+    angle_residual = 0.0
   target = (
-    0.5 * (offset_target - allocated_c2) * PATH_MIN_LOOKAHEAD ** 2 * c0_share,
-    (angle_target - allocated_c2) * lookahead,
+    0.5 * offset_residual * PATH_MIN_LOOKAHEAD ** 2 * c0_share,
+    angle_residual * lookahead,
     allocated_c2,
     allocated_c3,
   )
@@ -285,7 +291,7 @@ class ProjectedLatControlPath:
       for last, step, limits in zip(self._last_command.coefficients(), attack_steps, PATH_LIMITS, strict=True)
     ]
     action_tracking_error = raw_target[2] - measured_curvature
-    unresolved = max(abs(raw_target[2]), abs(measured_curvature), abs(action_tracking_error))
+    unresolved = max(abs(raw_target[2]), abs(action_tracking_error))
     c2_share = min(
       _interp(abs(raw_target[2]), *PATH_C2_FADE_BP, 1.0, 0.0),
       _interp(unresolved, *PATH_C2_SETTLED_BP, 1.0, 0.0),
