@@ -191,6 +191,32 @@ def test_delivered_gentle_path_uses_c2_without_duplicate_preview_terms():
   assert abs(command.curvature - 0.003) < 1e-6
 
 
+def test_gentle_steady_curve_does_not_reset_when_wheel_temporarily_overtracks():
+  controller = ProjectedLatControlPath()
+  curvature = 0.003
+  target = model(0.5 * curvature * 7.0 ** 2, curvature * 7.0, curvature)
+
+  command = None
+  for _ in range(20):
+    command = controller.update(
+      target, curvature, 7.0, True, False,
+      desired_angle_curvature=curvature,
+    )
+
+  assert command is not None
+  settled_curvature = equivalent_curvature(command, 7.0)
+  disturbed = controller.update(
+    target, 0.0065, 7.0, True, False,
+    desired_angle_curvature=curvature,
+  )
+
+  assert abs(settled_curvature - curvature) < 1e-9
+  assert equivalent_curvature(disturbed, 7.0) >= 0.5 * settled_curvature
+  assert disturbed.path_offset >= 0.0
+  assert disturbed.path_angle >= 0.0
+  assert disturbed.curvature > 0.0
+
+
 def test_c3_unwind_waits_while_wheel_undertracks_desired_angle():
   controller = ProjectedLatControlPath()
   target = model(0.5, 0.1, 0.01, -0.0004)
