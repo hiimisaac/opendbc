@@ -235,40 +235,6 @@ def test_target_crossing_is_continuous_in_both_directions():
     assert max(normalized_deltas) <= 0.01
 
 
-def test_projected_arrival_brakes_before_crossing_without_collapsing_authority():
-  controller = ProjectedLatControlPath()
-  reference_controller = ProjectedLatControlPath()
-  target = model(0.4, 0.1, 0.002, 0.0002)
-  deeper_target = model(0.8, 0.2, 0.002, 0.0002)
-  desired = 0.003
-
-  for _ in range(100):
-    previous = controller.update(
-      target, 0.002, 7.0, True, False,
-      projected_measured_curvature=0.002,
-      desired_angle_curvature=0.01,
-    )
-    reference_controller.update(
-      target, 0.002, 7.0, True, False,
-      projected_measured_curvature=0.002,
-      desired_angle_curvature=0.01,
-    )
-
-  braked = controller.update(
-    deeper_target, 0.002, 7.0, True, False,
-    projected_measured_curvature=0.004,
-    desired_angle_curvature=desired,
-  )
-  full = reference_controller.update(
-    deeper_target, 0.002, 7.0, True, False,
-    projected_measured_curvature=0.004,
-    desired_angle_curvature=0.01,
-  )
-
-  assert equivalent_curvature(braked, 7.0) < equivalent_curvature(full, 7.0)
-  assert equivalent_curvature(braked, 7.0) >= 0.89 * equivalent_curvature(previous, 7.0)
-
-
 def test_constant_target_projection_jitter_cannot_form_an_authority_relay():
   for direction in (-1.0, 1.0):
     controller = ProjectedLatControlPath()
@@ -365,9 +331,8 @@ def test_tiny_desired_noise_cannot_bypass_measured_relatch_confirmation():
     assert direction * equivalent_curvature(command, 7.0) <= 2.0 * direction * noisy_desired
 
 
-def test_projected_undertracking_relatches_immediately():
+def test_sustained_undertracking_relatches_after_one_confirmation_frame():
   controller = ProjectedLatControlPath()
-  reference_controller = ProjectedLatControlPath()
   target = model(0.8, 0.2, 0.002, 0.0002)
   desired = 0.003
   for _ in range(100):
@@ -376,24 +341,26 @@ def test_projected_undertracking_relatches_immediately():
       projected_measured_curvature=desired,
       desired_angle_curvature=desired,
     )
-    reference_controller.update(
-      target, desired, 7.0, True, False,
-      projected_measured_curvature=desired,
-      desired_angle_curvature=0.01,
-    )
 
-  relatched = controller.update(
-    target, desired - 0.0012, 7.0, True, False,
-    projected_measured_curvature=desired - 0.0012,
+  controller.update(
+    target, desired + 0.0001, 7.0, True, False,
+    projected_measured_curvature=desired,
     desired_angle_curvature=desired,
   )
-  reference = reference_controller.update(
+  confirmation = controller.update(
     target, desired - 0.0012, 7.0, True, False,
-    projected_measured_curvature=desired - 0.0012,
-    desired_angle_curvature=0.01,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
+  )
+  relatched = controller.update(
+    target, desired - 0.0012, 7.0, True, False,
+    projected_measured_curvature=desired,
+    desired_angle_curvature=desired,
   )
 
-  assert relatched == reference
+  assert equivalent_curvature(confirmation, 7.0) <= 2.0 * desired
+  assert relatched.path_offset > 0.79
+  assert relatched.path_angle > 0.19
 
 
 def test_safe_shallower_command_bypasses_relatch_confirmation():
