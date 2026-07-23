@@ -34,6 +34,15 @@ def with_action(path, curvature: float):
   return path
 
 
+def equivalent_curvature(command, distance: float = 7.0) -> float:
+  path_offset = getattr(command, "path_offset", getattr(command, "pathOffset", 0.0))
+  path_angle = getattr(command, "path_angle", getattr(command, "pathAngle", 0.0))
+  curvature_rate = getattr(command, "curvature_rate", getattr(command, "curvatureRate", 0.0))
+  path_offset += path_angle * distance + 0.5 * command.curvature * distance ** 2 + \
+                 curvature_rate * distance ** 3 / 6.0
+  return 2.0 * path_offset / distance ** 2
+
+
 def test_projected_tracking_error_only_discounts_closing_wheel_motion():
   assert math.isclose(projected_tracking_error(0.04, 0.02, 0.03), 0.01)
   assert projected_tracking_error(0.04, 0.02, 0.05) == 0.0
@@ -87,6 +96,22 @@ def test_falling_action_does_not_unwind_while_model_still_requires_turn():
 
   assert command.path_offset >= 0.0
   assert command.path_angle > 0.0
+
+
+def test_unwind_cannot_cross_against_meaningful_model_exit_geometry():
+  controller = LatControlPath()
+
+  exit_path = SimpleNamespace(
+    valid=True,
+    pathOffset=-0.0916,
+    pathAngle=-0.0217,
+    curvature=-0.0017,
+    curvatureRate=0.0005,
+  )
+  command = controller.update(exit_path, -0.0046, 11.54, True, False, desired_angle_curvature=-0.0017)
+
+  assert equivalent_curvature(exit_path) < -0.005
+  assert equivalent_curvature(command) <= 0.0
 
 
 def test_model_relative_undertracking_adds_bounded_path_correction():
