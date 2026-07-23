@@ -22,13 +22,10 @@ PATH_PROJECTION_ITERATIONS = 96
 PATH_C2_FADE_BP = (0.006, 0.012)
 PATH_C2_SETTLED_BP = (0.003, 0.006)
 PATH_PREVIEW_BP = (0.003, 0.012)
-PATH_STALE_PREVIEW_ERROR = 0.012
-PATH_STALE_PREVIEW_SPEED = 3.0
 PATH_C3_UNWIND_ERROR_BP = (0.0005, 0.002)
 PATH_C3_UNWIND_TARGET_MIN = 0.003
 PATH_MODEL_MANEUVER_MIN = 0.003
 PATH_DIRECTION_MARGIN = 0.0005
-PATH_ARRIVAL_TAPER = 0.001
 
 
 @dataclass(frozen=True)
@@ -154,29 +151,36 @@ def _c3_compatibility_share(curvature_rate: float, desired_curvature: float,
 
 
 def _shape_preserving_delivery_share(model_path: tuple[float, float, float, float],
-                                     command_curvature: float, measured_curvature: float,
-                                     desired_curvature: float) -> tuple[float, bool]:
-  """Taper only near the measured target without changing the model polynomial's shape."""
-  reference_curvature = desired_curvature
+                                     command_curvature: float, projected_curvature: float,
+                                     desired_curvature: float) -> float:
+  """Scale the full polynomial for wrong-direction, overtracking, and spatial unwind."""
+  model_curvature = _equivalent_curvature(model_path)
+  reference_curvature = model_curvature
   if reference_curvature == 0.0:
-    reference_curvature = measured_curvature
+    reference_curvature = desired_curvature if desired_curvature != 0.0 else projected_curvature
   if reference_curvature == 0.0:
-    reference_curvature = _equivalent_curvature(model_path)
-  if reference_curvature == 0.0:
-    return 1.0, False
+    return 1.0
 
   direction = math.copysign(1.0, reference_curvature)
   command_along = direction * command_curvature
+  measured_along = direction * projected_curvature
   desired_along = direction * desired_curvature
-  command_deepens_target = command_along > max(desired_along, 0.0)
-  remaining_error = direction * (desired_curvature - measured_curvature)
-  if remaining_error >= PATH_ARRIVAL_TAPER or not command_deepens_target:
-    return 1.0, command_deepens_target
+  if command_along <= 0.0:
+    return 0.0 if abs(model_curvature) >= PATH_MODEL_MANEUVER_MIN else 1.0
+  if measured_along <= 0.0 or desired_along >= measured_along:
+    return 1.0
 
-  target_share = _clip(max(desired_along, 0.0) / command_along, (0.0, 1.0))
-  arrival = _clip((PATH_ARRIVAL_TAPER - remaining_error) / PATH_ARRIVAL_TAPER, (0.0, 1.0))
-  smooth_arrival = arrival * arrival * (3.0 - 2.0 * arrival)
-  return 1.0 - smooth_arrival * (1.0 - target_share), True
+  delivery_share = 1.0
+  if command_along > measured_along:
+    delivery_share = _clip(measured_along / command_along, (0.0, 1.0))
+
+  near_curvature = direction * _equivalent_curvature(model_path, PATH_PROJECTION_DISTANCES[0])
+  far_curvature = direction * _equivalent_curvature(model_path, PATH_PROJECTION_DISTANCES[2])
+  path_scale = max(abs(near_curvature), abs(far_curvature))
+  spatial_unwind = _clip((near_curvature - far_curvature) / path_scale, (0.0, 1.0)) if path_scale > 0.0 else 0.0
+  desired_share = _clip(max(desired_along, 0.0) / command_along, (0.0, 1.0))
+  unwind_share = 1.0 - spatial_unwind * (1.0 - desired_share)
+  return min(delivery_share, unwind_share)
 
 
 class ProjectedLatControlPath:
@@ -184,41 +188,6 @@ class ProjectedLatControlPath:
 
   def __init__(self):
     self._last_command = LateralPathCommand()
-    self._delivery_share = 1.0
-    self._desired_curvature_last = 0.0
-    self._relatch_requested = False
-
-  def _confirm_delivery_relatch(self, target_share: float, desired_curvature: float,
-                                command_deepens_target: bool) -> float:
-    direction = math.copysign(1.0, desired_curvature) if desired_curvature != 0.0 else 0.0
-    outward_target_motion = max(direction * (desired_curvature - self._desired_curvature_last), 0.0)
-    requested_share_increase = max(target_share - self._delivery_share, 0.0)
-    target_moved_outward = outward_target_motion >= PATH_ARRIVAL_TAPER * requested_share_increase
-
-    if not command_deepens_target:
-      delivery_share = 1.0
-      self._relatch_requested = False
-    elif target_share < self._delivery_share:
-      delivery_share = target_share
-      self._relatch_requested = False
-    elif target_share > self._delivery_share:
-      if target_moved_outward or self._relatch_requested:
-        delivery_share = target_share
-      else:
-        delivery_share = self._delivery_share
-      self._relatch_requested = True
-    else:
-      delivery_share = target_share
-      self._relatch_requested = False
-
-    self._delivery_share = delivery_share
-    self._desired_curvature_last = desired_curvature
-    return delivery_share
-
-  def _reset_delivery(self, desired_curvature: float = 0.0) -> None:
-    self._delivery_share = 1.0
-    self._desired_curvature_last = desired_curvature
-    self._relatch_requested = False
 
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
@@ -231,7 +200,6 @@ class ProjectedLatControlPath:
 
     if not active:
       self._last_command = LateralPathCommand()
-      self._reset_delivery()
       return self._last_command
 
     valid = path is not None and bool(getattr(path, "valid", False))
@@ -244,7 +212,6 @@ class ProjectedLatControlPath:
         _finite(getattr(path, "curvature", 0.0)),
         _finite(getattr(path, "curvatureRate", 0.0)),
       )
-    desired_angle_feedback_available = desired_angle_curvature is not None
     desired_angle_curvature = target[2] if desired_angle_curvature is None else _finite(desired_angle_curvature, target[2])
 
     if driver_override:
@@ -254,7 +221,6 @@ class ProjectedLatControlPath:
         path_angle=_clip(measured_curvature * max(v_ego, PATH_MIN_LOOKAHEAD), PATH_LIMITS[1]),
       )
       self._last_command = command
-      self._reset_delivery(desired_angle_curvature)
       return command
 
     raw_target = target
@@ -263,24 +229,12 @@ class ProjectedLatControlPath:
     offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
     angle_curvature = raw_target[1] / lookahead
     geometry_curvature = offset_curvature + 2.0 * raw_target[1] / PATH_MIN_LOOKAHEAD
-    desired_angle_error = desired_angle_curvature - projected_measured_curvature
-    strong_angle_rejection = model_curvature * desired_angle_error < 0.0 and \
-                             abs(desired_angle_error) >= PATH_STALE_PREVIEW_ERROR and \
-                             v_ego >= PATH_STALE_PREVIEW_SPEED
     delivered_model_geometry = valid and offset_curvature * angle_curvature > 0.0 and \
                                abs(geometry_curvature) > PATH_MODEL_MANEUVER_MIN and \
                                model_curvature * geometry_curvature > 0.0 and \
                                measured_curvature * geometry_curvature > 0.0 and \
-                               abs(measured_curvature) >= PATH_DIRECTION_MARGIN and \
-                               not strong_angle_rejection
-    if strong_angle_rejection:
-      target = (
-        0.5 * desired_angle_curvature * PATH_MIN_LOOKAHEAD ** 2,
-        desired_angle_curvature * lookahead,
-        target[2],
-        0.0,
-      )
-    elif valid:
+                               abs(measured_curvature) >= PATH_DIRECTION_MARGIN
+    if valid:
       offset_curvature = 2.0 * target[0] / PATH_MIN_LOOKAHEAD ** 2
       angle_curvature = target[1] / lookahead
       preview_share = _interp(max(abs(offset_curvature), abs(angle_curvature)),
@@ -315,23 +269,12 @@ class ProjectedLatControlPath:
     coefficients = _project_coefficients(target, coefficient_bounds)
     if delivered_model_geometry:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
-    delivery_share = 1.0
-    if desired_angle_feedback_available:
-      target_delivery_share, command_deepens_target = _shape_preserving_delivery_share(
-        raw_target, _equivalent_curvature(coefficients), measured_curvature,
-        desired_angle_curvature,
-      )
-      delivery_share = self._confirm_delivery_relatch(
-        target_delivery_share, desired_angle_curvature, command_deepens_target,
-      )
-    else:
-      self._reset_delivery(desired_angle_curvature)
-    base_command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
-                                      curvature=coefficients[2], curvature_rate=coefficients[3])
-    # Keep the untapered attack state so relatching never has to restart the coefficient attack.
-    self._last_command = base_command
-    delivered_coefficients = tuple(coefficient * delivery_share for coefficient in coefficients)
-    command = LateralPathCommand(valid=valid, path_offset=delivered_coefficients[0],
-                                 path_angle=delivered_coefficients[1], curvature=delivered_coefficients[2],
-                                 curvature_rate=delivered_coefficients[3])
+    delivery_share = _shape_preserving_delivery_share(
+      raw_target, _equivalent_curvature(coefficients),
+      projected_measured_curvature, desired_angle_curvature,
+    )
+    coefficients = tuple(coefficient * delivery_share for coefficient in coefficients)
+    command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
+                                 curvature=coefficients[2], curvature_rate=coefficients[3])
+    self._last_command = command
     return command
