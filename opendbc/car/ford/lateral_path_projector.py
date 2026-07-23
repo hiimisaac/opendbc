@@ -183,15 +183,6 @@ class ProjectedLatControlPath:
       )
     desired_angle_curvature = target[2] if desired_angle_curvature is None else _finite(desired_angle_curvature, target[2])
 
-    if driver_override:
-      command = LateralPathCommand(
-        valid=valid,
-        path_offset=_clip(0.5 * measured_curvature * PATH_MIN_LOOKAHEAD ** 2, PATH_LIMITS[0]),
-        path_angle=_clip(measured_curvature * max(v_ego, PATH_MIN_LOOKAHEAD), PATH_LIMITS[1]),
-      )
-      self._last_command = command
-      return command
-
     raw_target = target
     model_curvature = _equivalent_curvature(raw_target)
     lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
@@ -208,13 +199,18 @@ class ProjectedLatControlPath:
                                measured_curvature * geometry_curvature > 0.0 and \
                                abs(measured_curvature) >= PATH_DIRECTION_MARGIN and \
                                not strong_angle_rejection
-    if strong_angle_rejection:
-      target = (
-        0.5 * desired_angle_curvature * PATH_MIN_LOOKAHEAD ** 2,
-        desired_angle_curvature * lookahead,
-        target[2],
-        0.0,
-      )
+    if driver_override:
+      # Describe the measured wheel path once, then let the constrained
+      # projection redistribute unavailable C2 into C0/C1. Encoding the same
+      # curvature directly in both C0 and C1 multiplies the delivered path.
+      target = (0.0, 0.0, measured_curvature, 0.0)
+    elif strong_angle_rejection:
+      fallback_curvature = desired_angle_curvature
+      if abs(model_curvature) >= PATH_MODEL_MANEUVER_MIN and model_curvature * fallback_curvature < 0.0:
+        # Immediate angle evidence may release a stale preview, but it must
+        # not counter-command a meaningful spatial model path.
+        fallback_curvature = 0.0
+      target = (0.0, 0.0, fallback_curvature, 0.0)
     elif valid:
       offset_curvature = 2.0 * target[0] / PATH_MIN_LOOKAHEAD ** 2
       angle_curvature = target[1] / lookahead

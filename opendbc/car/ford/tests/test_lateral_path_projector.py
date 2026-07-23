@@ -91,8 +91,24 @@ def test_strong_angle_evidence_rejects_stale_model_preview():
     desired_angle_curvature=0.0002,
   )
 
-  assert command.path_offset > 0.0
-  assert command.path_angle > 0.0
+  assert equivalent_curvature(stale_preview, 7.0) < 0.0
+  assert equivalent_curvature(command, 7.0) == 0.0
+
+
+def test_strong_angle_fallback_does_not_duplicate_desired_curvature():
+  controller = ProjectedLatControlPath()
+  stale_preview = model(1.0, 0.2, 0.02)
+  desired_curvature = 0.006
+
+  command = controller.update(
+    stale_preview, 0.03, 7.0, True, False,
+    projected_measured_curvature=0.03,
+    desired_angle_curvature=desired_curvature,
+  )
+
+  assert 0.0 < equivalent_curvature(command, 7.0) < 2.0 * desired_curvature
+  assert command.curvature == 0.0
+  assert command.curvature_rate == 0.0
 
 
 def test_delivered_gentle_path_uses_c2_without_duplicate_preview_terms():
@@ -136,13 +152,13 @@ def test_projection_constraints_cannot_flip_delivered_model_geometry():
   assert equivalent_curvature(command, 7.0) <= 0.0
 
 
-def test_driver_override_projects_the_delivered_wheel_path():
+def test_driver_override_projects_measured_curvature_once():
   controller = ProjectedLatControlPath()
+  measured_curvature = -0.01
 
-  command = controller.update(model(1.0, 0.2, 0.02, 0.001), -0.01, 10.0, True, True)
+  command = controller.update(model(1.0, 0.2, 0.02, 0.001), measured_curvature, 10.0, True, True)
 
-  assert command.path_offset == 0.5 * -0.01 * 7.0 ** 2
-  assert command.path_angle == -0.01 * 10.0
+  assert 2.0 * measured_curvature < equivalent_curvature(command, 7.0) < 0.0
   assert command.curvature == 0.0
   assert command.curvature_rate == 0.0
 
