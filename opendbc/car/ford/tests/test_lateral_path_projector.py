@@ -191,6 +191,105 @@ def test_delivered_gentle_path_uses_c2_without_duplicate_preview_terms():
   assert abs(command.curvature - 0.003) < 1e-6
 
 
+def test_gentle_path_uses_only_reversible_c2_despite_noisy_preview():
+  controller = ProjectedLatControlPath()
+  gentle = model(
+    0.5 * 0.0025 * 7.0 ** 2,
+    0.0025 * 25.0,
+    0.002,
+    -0.0001,
+  )
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      gentle, 0.002, 25.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.002,
+    )
+
+  assert command is not None
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert command.curvature == gentle.curvature
+  assert command.curvature_rate == 0.0
+
+
+def test_gentle_c2_anchor_is_not_changed_by_measured_wheel_disturbance():
+  controller = ProjectedLatControlPath()
+  gentle = model(
+    0.5 * 0.0025 * 7.0 ** 2,
+    0.0025 * 25.0,
+    0.002,
+    -0.0001,
+  )
+
+  for _ in range(100):
+    controller.update(
+      gentle, 0.002, 25.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.002,
+    )
+
+  disturbed = controller.update(
+    gentle, 0.0065, 25.0, True, False,
+    projected_measured_curvature=-0.001,
+    desired_angle_curvature=0.002,
+  )
+
+  assert disturbed.path_offset == 0.0
+  assert disturbed.path_angle == 0.0
+  assert disturbed.curvature == gentle.curvature
+  assert disturbed.curvature_rate == 0.0
+
+
+def test_transition_crossfades_once_from_c2_to_full_polynomial():
+  commands = []
+  for curvature in (0.003, 0.0045, 0.006):
+    controller = ProjectedLatControlPath()
+    target = model(
+      0.5 * curvature * 7.0 ** 2,
+      curvature * 7.0,
+      curvature,
+    )
+    command = None
+    for _ in range(100):
+      command = controller.update(
+        target, curvature, 7.0, True, False,
+        desired_angle_curvature=curvature,
+      )
+    commands.append(command)
+
+  assert all(command is not None for command in commands)
+  gentle, transition, full = commands
+  assert gentle.curvature == 0.003
+  assert gentle.path_offset == 0.0
+  assert gentle.path_angle == 0.0
+  assert abs(transition.curvature - 0.00225) < 1e-9
+  assert transition.path_offset > 0.0
+  assert transition.path_angle > 0.0
+  assert full.curvature == 0.0
+  assert full.path_offset > transition.path_offset
+  assert full.path_angle > transition.path_angle
+
+
+def test_meaningful_c3_preview_can_leave_c2_baseband():
+  controller = ProjectedLatControlPath()
+  target = model(0.0, 0.0, 0.001, 0.0005)
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.001, 25.0, True, False,
+      projected_measured_curvature=0.001,
+      desired_angle_curvature=0.001,
+    )
+
+  assert command is not None
+  assert 0.0 < command.curvature < target.curvature
+  assert command.curvature_rate > 0.0
+
+
 def test_gentle_steady_curve_does_not_reset_when_wheel_temporarily_overtracks():
   controller = ProjectedLatControlPath()
   curvature = 0.003
@@ -217,6 +316,21 @@ def test_gentle_steady_curve_does_not_reset_when_wheel_temporarily_overtracks():
   assert disturbed.curvature > 0.0
 
 
+def test_zero_unwind_target_cannot_manufacture_opposing_preview():
+  controller = ProjectedLatControlPath()
+  target = model(-0.0245, -0.007, -0.001)
+
+  command = None
+  for _ in range(10):
+    command = controller.update(
+      target, -0.0031, 7.0, True, False,
+      desired_angle_curvature=-0.001,
+    )
+
+  assert command is not None
+  assert equivalent_curvature(command, 7.0) <= 0.0
+
+
 def test_c3_unwind_waits_while_wheel_undertracks_desired_angle():
   controller = ProjectedLatControlPath()
   target = model(0.5, 0.1, 0.01, -0.0004)
@@ -225,6 +339,19 @@ def test_c3_unwind_waits_while_wheel_undertracks_desired_angle():
     target, 0.006, 7.0, True, False,
     projected_measured_curvature=0.006,
     desired_angle_curvature=0.01,
+  )
+
+  assert command.curvature_rate == 0.0
+
+
+def test_gentle_c3_unwind_stops_after_projected_wheel_crosses_target():
+  controller = ProjectedLatControlPath()
+  target = model(-0.0245, -0.007, -0.00175, 0.00052)
+
+  command = controller.update(
+    target, -0.00175, 7.0, True, False,
+    projected_measured_curvature=0.0005,
+    desired_angle_curvature=-0.00175,
   )
 
   assert command.curvature_rate == 0.0
