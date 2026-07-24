@@ -23,7 +23,8 @@ PATH_C0_TRACKING_ERROR_LIMIT = 0.02
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
-PATH_C3_UNWIND_ERROR_BP = (0.0005, 0.002)
+PATH_PROJECTED_ARRIVAL_ERROR_BP = (0.0005, 0.002)
+PATH_C3_UNWIND_ERROR_BP = PATH_PROJECTED_ARRIVAL_ERROR_BP
 PATH_DIRECTION_MARGIN = 0.0005
 
 
@@ -109,7 +110,7 @@ def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
 
 
 def _undertracking_correction(target: float, measured_curvature: float, limit: float) -> float:
-  """Add authority only while the delivered wheel remains behind the target."""
+  """Return bounded model-error authority while the wheel is behind target."""
   tracking_error = target - measured_curvature
   if tracking_error * target <= 0.0:
     return 0.0
@@ -117,6 +118,51 @@ def _undertracking_correction(target: float, measured_curvature: float, limit: f
     _deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE),
     (-limit, limit),
   )
+
+
+def _projected_tracking_error(target: float, measured_curvature: float,
+                              projected_curvature: float) -> float:
+  """Return the smaller desired-angle shortfall from current and projected wheel."""
+  measured_error = target - measured_curvature
+  projected_error = target - projected_curvature
+  if measured_error * target <= 0.0 or projected_error * target <= 0.0:
+    return 0.0
+
+  return math.copysign(
+    min(abs(measured_error), abs(projected_error)),
+    target,
+  )
+
+
+def _gated_tracking_correction(model_target: float, desired_angle_target: float,
+                               measured_curvature: float, projected_curvature: float,
+                               limit: float) -> float:
+  """Preserve model authority, but only while desired angle permits correction."""
+  desired_error = _projected_tracking_error(
+    desired_angle_target,
+    measured_curvature,
+    projected_curvature,
+  )
+  desired_correction = _clip(
+    _deadzone(desired_error, PATH_TRACKING_ERROR_DEADZONE),
+    (-limit, limit),
+  )
+  if desired_correction == 0.0:
+    return 0.0
+
+  model_correction = _undertracking_correction(model_target, measured_curvature, limit)
+  if model_correction * desired_correction <= 0.0:
+    full_correction = desired_correction
+  else:
+    full_correction = model_correction if abs(model_correction) >= abs(desired_correction) else desired_correction
+
+  arrival_share = _interp(
+    abs(desired_error),
+    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  return full_correction * arrival_share
 
 
 def _unwind_target(target: float, measured_curvature: float) -> float:
@@ -129,7 +175,8 @@ def _unwind_target(target: float, measured_curvature: float) -> float:
 
 
 def _compose_path_target(raw_target: tuple[float, float, float, float],
-                         measured_curvature: float, desired_angle_curvature: float,
+                         measured_curvature: float, projected_curvature: float,
+                         desired_angle_curvature: float,
                          v_ego: float, valid: bool,
                          allocated_c3: float) \
                          -> tuple[tuple[float, float, float, float], float, bool]:
@@ -183,16 +230,21 @@ def _compose_path_target(raw_target: tuple[float, float, float, float],
     offset_target = _unwind_target(offset_target, measured_curvature)
     angle_target = _unwind_target(angle_target, measured_curvature)
   else:
+    correction_is_coherent = model_target * desired_angle_curvature > 0.0
     model_action_disagreement = model_target * desired_curvature < 0.0 or \
                                 model_target * measured_curvature < 0.0
-    offset_target += _undertracking_correction(
+    offset_target += _gated_tracking_correction(
       offset_target,
+      desired_angle_curvature if correction_is_coherent else 0.0,
       measured_curvature,
+      projected_curvature,
       PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT,
     )
-    angle_target += _undertracking_correction(
+    angle_target += _gated_tracking_correction(
       angle_target,
+      desired_angle_curvature if correction_is_coherent else 0.0,
       measured_curvature,
+      projected_curvature,
       PATH_C1_TRACKING_ERROR_LIMIT,
     )
 
@@ -305,7 +357,7 @@ class ProjectedLatControlPath:
     bounds[3] = (safe_c3, safe_c3)
 
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
-      raw_target, measured_curvature, desired_angle_curvature,
+      raw_target, measured_curvature, projected_measured_curvature, desired_angle_curvature,
       v_ego, valid, safe_c3,
     )
     target = (

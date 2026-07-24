@@ -81,24 +81,151 @@ def test_meaningful_model_exit_cannot_project_to_the_opposite_direction():
   assert equivalent_curvature(command, 7.0) <= 0.0
 
 
-def test_projected_wheel_motion_cannot_scale_c0_c1_authority():
-  target = model(0.5, 0.1, 0.01)
-  measured_controller = ProjectedLatControlPath()
-  projected_controller = ProjectedLatControlPath()
-
-  measured_command = measured_controller.update(
-    target, 0.005, 7.0, True, False,
-    projected_measured_curvature=0.005,
-    desired_angle_curvature=0.01,
+def test_projected_arrival_removes_only_c0_c1_correction():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
   )
-  projected_command = projected_controller.update(
+  behind_controller = ProjectedLatControlPath()
+  arrived_controller = ProjectedLatControlPath()
+
+  behind_command = None
+  arrived_command = None
+  for _ in range(100):
+    behind_command = behind_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+    )
+    arrived_command = arrived_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.016,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert behind_command is not None
+  assert arrived_command is not None
+  assert behind_command.path_offset > arrived_command.path_offset
+  assert behind_command.path_angle > arrived_command.path_angle
+  assert abs(arrived_command.path_offset - target.pathOffset) < 1e-9
+  assert abs(arrived_command.path_angle - target.pathAngle) < 1e-9
+
+
+def test_desired_angle_shortfall_extends_c0_c1_beyond_model_geometry():
+  model_curvature = 0.008
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    model_curvature,
+  )
+  model_controller = ProjectedLatControlPath()
+  deeper_controller = ProjectedLatControlPath()
+
+  model_command = None
+  deeper_command = None
+  for _ in range(100):
+    model_command = model_controller.update(
+      target, 0.003, 7.0, True, False,
+      projected_measured_curvature=0.003,
+      desired_angle_curvature=model_curvature,
+    )
+    deeper_command = deeper_controller.update(
+      target, 0.003, 7.0, True, False,
+      projected_measured_curvature=0.003,
+      desired_angle_curvature=0.015,
+    )
+
+  assert model_command is not None
+  assert deeper_command is not None
+  assert deeper_command.path_offset > model_command.path_offset
+  assert deeper_command.path_angle > model_command.path_angle
+
+
+def test_projected_gate_preserves_model_correction_while_both_wheel_estimates_are_behind():
+  model_curvature = 0.015
+  desired_curvature = 0.010
+  measured_curvature = 0.005
+  tracking_correction = model_curvature - measured_curvature - 0.0005
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    model_curvature,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, measured_curvature, 7.0, True, False,
+      projected_measured_curvature=measured_curvature,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert command is not None
+  assert abs(command.path_offset - 0.5 * (model_curvature + tracking_correction) * 7.0 ** 2) < 1e-9
+  assert abs(command.path_angle - (model_curvature + tracking_correction) * 7.0) < 1e-9
+
+
+def test_projected_crossing_drops_correction_immediately_without_reversing_model():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert command is not None
+  arrived = controller.update(
     target, 0.005, 7.0, True, False,
-    projected_measured_curvature=0.03,
-    desired_angle_curvature=0.01,
+    projected_measured_curvature=0.016,
+    desired_angle_curvature=desired_curvature,
   )
 
-  assert measured_command.path_offset == projected_command.path_offset
-  assert measured_command.path_angle == projected_command.path_angle
+  assert arrived.path_offset < command.path_offset
+  assert arrived.path_angle < command.path_angle
+  assert abs(arrived.path_offset - target.pathOffset) < 1e-9
+  assert abs(arrived.path_angle - target.pathAngle) < 1e-9
+
+
+def test_projected_arrival_tapers_c0_c1_correction_without_a_command_step():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+  )
+  just_outside_controller = ProjectedLatControlPath()
+  just_inside_controller = ProjectedLatControlPath()
+
+  just_outside = None
+  just_inside = None
+  for _ in range(100):
+    just_outside = just_outside_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.01449,
+      desired_angle_curvature=desired_curvature,
+    )
+    just_inside = just_inside_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.01451,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert just_outside is not None
+  assert just_inside is not None
+  assert equivalent_curvature(just_outside, 7.0) >= equivalent_curvature(just_inside, 7.0)
+  assert equivalent_curvature(just_outside, 7.0) - equivalent_curvature(just_inside, 7.0) < 0.001
 
 
 def test_measured_wheel_and_desired_angle_reject_stale_opposing_geometry():
@@ -135,6 +262,28 @@ def test_opposing_action_does_not_discard_model_preview_before_wheel_follows_it(
   )
 
   assert equivalent_curvature(command, 7.0) > 0.0
+
+
+def test_opposing_action_does_not_block_c0_c1_correction_toward_desired_angle():
+  model_curvature = 0.015
+  entering_geometry = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    -0.004,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      entering_geometry, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=model_curvature,
+    )
+
+  assert command is not None
+  assert command.path_offset > entering_geometry.pathOffset
+  assert command.path_angle > entering_geometry.pathAngle
 
 
 def test_medium_curve_allocates_c2_once_without_opposing_preview_coefficients():
