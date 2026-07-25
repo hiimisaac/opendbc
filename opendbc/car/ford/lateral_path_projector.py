@@ -20,6 +20,7 @@ PATH_C2_BASEBAND_BP = (0.003, 0.006)
 PATH_PREVIEW_BP = (0.003, 0.012)
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
+PATH_C0_CONTINUATION_ERROR_LIMIT = 0.04
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
@@ -233,12 +234,18 @@ def _compose_path_target(raw_target: tuple[float, float, float, float],
     correction_is_coherent = model_target * desired_angle_curvature > 0.0
     model_action_disagreement = model_target * desired_curvature < 0.0 or \
                                 model_target * measured_curvature < 0.0
+    c3_limit = PATH_LIMITS[3][1] if allocated_c3 >= 0.0 else abs(PATH_LIMITS[3][0])
+    outward_c3_is_pinned = raw_target[3] * model_target > 0.0 and abs(allocated_c3) >= c3_limit
+    continuing_model_preview = correction_is_coherent and outward_c3_is_pinned and \
+                               abs(model_target) > abs(desired_angle_curvature) + PATH_TRACKING_ERROR_DEADZONE
+    c0_tracking_target = model_target if continuing_model_preview else desired_angle_curvature
+    c0_tracking_limit = PATH_C0_CONTINUATION_ERROR_LIMIT if continuing_model_preview else \
+                        (PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT)
     offset_target += _gated_tracking_correction(
-      offset_target,
-      desired_angle_curvature if correction_is_coherent else 0.0,
+      offset_target, c0_tracking_target if correction_is_coherent else 0.0,
       measured_curvature,
       projected_curvature,
-      PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT,
+      c0_tracking_limit,
     )
     angle_target += _gated_tracking_correction(
       angle_target,
