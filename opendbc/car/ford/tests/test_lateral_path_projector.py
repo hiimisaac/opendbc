@@ -646,10 +646,38 @@ def test_attack_is_bounded_and_release_is_immediate():
   attack = controller.update(model(4.0, 0.4, 0.02, 0.001), 0.0, 7.0, True, False)
   release = controller.update(model(0.0, 0.0), 0.0, 7.0, True, False)
 
-  assert 0.0 < attack.path_offset <= 0.147
-  assert 0.0 < attack.path_angle <= 0.042
+  assert 0.0 < attack.path_offset <= 0.18375
+  assert 0.0 < attack.path_angle <= 0.0525
   assert 0.0 <= attack.curvature_rate <= 0.0002
   assert release.path_offset == 0.0
   assert release.path_angle == 0.0
   assert release.curvature == 0.0
   assert release.curvature_rate == 0.0
+
+
+def test_large_undertracking_maneuver_can_attack_faster_than_base_rate():
+  controller = ProjectedLatControlPath()
+  target = model(4.0, 0.4, 0.02, 0.001)
+
+  attack = controller.update(
+    target, 0.0, 7.0, True, False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.02,
+  )
+
+  assert 0.147 < attack.path_offset <= 0.18375
+  assert 0.042 < attack.path_angle <= 0.0525
+
+
+def test_maneuver_attack_returns_to_base_rate_at_projected_arrival():
+  controller = ProjectedLatControlPath()
+  target = model(4.0, 0.4, 0.02, 0.001)
+
+  attack = controller.update(
+    target, 0.015, 7.0, True, False,
+    projected_measured_curvature=0.021,
+    desired_angle_curvature=0.02,
+  )
+
+  assert 0.0 < attack.path_offset <= 0.147
+  assert 0.0 < attack.path_angle <= 0.042

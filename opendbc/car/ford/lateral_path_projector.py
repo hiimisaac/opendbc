@@ -14,6 +14,7 @@ PATH_LIMITS = (
 )
 PATH_MIN_LOOKAHEAD = 7.0
 PATH_MANEUVER_CURVATURE_SLEW = 0.006
+PATH_TRACKING_MANEUVER_CURVATURE_SLEW = 0.0075
 PATH_C2_SLEW = 0.0002
 PATH_C3_SLEW = 0.0002
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
@@ -347,9 +348,20 @@ class ProjectedLatControlPath:
     raw_target = target
     lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
 
+    tracking_error = _projected_tracking_error(
+      desired_angle_curvature, measured_curvature, projected_measured_curvature,
+    )
+    tracking_attack_share = _interp(
+      abs(tracking_error), *PATH_PROJECTED_ARRIVAL_ERROR_BP, 0.0, 1.0,
+    )
+    maneuver_curvature_slew = _blend(
+      PATH_MANEUVER_CURVATURE_SLEW,
+      PATH_TRACKING_MANEUVER_CURVATURE_SLEW,
+      tracking_attack_share,
+    )
     attack_steps = (
-      0.5 * PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2,
-      PATH_MANEUVER_CURVATURE_SLEW * lookahead,
+      0.5 * maneuver_curvature_slew * PATH_MIN_LOOKAHEAD ** 2,
+      maneuver_curvature_slew * lookahead,
       PATH_C2_SLEW,
       PATH_C3_SLEW,
     )
