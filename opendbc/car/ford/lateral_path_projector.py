@@ -21,6 +21,7 @@ PATH_PREVIEW_BP = (0.003, 0.012)
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
 PATH_C0_CONTINUATION_ERROR_LIMIT = 0.04
+PATH_C0_CONTINUATION_MARGIN = 0.006
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
@@ -93,15 +94,17 @@ def _equivalent_curvature(coefficients: tuple[float, float, float, float], dista
 
 def _maneuver_demand(raw_target: tuple[float, float, float, float],
                      v_ego: float, valid: bool) -> float:
-  """Return the strongest current or preview curvature observation."""
+  """Return the strongest current or coherent preview curvature observation."""
   if not valid:
     return abs(raw_target[2])
 
   lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
   offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
   angle_curvature = raw_target[1] / lookahead
+  coherent_geometry_demand = min(abs(offset_curvature), abs(angle_curvature)) \
+    if offset_curvature * angle_curvature > 0.0 else 0.0
   curvature_rate_demand = abs(raw_target[3]) * lookahead / 3.0
-  return max(abs(raw_target[2]), abs(offset_curvature), abs(angle_curvature), curvature_rate_demand)
+  return max(abs(raw_target[2]), coherent_geometry_demand, curvature_rate_demand)
 
 
 def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
@@ -238,7 +241,11 @@ def _compose_path_target(raw_target: tuple[float, float, float, float],
     outward_c3_is_pinned = raw_target[3] * model_target > 0.0 and abs(allocated_c3) >= c3_limit
     continuing_model_preview = correction_is_coherent and outward_c3_is_pinned and \
                                abs(model_target) > abs(desired_angle_curvature) + PATH_TRACKING_ERROR_DEADZONE
-    c0_tracking_target = model_target if continuing_model_preview else desired_angle_curvature
+    bounded_preview_target = math.copysign(
+      min(abs(model_target), abs(desired_angle_curvature) + PATH_C0_CONTINUATION_MARGIN),
+      model_target,
+    )
+    c0_tracking_target = bounded_preview_target if continuing_model_preview else desired_angle_curvature
     c0_tracking_limit = PATH_C0_CONTINUATION_ERROR_LIMIT if continuing_model_preview else \
                         (PATH_C1_TRACKING_ERROR_LIMIT if model_action_disagreement else PATH_C0_TRACKING_ERROR_LIMIT)
     offset_target += _gated_tracking_correction(
