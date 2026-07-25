@@ -138,14 +138,38 @@ def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
   assert command.curvature == 0.0
   assert command.curvature_rate == 0.001023
 
-  preview_arrived = controller.update(
+  bounded_preview_arrived = controller.update(
     target, 0.01, 7.0, True, False,
-    projected_measured_curvature=model_curvature,
+    projected_measured_curvature=desired_angle_curvature + 0.006,
     desired_angle_curvature=desired_angle_curvature,
   )
 
-  assert abs(preview_arrived.path_offset - target.pathOffset) < 1e-9
-  assert abs(preview_arrived.path_angle - target.pathAngle) < 1e-9
+  assert abs(bounded_preview_arrived.path_offset - target.pathOffset) < 1e-9
+  assert abs(bounded_preview_arrived.path_angle - target.pathAngle) < 1e-9
+
+
+def test_continuing_model_preview_cannot_extend_c0_past_bounded_angle_corridor():
+  model_curvature = 0.04
+  desired_angle_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_angle_curvature,
+    0.002,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, desired_angle_curvature + 0.007, 7.0, True, False,
+      projected_measured_curvature=desired_angle_curvature + 0.009,
+      desired_angle_curvature=desired_angle_curvature,
+    )
+
+  assert command is not None
+  assert abs(command.path_offset - target.pathOffset) < 1e-9
+  assert abs(command.path_angle - target.pathAngle) < 1e-9
 
 
 def test_available_c3_does_not_spill_continuation_into_c0():
@@ -480,6 +504,31 @@ def test_transition_crossfades_once_from_c2_to_full_polynomial():
   assert full.curvature == 0.0
   assert full.path_offset > transition.path_offset
   assert full.path_angle > transition.path_angle
+
+
+def test_single_preview_observation_cannot_pull_ordinary_c2_into_polynomial_transition():
+  controller = ProjectedLatControlPath()
+  curvature = 0.0017
+  offset_curvature = 0.0047
+  angle_curvature = 0.0025
+  target = model(
+    0.5 * offset_curvature * 7.0 ** 2,
+    angle_curvature * 12.0,
+    curvature,
+  )
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, curvature, 12.0, True, False,
+      projected_measured_curvature=curvature,
+      desired_angle_curvature=curvature,
+    )
+
+  assert command is not None
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert abs(command.curvature - curvature) < 1e-9
 
 
 def test_meaningful_c3_preview_can_leave_c2_baseband():
