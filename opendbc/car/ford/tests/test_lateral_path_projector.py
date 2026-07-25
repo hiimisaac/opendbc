@@ -113,6 +113,66 @@ def test_projected_arrival_removes_only_c0_c1_correction():
   assert abs(arrived_command.path_angle - target.pathAngle) < 1e-9
 
 
+def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
+  model_curvature = 0.04
+  desired_angle_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_angle_curvature,
+    0.002,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=0.02,
+      desired_angle_curvature=desired_angle_curvature,
+    )
+
+  assert command is not None
+  assert command.path_offset > target.pathOffset
+  assert abs(command.path_angle - target.pathAngle) < 1e-9
+  assert command.curvature == 0.0
+  assert command.curvature_rate == 0.001023
+
+  preview_arrived = controller.update(
+    target, 0.01, 7.0, True, False,
+    projected_measured_curvature=model_curvature,
+    desired_angle_curvature=desired_angle_curvature,
+  )
+
+  assert abs(preview_arrived.path_offset - target.pathOffset) < 1e-9
+  assert abs(preview_arrived.path_angle - target.pathAngle) < 1e-9
+
+
+def test_available_c3_does_not_spill_continuation_into_c0():
+  model_curvature = 0.04
+  desired_angle_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_angle_curvature,
+    0.0005,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=0.02,
+      desired_angle_curvature=desired_angle_curvature,
+    )
+
+  assert command is not None
+  assert abs(command.path_offset - target.pathOffset) < 1e-9
+  assert abs(command.path_angle - target.pathAngle) < 1e-9
+  assert command.curvature_rate == target.curvatureRate
+
+
 def test_desired_angle_shortfall_extends_c0_c1_beyond_model_geometry():
   model_curvature = 0.008
   target = model(
