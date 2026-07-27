@@ -13,8 +13,6 @@ PATH_LIMITS = (
   (-0.001024, 0.001023),
 )
 PATH_MIN_LOOKAHEAD = 7.0
-PATH_MANEUVER_CURVATURE_SLEW = 0.006
-PATH_TRACKING_MANEUVER_CURVATURE_SLEW = 0.0075
 PATH_C2_SLEW = 0.0002
 PATH_C3_SLEW = 0.0002
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
@@ -78,14 +76,6 @@ def _limit_attack(value: float, last: float, max_step: float) -> float:
 
 def _basis(distance: float) -> tuple[float, float, float, float]:
   return 2.0 / distance ** 2, 2.0 / distance, 1.0, distance / 3.0
-
-
-def _attack_bounds(last: float, step: float, limits: tuple[float, float]) -> tuple[float, float]:
-  if last > 0.0:
-    return max(limits[0], -step), min(limits[1], last + step)
-  if last < 0.0:
-    return max(limits[0], last - step), min(limits[1], step)
-  return max(limits[0], -step), min(limits[1], step)
 
 
 def _equivalent_curvature(coefficients: tuple[float, float, float, float], distance: float = 7.0) -> float:
@@ -348,27 +338,9 @@ class ProjectedLatControlPath:
     raw_target = target
     lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
 
-    tracking_error = _projected_tracking_error(
-      desired_angle_curvature, measured_curvature, projected_measured_curvature,
-    )
-    tracking_attack_share = _interp(
-      abs(tracking_error), *PATH_PROJECTED_ARRIVAL_ERROR_BP, 0.0, 1.0,
-    )
-    maneuver_curvature_slew = _blend(
-      PATH_MANEUVER_CURVATURE_SLEW,
-      PATH_TRACKING_MANEUVER_CURVATURE_SLEW,
-      tracking_attack_share,
-    )
-    attack_steps = (
-      0.5 * maneuver_curvature_slew * PATH_MIN_LOOKAHEAD ** 2,
-      maneuver_curvature_slew * lookahead,
-      PATH_C2_SLEW,
-      PATH_C3_SLEW,
-    )
-    bounds = [
-      _attack_bounds(last, step, limits)
-      for last, step, limits in zip(self._last_command.coefficients(), attack_steps, PATH_LIMITS, strict=True)
-    ]
+    # The PSCM owns physical steering-rate limits. Keep C0/C1 bounded by the
+    # signal range without adding another stateful attack limit in front of it.
+    bounds = list(PATH_LIMITS)
     maneuver_demand = _maneuver_demand(raw_target, v_ego, valid)
     residual_share = _interp(maneuver_demand, *PATH_C2_BASEBAND_BP, 0.0, 1.0)
     # C2 owns normal driving. The complete polynomial is a single continuous

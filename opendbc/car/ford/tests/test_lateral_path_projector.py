@@ -640,14 +640,14 @@ def test_driver_override_projects_the_delivered_wheel_path():
   assert command.curvature_rate == 0.0
 
 
-def test_attack_is_bounded_and_release_is_immediate():
+def test_c0_c1_attack_uses_full_signal_range_and_release_is_immediate():
   controller = ProjectedLatControlPath()
 
   attack = controller.update(model(4.0, 0.4, 0.02, 0.001), 0.0, 7.0, True, False)
   release = controller.update(model(0.0, 0.0), 0.0, 7.0, True, False)
 
-  assert 0.0 < attack.path_offset <= 0.18375
-  assert 0.0 < attack.path_angle <= 0.0525
+  assert 0.18375 < attack.path_offset <= 4.60
+  assert 0.0525 < attack.path_angle <= 0.497
   assert 0.0 <= attack.curvature_rate <= 0.0002
   assert release.path_offset == 0.0
   assert release.path_angle == 0.0
@@ -655,7 +655,7 @@ def test_attack_is_bounded_and_release_is_immediate():
   assert release.curvature_rate == 0.0
 
 
-def test_large_undertracking_maneuver_can_attack_faster_than_base_rate():
+def test_large_undertracking_maneuver_is_not_software_rate_limited():
   controller = ProjectedLatControlPath()
   target = model(4.0, 0.4, 0.02, 0.001)
 
@@ -665,11 +665,11 @@ def test_large_undertracking_maneuver_can_attack_faster_than_base_rate():
     desired_angle_curvature=0.02,
   )
 
-  assert 0.147 < attack.path_offset <= 0.18375
-  assert 0.042 < attack.path_angle <= 0.0525
+  assert 0.18375 < attack.path_offset <= 4.60
+  assert 0.0525 < attack.path_angle <= 0.497
 
 
-def test_maneuver_attack_returns_to_base_rate_at_projected_arrival():
+def test_projected_arrival_does_not_reintroduce_c0_c1_attack_limit():
   controller = ProjectedLatControlPath()
   target = model(4.0, 0.4, 0.02, 0.001)
 
@@ -679,5 +679,5 @@ def test_maneuver_attack_returns_to_base_rate_at_projected_arrival():
     desired_angle_curvature=0.02,
   )
 
-  assert 0.0 < attack.path_offset <= 0.147
-  assert 0.0 < attack.path_angle <= 0.042
+  assert 0.18375 < attack.path_offset <= 4.60
+  assert 0.0525 < attack.path_angle <= 0.497
