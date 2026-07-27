@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.lateral_path_projector import (
+  PATH_MANEUVER_CURVATURE_SLEW,
+  PATH_MIN_LOOKAHEAD,
+  PATH_TRACKING_MANEUVER_CURVATURE_SLEW,
+  ProjectedLatControlPath,
+)
 
 
 def model(path_offset: float, path_angle: float, curvature: float = 0.0, curvature_rate: float = 0.0):
@@ -646,8 +651,8 @@ def test_attack_is_bounded_and_release_is_immediate():
   attack = controller.update(model(4.0, 0.4, 0.02, 0.001), 0.0, 7.0, True, False)
   release = controller.update(model(0.0, 0.0), 0.0, 7.0, True, False)
 
-  assert 0.0 < attack.path_offset <= 0.18375
-  assert 0.0 < attack.path_angle <= 0.0525
+  assert 0.0 < attack.path_offset <= 0.5 * PATH_TRACKING_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2
+  assert 0.0 < attack.path_angle <= PATH_TRACKING_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD
   assert 0.0 <= attack.curvature_rate <= 0.0002
   assert release.path_offset == 0.0
   assert release.path_angle == 0.0
@@ -665,8 +670,10 @@ def test_large_undertracking_maneuver_can_attack_faster_than_base_rate():
     desired_angle_curvature=0.02,
   )
 
-  assert 0.147 < attack.path_offset <= 0.18375
-  assert 0.042 < attack.path_angle <= 0.0525
+  assert 0.5 * PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2 < attack.path_offset <= \
+    0.5 * PATH_TRACKING_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2
+  assert PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD < attack.path_angle <= \
+    PATH_TRACKING_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD
 
 
 def test_maneuver_attack_returns_to_base_rate_at_projected_arrival():
@@ -679,5 +686,5 @@ def test_maneuver_attack_returns_to_base_rate_at_projected_arrival():
     desired_angle_curvature=0.02,
   )
 
-  assert 0.0 < attack.path_offset <= 0.147
-  assert 0.0 < attack.path_angle <= 0.042
+  assert 0.0 < attack.path_offset <= 0.5 * PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD ** 2
+  assert 0.0 < attack.path_angle <= PATH_MANEUVER_CURVATURE_SLEW * PATH_MIN_LOOKAHEAD
