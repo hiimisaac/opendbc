@@ -144,6 +144,7 @@ class CarController(CarControllerBase):
           CC.latActive, driver_override,
           projected_measured_curvature=projected_wheel_curvature,
           desired_angle_curvature=desired_angle_curvature,
+          lat_ctl_limit=CS.lat_ctl_limit,
         )
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate

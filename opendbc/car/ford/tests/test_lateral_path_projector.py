@@ -197,6 +197,144 @@ def test_available_c3_does_not_spill_continuation_into_c0():
   assert command.curvature_rate == target.curvatureRate
 
 
+def test_pscm_envelope_reallocates_outward_c3_into_c0_while_wheel_is_behind():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+    0.001023,
+  )
+  controllers = [ProjectedLatControlPath() for _ in range(3)]
+  commands = [None, None, None]
+
+  for _ in range(100):
+    for limit_status, controller in enumerate(controllers):
+      commands[limit_status] = controller.update(
+        target, 0.005, 7.0, True, False,
+        projected_measured_curvature=0.005,
+        desired_angle_curvature=desired_curvature,
+        lat_ctl_limit=limit_status,
+      )
+
+  clear, close, reached = commands
+  assert clear is not None
+  assert close is not None
+  assert reached is not None
+  assert clear.path_offset < close.path_offset < reached.path_offset
+  assert clear.curvature_rate > close.curvature_rate > reached.curvature_rate
+  assert abs(close.curvature_rate - 0.5 * clear.curvature_rate) < 1e-12
+  assert abs(reached.curvature_rate) < 1e-12
+  assert equivalent_curvature(clear, 3.0) < equivalent_curvature(close, 3.0) < equivalent_curvature(reached, 3.0)
+  assert equivalent_curvature(clear, 7.0) < equivalent_curvature(close, 7.0) < equivalent_curvature(reached, 7.0)
+  assert abs(equivalent_curvature(clear, 15.0) - equivalent_curvature(close, 15.0)) < 1e-9
+  assert abs(equivalent_curvature(clear, 15.0) - equivalent_curvature(reached, 15.0)) < 1e-9
+
+
+def test_pscm_envelope_does_not_reallocate_c3_after_projected_arrival():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+    0.001023,
+  )
+  baseline_controller = ProjectedLatControlPath()
+  controller = ProjectedLatControlPath()
+
+  baseline = None
+  reallocated = None
+  for _ in range(100):
+    baseline = baseline_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.016,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=0,
+    )
+    reallocated = controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=2,
+    )
+
+  arrived = controller.update(
+    target, 0.005, 7.0, True, False,
+    projected_measured_curvature=0.016,
+    desired_angle_curvature=desired_curvature,
+    lat_ctl_limit=2,
+  )
+
+  assert baseline is not None
+  assert reallocated is not None
+  assert reallocated != baseline
+  assert arrived == baseline
+
+
+def test_pscm_driver_limit_does_not_add_path_authority():
+  desired_curvature = 0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+    0.001023,
+  )
+  clear_controller = ProjectedLatControlPath()
+  driver_limit_controller = ProjectedLatControlPath()
+
+  clear = None
+  driver_limited = None
+  for _ in range(100):
+    clear = clear_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=0,
+    )
+    driver_limited = driver_limit_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=3,
+    )
+
+  assert clear == driver_limited
+
+
+def test_pscm_envelope_reallocation_is_symmetric_for_right_turns():
+  desired_curvature = -0.015
+  target = model(
+    0.5 * desired_curvature * 7.0 ** 2,
+    desired_curvature * 7.0,
+    desired_curvature,
+    -0.001,
+  )
+  clear_controller = ProjectedLatControlPath()
+  reached_controller = ProjectedLatControlPath()
+
+  clear = None
+  reached = None
+  for _ in range(100):
+    clear = clear_controller.update(
+      target, -0.005, 7.0, True, False,
+      projected_measured_curvature=-0.005,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=0,
+    )
+    reached = reached_controller.update(
+      target, -0.005, 7.0, True, False,
+      projected_measured_curvature=-0.005,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=2,
+    )
+
+  assert clear is not None
+  assert reached is not None
+  assert abs(reached.path_offset) > abs(clear.path_offset)
+  assert abs(reached.curvature_rate) < abs(clear.curvature_rate)
+  assert abs(equivalent_curvature(clear, 15.0) - equivalent_curvature(reached, 15.0)) < 1e-9
+
+
 def test_desired_angle_shortfall_extends_c0_c1_beyond_model_geometry():
   model_curvature = 0.008
   target = model(
