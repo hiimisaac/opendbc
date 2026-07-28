@@ -194,7 +194,7 @@ class TestCarModelBase(unittest.TestCase):
       self.skipTest("no need to check carParams for dashcamOnly")
 
     self.assertGreater(self.CP.mass, 1)
-    if self.CP.steerControlType not in (SteerControlType.angle, SteerControlType.curvature):
+    if self.CP.steerControlType not in (SteerControlType.angle, SteerControlType.curvature, SteerControlType.path):
       tuning = self.CP.lateralTuning.which()
       if tuning == "pid":
         self.assertTrue(len(self.CP.lateralTuning.pid.kpV))
@@ -327,7 +327,7 @@ class TestCarModelBase(unittest.TestCase):
     valid_addrs = [(addr, bus, size) for bus, addrs in self.fingerprint.items() for addr, size in addrs.items()]
     address, bus, size = fuzzy.choice(valid_addrs)
     msgs = fuzzy.list(lambda: fuzzy.binary(min_size=size, max_size=size), min_size=20)
-    vehicle_speed_seen = self.CP.steerControlType == SteerControlType.angle and not self.CP.notCar
+    vehicle_speed_seen = self.CP.steerControlType in (SteerControlType.angle, SteerControlType.path) and not self.CP.notCar
 
     for n, dat in enumerate(msgs):
       prev_panda_gas = self.safety.get_gas_pressed_prev()
@@ -385,7 +385,7 @@ class TestCarModelBase(unittest.TestCase):
     controls_allowed_prev = False
     CS_prev = car.CarState.new_message()
     checks = defaultdict(int)
-    vehicle_speed_seen = self.CP.steerControlType == SteerControlType.angle and not self.CP.notCar
+    vehicle_speed_seen = self.CP.steerControlType in (SteerControlType.angle, SteerControlType.path) and not self.CP.notCar
 
     for idx, can in enumerate(self.can_msgs):
       CS = self.CI.update(can).as_reader()
