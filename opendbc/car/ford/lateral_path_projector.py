@@ -16,6 +16,8 @@ PATH_MIN_LOOKAHEAD = 7.0
 PATH_C2_SLEW = 0.0002
 PATH_C3_SLEW = 0.0002
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
+PATH_SPATIAL_ONSET_LOOKAHEAD = 12.0
+PATH_SPATIAL_ONSET_RELATIVE_MIN = 0.5
 PATH_PREVIEW_BP = (0.003, 0.012)
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
@@ -134,6 +136,39 @@ def _projected_tracking_error(target: float, measured_curvature: float,
     min(abs(measured_error), abs(projected_error)),
     target,
   )
+
+
+def _confirmed_spatial_onset_demand(raw_target: tuple[float, float, float, float],
+                                    desired_angle_curvature: float,
+                                    measured_curvature: float,
+                                    projected_curvature: float,
+                                    valid: bool) -> float:
+  """Recognize a real low-speed turn from its spatial slope while still behind."""
+  if not valid:
+    return 0.0
+
+  tracking_error = _projected_tracking_error(
+    desired_angle_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  spatial_change = abs(raw_target[3]) * PATH_SPATIAL_ONSET_LOOKAHEAD / 3.0
+  confirmed = tracking_error * desired_angle_curvature > 0.0 and \
+              raw_target[3] * desired_angle_curvature > 0.0 and \
+              spatial_change >= max(
+                PATH_C2_BASEBAND_BP[0],
+                PATH_SPATIAL_ONSET_RELATIVE_MIN * abs(desired_angle_curvature),
+              )
+  if not confirmed:
+    return 0.0
+
+  arrival_share = _interp(
+    abs(tracking_error),
+    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  return spatial_change * arrival_share
 
 
 def _gated_tracking_correction(model_target: float, desired_angle_target: float,
@@ -381,7 +416,16 @@ class ProjectedLatControlPath:
     # The PSCM owns physical steering-rate limits. Keep C0/C1 bounded by the
     # signal range without adding another stateful attack limit in front of it.
     bounds = list(PATH_LIMITS)
-    maneuver_demand = _maneuver_demand(raw_target, v_ego, valid)
+    maneuver_demand = max(
+      _maneuver_demand(raw_target, v_ego, valid),
+      _confirmed_spatial_onset_demand(
+        raw_target,
+        desired_angle_curvature,
+        measured_curvature,
+        projected_measured_curvature,
+        valid,
+      ),
+    )
     residual_share = _interp(maneuver_demand, *PATH_C2_BASEBAND_BP, 0.0, 1.0)
     # C2 owns normal driving. The complete polynomial is a single continuous
     # authority extension, reaching the previous full-strength command at 0.006.
