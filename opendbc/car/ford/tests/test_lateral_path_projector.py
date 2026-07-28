@@ -32,7 +32,10 @@ def test_feasible_strong_model_is_reproduced_once_wheel_delivers_it():
 
   command = None
   for _ in range(100):
-    command = controller.update(target, delivered_curvature, 7.0, True, False)
+    command = controller.update(
+      target, delivered_curvature, 7.0, True, False,
+      desired_angle_curvature=delivered_curvature,
+    )
 
   assert command is not None
   for distance in (3.0, 7.0, 15.0, 30.0):
@@ -113,6 +116,145 @@ def test_projected_arrival_removes_only_c0_c1_correction():
   assert abs(arrived_command.path_angle - target.pathAngle) < 1e-9
 
 
+def test_arrived_action_retains_only_its_share_of_deeper_model_preview():
+  model_curvature = 0.07
+  desired_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_curvature,
+  )
+  behind_controller = ProjectedLatControlPath()
+  arrived_controller = ProjectedLatControlPath()
+
+  behind = None
+  arrived = None
+  for _ in range(100):
+    behind = behind_controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+    )
+    arrived = arrived_controller.update(
+      target, desired_curvature, 7.0, True, False,
+      projected_measured_curvature=desired_curvature,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert behind is not None
+  assert arrived is not None
+  action_share = desired_curvature / model_curvature
+  assert 0.0 < arrived.path_offset < behind.path_offset
+  assert 0.0 < arrived.path_angle < behind.path_angle
+  assert arrived.path_offset <= action_share * target.pathOffset
+  assert arrived.path_angle <= action_share * target.pathAngle
+  assert 0.0 < equivalent_curvature(arrived, 7.0) < equivalent_curvature(behind, 7.0)
+
+  relatched = arrived_controller.update(
+    target, 0.005, 7.0, True, False,
+    projected_measured_curvature=0.005,
+    desired_angle_curvature=desired_curvature,
+  )
+
+  assert relatched.path_offset == behind.path_offset
+  assert relatched.path_angle == behind.path_angle
+
+
+def test_action_aligned_preview_keeps_full_authority_while_wheel_is_behind():
+  model_curvature = 0.07
+  desired_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_curvature,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.005, 7.0, True, False,
+      projected_measured_curvature=0.005,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert command is not None
+  assert command.path_offset > target.pathOffset
+  assert command.path_angle >= target.pathAngle
+
+
+def test_action_aligned_preview_handoff_is_continuous_at_arrival():
+  model_curvature = 0.07
+  desired_curvature = 0.015
+  target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_curvature,
+  )
+  outside_controller = ProjectedLatControlPath()
+  inside_controller = ProjectedLatControlPath()
+
+  outside = None
+  inside = None
+  for _ in range(100):
+    outside = outside_controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=desired_curvature - 0.00051,
+      desired_angle_curvature=desired_curvature,
+    )
+    inside = inside_controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=desired_curvature - 0.00049,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert outside is not None
+  assert inside is not None
+  assert equivalent_curvature(outside, 7.0) >= equivalent_curvature(inside, 7.0) > 0.0
+  assert equivalent_curvature(outside, 7.0) - equivalent_curvature(inside, 7.0) < 0.003
+
+
+def test_action_aligned_preview_is_symmetric_for_right_turns():
+  # Keep the raw polynomial inside Ford's intentionally asymmetric signal
+  # bounds so this isolates controller symmetry from DBC clipping.
+  model_curvature = 0.04
+  desired_curvature = 0.015
+  left_target = model(
+    0.5 * model_curvature * 7.0 ** 2,
+    model_curvature * 7.0,
+    desired_curvature,
+    0.0005,
+  )
+  right_target = model(
+    -left_target.pathOffset,
+    -left_target.pathAngle,
+    -left_target.curvature,
+    -left_target.curvatureRate,
+  )
+  left_controller = ProjectedLatControlPath()
+  right_controller = ProjectedLatControlPath()
+
+  left = None
+  right = None
+  for _ in range(100):
+    left = left_controller.update(
+      left_target, desired_curvature, 7.0, True, False,
+      projected_measured_curvature=desired_curvature,
+      desired_angle_curvature=desired_curvature,
+    )
+    right = right_controller.update(
+      right_target, -desired_curvature, 7.0, True, False,
+      projected_measured_curvature=-desired_curvature,
+      desired_angle_curvature=-desired_curvature,
+    )
+
+  assert left is not None
+  assert right is not None
+  assert right.valid == left.valid
+  for left_coefficient, right_coefficient in zip(left.coefficients(), right.coefficients(), strict=True):
+    assert abs(right_coefficient + left_coefficient) < 1e-12
+
+
 def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
   model_curvature = 0.04
   desired_angle_curvature = 0.015
@@ -133,10 +275,11 @@ def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
     )
 
   assert command is not None
-  assert command.path_offset > target.pathOffset
-  assert abs(command.path_angle - target.pathAngle) < 1e-9
+  action_share = desired_angle_curvature / model_curvature
+  assert command.path_offset > action_share * target.pathOffset
+  assert abs(command.path_angle - action_share * target.pathAngle) < 1e-9
   assert command.curvature == 0.0
-  assert command.curvature_rate == 0.001023
+  assert command.curvature_rate == action_share * 0.001023
 
   bounded_preview_arrived = controller.update(
     target, 0.01, 7.0, True, False,
@@ -144,8 +287,8 @@ def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
     desired_angle_curvature=desired_angle_curvature,
   )
 
-  assert abs(bounded_preview_arrived.path_offset - target.pathOffset) < 1e-9
-  assert abs(bounded_preview_arrived.path_angle - target.pathAngle) < 1e-9
+  assert abs(bounded_preview_arrived.path_offset - action_share * target.pathOffset) < 1e-9
+  assert abs(bounded_preview_arrived.path_angle - action_share * target.pathAngle) < 1e-9
 
 
 def test_continuing_model_preview_cannot_extend_c0_past_bounded_angle_corridor():
@@ -168,8 +311,9 @@ def test_continuing_model_preview_cannot_extend_c0_past_bounded_angle_corridor()
     )
 
   assert command is not None
-  assert abs(command.path_offset - target.pathOffset) < 1e-9
-  assert abs(command.path_angle - target.pathAngle) < 1e-9
+  action_share = desired_angle_curvature / model_curvature
+  assert abs(command.path_offset - action_share * target.pathOffset) < 1e-9
+  assert abs(command.path_angle - action_share * target.pathAngle) < 1e-9
 
 
 def test_available_c3_does_not_spill_continuation_into_c0():
@@ -192,9 +336,10 @@ def test_available_c3_does_not_spill_continuation_into_c0():
     )
 
   assert command is not None
-  assert abs(command.path_offset - target.pathOffset) < 1e-9
-  assert abs(command.path_angle - target.pathAngle) < 1e-9
-  assert command.curvature_rate == target.curvatureRate
+  action_share = desired_angle_curvature / model_curvature
+  assert abs(command.path_offset - action_share * target.pathOffset) < 1e-9
+  assert abs(command.path_angle - action_share * target.pathAngle) < 1e-9
+  assert command.curvature_rate == action_share * target.curvatureRate
 
 
 def test_pscm_envelope_reallocates_outward_c3_into_c0_while_wheel_is_behind():

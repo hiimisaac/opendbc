@@ -130,6 +130,30 @@ def _projected_tracking_error(target: float, measured_curvature: float,
   )
 
 
+def _action_aligned_preview_share(model_target: float, desired_angle_target: float,
+                                  measured_curvature: float, projected_curvature: float) -> float:
+  """Retain action-holding geometry at arrival and full preview only while behind."""
+  if model_target == 0.0:
+    return 1.0
+
+  action_share = 0.0
+  if model_target * desired_angle_target > 0.0:
+    action_share = _clip(abs(desired_angle_target / model_target), (0.0, 1.0))
+
+  tracking_error = _projected_tracking_error(
+    desired_angle_target,
+    measured_curvature,
+    projected_curvature,
+  )
+  shortfall_share = _interp(
+    abs(tracking_error),
+    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  return action_share + (1.0 - action_share) * shortfall_share
+
+
 def _gated_tracking_correction(model_target: float, desired_angle_target: float,
                                measured_curvature: float, projected_curvature: float,
                                limit: float) -> float:
@@ -415,8 +439,20 @@ class ProjectedLatControlPath:
     c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
+    preview_share = _action_aligned_preview_share(
+      model_curvature,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
+    )
+    coefficients = (
+      coefficients[0] * preview_share,
+      coefficients[1] * preview_share,
+      coefficients[2],
+      coefficients[3] * preview_share,
+    )
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
     self._last_command = command
-    self._last_allocated_c3 = safe_c3 if c3_was_reallocated else command.curvature_rate
+    self._last_allocated_c3 = safe_c3 if c3_was_reallocated or preview_share < 1.0 else command.curvature_rate
     return command
