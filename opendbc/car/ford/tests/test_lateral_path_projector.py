@@ -208,6 +208,96 @@ def test_spatial_preview_is_symmetric_for_right_turns():
     assert abs(right_coefficient + left_coefficient) < 1e-12
 
 
+def test_confirmed_low_speed_spatial_onset_uses_preview_while_wheel_is_behind():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    desired_curvature = direction * 0.006
+    spatial_curvature = direction * 0.015
+    target = model(
+      0.5 * spatial_curvature * 7.0 ** 2,
+      spatial_curvature * 7.0,
+      desired_curvature,
+      direction * 0.001,
+    )
+
+    command = None
+    for _ in range(100):
+      command = controller.update(
+        target, 0.0, 5.0, True, False,
+        projected_measured_curvature=0.0,
+        desired_angle_curvature=desired_curvature,
+      )
+
+    assert command is not None
+    assert direction * command.path_offset > 0.0
+    assert direction * command.path_angle > 0.0
+    assert 0.0 < direction * command.curvature < abs(desired_curvature)
+    assert direction * command.curvature_rate > 0.0
+
+
+def test_unconfirmed_low_speed_spatial_slope_stays_on_c2():
+  cases = (
+    (0.006, 0.0007),
+    (0.010, 0.0010),
+  )
+  for desired_curvature, curvature_rate in cases:
+    controller = ProjectedLatControlPath()
+    spatial_curvature = 0.015
+    target = model(
+      0.5 * spatial_curvature * 7.0 ** 2,
+      spatial_curvature * 7.0,
+      desired_curvature,
+      curvature_rate,
+    )
+
+    command = None
+    for _ in range(100):
+      command = controller.update(
+        target, 0.0, 5.0, True, False,
+        projected_measured_curvature=0.0,
+        desired_angle_curvature=desired_curvature,
+      )
+
+    assert command is not None
+    assert command.path_offset == 0.0
+    assert command.path_angle == 0.0
+    assert command.curvature == desired_curvature
+    assert command.curvature_rate == 0.0
+
+
+def test_confirmed_spatial_onset_is_removed_immediately_at_projected_arrival():
+  controller = ProjectedLatControlPath()
+  desired_curvature = 0.006
+  spatial_curvature = 0.015
+  target = model(
+    0.5 * spatial_curvature * 7.0 ** 2,
+    spatial_curvature * 7.0,
+    desired_curvature,
+    0.001,
+  )
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.0, 5.0, True, False,
+      projected_measured_curvature=0.0,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert command is not None
+  assert command.path_offset > 0.0
+  arrived = controller.update(
+    target, 0.0, 5.0, True, False,
+    projected_measured_curvature=desired_curvature,
+    desired_angle_curvature=desired_curvature,
+  )
+
+  assert arrived.path_offset == 0.0
+  assert arrived.path_angle == 0.0
+  assert arrived.curvature > command.curvature
+  assert arrived.curvature_rate == 0.0
+
+
 def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
   model_curvature = 0.04
   desired_angle_curvature = 0.015
