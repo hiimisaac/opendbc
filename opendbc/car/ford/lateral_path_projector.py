@@ -86,17 +86,23 @@ def _equivalent_curvature(coefficients: tuple[float, float, float, float], dista
 
 def _maneuver_demand(raw_target: tuple[float, float, float, float],
                      v_ego: float, valid: bool) -> float:
-  """Return the strongest current or coherent preview curvature observation."""
-  if not valid:
-    return abs(raw_target[2])
-
+  """Use polynomial authority for spatial curvature change or C2 overflow."""
   lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
+  desired_curvature = abs(raw_target[2])
+  curvature_rate_demand = abs(raw_target[3]) * lookahead / 3.0
+  if not valid:
+    return max(curvature_rate_demand, desired_curvature - PATH_LIMITS[2][1], 0.0)
+
   offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
   angle_curvature = raw_target[1] / lookahead
   coherent_geometry_demand = min(abs(offset_curvature), abs(angle_curvature)) \
     if offset_curvature * angle_curvature > 0.0 else 0.0
-  curvature_rate_demand = abs(raw_target[3]) * lookahead / 3.0
-  return max(abs(raw_target[2]), coherent_geometry_demand, curvature_rate_demand)
+  return max(
+    curvature_rate_demand,
+    desired_curvature - PATH_LIMITS[2][1],
+    coherent_geometry_demand - PATH_LIMITS[2][1],
+    0.0,
+  )
 
 
 def _target_is_behind_wheel(target: float, measured_curvature: float) -> bool:
@@ -128,30 +134,6 @@ def _projected_tracking_error(target: float, measured_curvature: float,
     min(abs(measured_error), abs(projected_error)),
     target,
   )
-
-
-def _action_aligned_preview_share(model_target: float, desired_angle_target: float,
-                                  measured_curvature: float, projected_curvature: float) -> float:
-  """Retain action-holding geometry at arrival and full preview only while behind."""
-  if model_target == 0.0:
-    return 1.0
-
-  action_share = 0.0
-  if model_target * desired_angle_target > 0.0:
-    action_share = _clip(abs(desired_angle_target / model_target), (0.0, 1.0))
-
-  tracking_error = _projected_tracking_error(
-    desired_angle_target,
-    measured_curvature,
-    projected_curvature,
-  )
-  shortfall_share = _interp(
-    abs(tracking_error),
-    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
-    0.0,
-    1.0,
-  )
-  return action_share + (1.0 - action_share) * shortfall_share
 
 
 def _gated_tracking_correction(model_target: float, desired_angle_target: float,
@@ -439,20 +421,8 @@ class ProjectedLatControlPath:
     c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
-    preview_share = _action_aligned_preview_share(
-      model_curvature,
-      desired_angle_curvature,
-      measured_curvature,
-      projected_measured_curvature,
-    )
-    coefficients = (
-      coefficients[0] * preview_share,
-      coefficients[1] * preview_share,
-      coefficients[2],
-      coefficients[3] * preview_share,
-    )
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
     self._last_command = command
-    self._last_allocated_c3 = safe_c3 if c3_was_reallocated or preview_share < 1.0 else command.curvature_rate
+    self._last_allocated_c3 = safe_c3 if c3_was_reallocated else command.curvature_rate
     return command
