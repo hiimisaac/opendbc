@@ -74,9 +74,11 @@ class TestFordFW(unittest.TestCase):
     class RecordingPathController:
       def __init__(self):
         self.path = None
+        self.lat_ctl_limit = None
 
       def update(self, path, *args, **kwargs):
         self.path = path
+        self.lat_ctl_limit = kwargs["lat_ctl_limit"]
         return LateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
 
     path_controller = RecordingPathController()
@@ -104,6 +106,7 @@ class TestFordFW(unittest.TestCase):
       buttons_stock_values={},
       acc_tja_status_stock_values={"Tja_D_Stat": 0},
       lkas_status_stock_values={},
+      lat_ctl_limit=2,
     )
     controller.lkas_enabled_last = True
     controller.lead_distance_bars_last = 0
@@ -111,6 +114,7 @@ class TestFordFW(unittest.TestCase):
     output, can_sends = controller.update(CC.as_reader(), CS, 0)
 
     assert path_controller.path is not None
+    assert path_controller.lat_ctl_limit == 2
     assert math.isclose(path_controller.path.pathOffset, 0.4, rel_tol=1e-6)
     assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)

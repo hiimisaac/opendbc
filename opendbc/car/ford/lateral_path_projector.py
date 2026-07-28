@@ -27,6 +27,7 @@ PATH_UNWIND_LIMIT = 0.006
 PATH_PROJECTED_ARRIVAL_ERROR_BP = (0.0005, 0.002)
 PATH_C3_UNWIND_ERROR_BP = PATH_PROJECTED_ARRIVAL_ERROR_BP
 PATH_DIRECTION_MARGIN = 0.0005
+PATH_C3_TO_C0_LOOKAHEAD = 15.0
 
 
 @dataclass(frozen=True)
@@ -295,16 +296,48 @@ def _c3_compatibility_share(curvature_rate: float, desired_curvature: float,
   return 1.0 - conflict_share
 
 
+def _reallocate_c3_to_c0(coefficients: tuple[float, float, float, float],
+                         model_curvature: float, desired_curvature: float,
+                         measured_curvature: float, projected_curvature: float,
+                         lat_ctl_limit: int) -> tuple[float, float, float, float]:
+  """Move outward C3 into near-field C0 only inside the PSCM envelope."""
+  envelope_share = 0.5 if lat_ctl_limit == 1 else 1.0 if lat_ctl_limit == 2 else 0.0
+  c0, c1, c2, c3 = coefficients
+  if envelope_share == 0.0 or c3 * desired_curvature <= 0.0 or c3 * model_curvature <= 0.0:
+    return coefficients
+
+  tracking_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  arrival_share = _interp(
+    abs(tracking_error),
+    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  requested_spill = c3 * envelope_share * arrival_share
+  c0_with_spill = _clip(
+    c0 + requested_spill * PATH_C3_TO_C0_LOOKAHEAD ** 3 / 6.0,
+    PATH_LIMITS[0],
+  )
+  actual_spill = (c0_with_spill - c0) * 6.0 / PATH_C3_TO_C0_LOOKAHEAD ** 3
+  return c0_with_spill, c1, c2, c3 - actual_spill
+
+
 class ProjectedLatControlPath:
   """Return one coherent, bounded Ford polynomial through a stable interface."""
 
   def __init__(self):
     self._last_command = LateralPathCommand()
+    self._last_allocated_c3 = 0.0
 
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
              projected_measured_curvature: float | None = None,
-             desired_angle_curvature: float | None = None) -> LateralPathCommand:
+             desired_angle_curvature: float | None = None,
+             lat_ctl_limit: int = 0) -> LateralPathCommand:
     measured_curvature = _finite(measured_curvature)
     projected_measured_curvature = measured_curvature if projected_measured_curvature is None else \
                                    _finite(projected_measured_curvature, measured_curvature)
@@ -312,6 +345,7 @@ class ProjectedLatControlPath:
 
     if not active:
       self._last_command = LateralPathCommand()
+      self._last_allocated_c3 = 0.0
       return self._last_command
 
     valid = path is not None and bool(getattr(path, "valid", False))
@@ -333,10 +367,10 @@ class ProjectedLatControlPath:
         path_angle=_clip(measured_curvature * max(v_ego, PATH_MIN_LOOKAHEAD), PATH_LIMITS[1]),
       )
       self._last_command = command
+      self._last_allocated_c3 = 0.0
       return command
 
     raw_target = target
-    lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
 
     # The PSCM owns physical steering-rate limits. Keep C0/C1 bounded by the
     # signal range without adding another stateful attack limit in front of it.
@@ -351,7 +385,7 @@ class ProjectedLatControlPath:
     bounds[2] = (safe_c2, safe_c2)
     c3_share = _c3_compatibility_share(raw_target[3], desired_angle_curvature, projected_measured_curvature)
     safe_c3 = _limit_attack(_clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3]),
-                            self._last_command.curvature_rate, PATH_C3_SLEW)
+                            self._last_allocated_c3, PATH_C3_SLEW)
     bounds[3] = (safe_c3, safe_c3)
 
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
@@ -369,9 +403,20 @@ class ProjectedLatControlPath:
       _clip(value, bound)
       for value, bound in zip(target, coefficient_bounds, strict=True)
     )
+    unallocated_c3 = coefficients[3]
+    coefficients = _reallocate_c3_to_c0(
+      coefficients,
+      model_curvature,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
+      lat_ctl_limit,
+    )
+    c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
     self._last_command = command
+    self._last_allocated_c3 = safe_c3 if c3_was_reallocated else command.curvature_rate
     return command
