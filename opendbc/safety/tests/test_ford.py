@@ -731,6 +731,19 @@ class TestFordCANFDMadsSafety(common.SafetyTestBase):
     self.assertFalse(self._rx(invalid_speed))
     self.assertFalse(self.safety.get_controls_allowed_lateral())
 
+  def test_speed_mismatch_revokes_lateral(self):
+    self._prime_rx_checks(3)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    speed_2 = self.packer.make_can_msg_safety("EngVehicleSpThrottle2", 0, {
+      "Veh_V_ActlEng": (common.MAX_SPEED_DELTA + 0.1) * 3.6,
+      "VehVActlEng_D_Qf": 3,
+      "VehVActlEng_No_Cnt": 1,
+    }, fix_checksum=checksum)
+    self.assertTrue(self._rx(speed_2))
+    self.assertFalse(self._tx(self._lat_ctl_msg(True)))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
   def test_fault_and_unavailable_cruise_states_do_not_authorize_lateral(self):
     self._prime_rx_checks(3)
     for cruise_state in (0, 1, 2, 6, 7):
