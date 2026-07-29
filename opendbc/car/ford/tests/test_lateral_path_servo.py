@@ -74,6 +74,75 @@ class TestFordPolynomialServo(unittest.TestCase):
     assert command.curvature == 0.0
     assert command.curvature_rate == 0.001023
 
+  def test_acquired_maneuver_share_survives_spatial_unwind_while_target_is_unresolved(self):
+    acquisition_path = model(
+      0.5 * 0.024 * 7.0**2,
+      0.024 * 8.0,
+      0.012,
+      0.001,
+    )
+    sustained_path = model(
+      0.5 * 0.013 * 7.0**2,
+      0.013 * 8.0,
+      0.012,
+      -0.0001,
+    )
+    servo = FordPolynomialServo()
+    acquired = servo.update(
+      acquisition_path,
+      feedback(0.020, 0.005, 0.004, desired_angle=100.0, speed=8.0),
+    )
+    sustained = servo.update(
+      sustained_path,
+      feedback(0.0195, 0.008, 0.007, desired_angle=97.0, speed=8.0),
+    )
+    fresh = FordPolynomialServo().update(
+      sustained_path,
+      feedback(0.0195, 0.008, 0.007, desired_angle=97.0, speed=8.0),
+    )
+    arrived = servo.update(
+      sustained_path,
+      feedback(0.0195, 0.0195, 0.0195, desired_angle=97.0, speed=8.0),
+    )
+
+    assert equivalent_curvature(acquired) > 0.10
+    assert equivalent_curvature(sustained) > 2.0 * equivalent_curvature(fresh)
+    assert sustained.curvature_rate == 0.0
+    assert equivalent_curvature(arrived) == 0.012
+
+  def test_held_maneuver_share_scales_continuously_with_desired_angle_retreat(self):
+    acquisition_path = model(
+      0.5 * 0.024 * 7.0**2,
+      0.024 * 8.0,
+      0.012,
+      0.001,
+    )
+    sustained_path = model(
+      0.5 * 0.013 * 7.0**2,
+      0.013 * 8.0,
+      0.012,
+      -0.0001,
+    )
+    steady_servo = FordPolynomialServo()
+    retreat_servo = FordPolynomialServo()
+    for servo in (steady_servo, retreat_servo):
+      servo.update(
+        acquisition_path,
+        feedback(0.020, 0.005, 0.004, desired_angle=100.0, speed=8.0),
+      )
+
+    steady = steady_servo.update(
+      sustained_path,
+      feedback(0.0195, 0.008, 0.007, desired_angle=100.0, speed=8.0),
+    )
+    retreating = retreat_servo.update(
+      sustained_path,
+      feedback(0.0195, 0.008, 0.007, desired_angle=50.0, speed=8.0),
+    )
+
+    assert equivalent_curvature(retreating) > 0.03
+    assert equivalent_curvature(retreating) < equivalent_curvature(steady)
+
   def test_retreating_desired_caps_outward_command_after_wheel_passes_target(self):
     servo = FordPolynomialServo()
     path = model(2.885494, 0.558042, 0.00015, 0.010035)

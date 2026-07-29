@@ -1,10 +1,10 @@
 """Ford LMC2 polynomial servo.
 
 C2 owns ordinary driving. Model geometry adds C0/C1/C3 only for spatial
-maneuvers; measured steering can extend that command only while both current
-and projected wheel positions remain behind the desired angle. A single
-terminal invariant removes outward authority after arrival without estimating
-PSCM dynamics or rate-limiting the command.
+maneuvers; authority already acquired for an unresolved maneuver is retained
+while both current and projected wheel positions remain behind the desired
+angle. A terminal invariant removes outward authority after arrival without
+estimating PSCM dynamics or rate-limiting the command.
 """
 
 from __future__ import annotations
@@ -35,6 +35,9 @@ PATH_CONTINUATION_MARGIN = 0.006
 PATH_C3_REALLOCATION_LOOKAHEAD = 15.0
 PATH_DESIRED_TREND_SAMPLES = 6
 PATH_DESIRED_RETREAT_DEADZONE_DEG = 2.0
+PATH_MANEUVER_HOLD_MAX_SPEED = 12.0
+PATH_MANEUVER_HOLD_MIN_DESIRED = 0.006
+PATH_MANEUVER_HOLD_MIN_ERROR = 0.001
 
 
 @dataclass(frozen=True)
@@ -276,19 +279,60 @@ class FordPolynomialServo:
   def __init__(self):
     self._desired_angles: deque[float] = deque(maxlen=PATH_DESIRED_TREND_SAMPLES)
     self._desired_direction = 0.0
+    self._held_maneuver_share = 0.0
     self._terminal_envelope = False
 
   def _reset(self) -> None:
     self._desired_angles.clear()
     self._desired_direction = 0.0
+    self._held_maneuver_share = 0.0
     self._terminal_envelope = False
 
-  def _desired_is_retreating(self, desired_curvature: float, desired_angle_deg: float) -> bool:
+  def _update_desired_direction(self, desired_curvature: float) -> None:
     if desired_curvature * self._desired_direction < 0.0:
       self._reset()
     if desired_curvature != 0.0:
       self._desired_direction = math.copysign(1.0, desired_curvature)
 
+  def _retain_acquired_maneuver_share(
+    self,
+    maneuver_share: float,
+    coefficients: tuple[float, float, float, float],
+    desired_curvature: float,
+    measured_curvature: float,
+    projected_curvature: float,
+    desired_angle_deg: float,
+    speed: float,
+  ) -> float:
+    lookahead = max(speed, PATH_MIN_LOOKAHEAD)
+    offset_curvature = 2.0 * coefficients[0] / PATH_MIN_LOOKAHEAD ** 2
+    angle_curvature = coefficients[1] / lookahead
+    tracking_error = _tracking_error(
+      desired_curvature,
+      measured_curvature,
+      projected_curvature,
+    )
+    unresolved_maneuver = speed < PATH_MANEUVER_HOLD_MAX_SPEED and \
+                          abs(desired_curvature) >= PATH_MANEUVER_HOLD_MIN_DESIRED and \
+                          tracking_error * desired_curvature > 0.0 and \
+                          abs(tracking_error) >= PATH_MANEUVER_HOLD_MIN_ERROR and \
+                          offset_curvature * desired_curvature > 0.0 and \
+                          angle_curvature * desired_curvature > 0.0
+    if not unresolved_maneuver:
+      self._held_maneuver_share = maneuver_share
+      return maneuver_share
+
+    desired_angle = abs(_finite(desired_angle_deg))
+    retreat_scale = 1.0
+    if self._desired_angles and self._desired_angles[-1] > 0.0:
+      retreat_scale = min(desired_angle / self._desired_angles[-1], 1.0)
+    self._held_maneuver_share = max(
+      maneuver_share,
+      retreat_scale * self._held_maneuver_share,
+    )
+    return self._held_maneuver_share
+
+  def _desired_is_retreating(self, desired_angle_deg: float) -> bool:
     self._desired_angles.append(abs(desired_angle_deg))
     if len(self._desired_angles) < self._desired_angles.maxlen:
       return False
@@ -328,11 +372,18 @@ class FordPolynomialServo:
     desired_curvature = _finite(feedback.desired_angle_curvature, coefficients[2])
     speed = max(_finite(feedback.speed), 0.0)
     lookahead = max(speed, PATH_MIN_LOOKAHEAD)
+    self._update_desired_direction(desired_curvature)
     maneuver_share = _maneuver_share(coefficients, speed, valid)
-    desired_retreating = self._desired_is_retreating(
+    maneuver_share = self._retain_acquired_maneuver_share(
+      maneuver_share,
+      coefficients,
       desired_curvature,
+      measured_curvature,
+      projected_curvature,
       _finite(feedback.desired_angle_deg),
+      speed,
     )
+    desired_retreating = self._desired_is_retreating(_finite(feedback.desired_angle_deg))
     model_unwinding = maneuver_share > 0.0 and coefficients[3] * measured_curvature < 0.0
     self._terminal_envelope |= desired_retreating or model_unwinding
     c3_share = _c3_compatibility_share(
