@@ -5,7 +5,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.lateral_path import driver_steering_opposes_command, SteeringAngleProjector
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.lateral_path_servo import FordPolynomialServo, SteeringFeedback
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -63,7 +63,7 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
-    self.lateral_path_controller = ProjectedLatControlPath()
+    self.lateral_path_controller = FordPolynomialServo()
     self.steering_angle_projector = SteeringAngleProjector()
 
     self.accel = 0.0
@@ -140,11 +140,17 @@ class CarController(CarControllerBase):
           path_target = path_target.as_builder()
           path_target.curvature = desired_curvature
         cmd = self.lateral_path_controller.update(
-          path_target, measured_curvature, CS.out.vEgoRaw,
-          CC.latActive, driver_override,
-          projected_measured_curvature=projected_wheel_curvature,
-          desired_angle_curvature=desired_angle_curvature,
-          lat_ctl_limit=CS.lat_ctl_limit,
+          path_target,
+          SteeringFeedback(
+            measured_curvature=measured_curvature,
+            projected_curvature=projected_wheel_curvature,
+            desired_angle_curvature=desired_angle_curvature,
+            desired_angle_deg=actuators.steeringAngleDeg,
+            speed=CS.out.vEgoRaw,
+            active=CC.latActive,
+            driver_override=driver_override,
+            lat_ctl_limit=CS.lat_ctl_limit,
+          ),
         )
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate

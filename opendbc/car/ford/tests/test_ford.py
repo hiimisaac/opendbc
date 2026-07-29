@@ -6,8 +6,8 @@ import unittest
 from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
-from opendbc.car.ford.carcontroller import CarController
-from opendbc.car.ford.lateral_path import LateralPathCommand
+from opendbc.car.ford.carcontroller import CarController, ford_curvature_from_steering_angle
+from opendbc.car.ford.lateral_path_servo import FordPolynomialServo, Lmc2Polynomial
 from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
@@ -69,15 +69,15 @@ class TestFordFW(unittest.TestCase):
     controller = CarController(DBC[CP.carFingerprint], CP)
     controller.frame = CarControllerParams.STEER_STEP
 
-    class RecordingPathController:
+    class RecordingPathController(FordPolynomialServo):
       def __init__(self):
         self.path = None
-        self.lat_ctl_limit = None
+        self.feedback = None
 
-      def update(self, path, *args, **kwargs):
+      def update(self, path, feedback):
         self.path = path
-        self.lat_ctl_limit = kwargs["lat_ctl_limit"]
-        return LateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
+        self.feedback = feedback
+        return Lmc2Polynomial(True, 0.1, 0.2, 0.003, 0.0004)
 
     path_controller = RecordingPathController()
     controller.lateral_path_controller = path_controller
@@ -112,7 +112,19 @@ class TestFordFW(unittest.TestCase):
     output, can_sends = controller.update(CC.as_reader(), CS, 0)
 
     assert path_controller.path is not None
-    assert path_controller.lat_ctl_limit == 2
+    assert path_controller.feedback is not None
+    assert path_controller.feedback.lat_ctl_limit == 2
+    assert path_controller.feedback.desired_angle_deg == 10.0
+    assert path_controller.feedback.active
+    assert not path_controller.feedback.driver_override
+    assert math.isclose(path_controller.feedback.speed, 7.0, rel_tol=1e-6)
+    assert math.isclose(path_controller.feedback.measured_curvature, 0.0, abs_tol=1e-12)
+    assert math.isclose(path_controller.feedback.projected_curvature, 0.0, abs_tol=1e-12)
+    assert math.isclose(
+      path_controller.feedback.desired_angle_curvature,
+      ford_curvature_from_steering_angle(controller.VM, 10.0, 7.0),
+      rel_tol=1e-6,
+    )
     assert math.isclose(path_controller.path.pathOffset, 0.4, rel_tol=1e-6)
     assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)
