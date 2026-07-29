@@ -141,7 +141,7 @@ def test_spatial_preview_keeps_full_authority_while_wheel_is_behind():
   assert command.path_angle >= target.pathAngle
 
 
-def test_rising_spatial_turn_keeps_preview_beyond_lagging_action():
+def test_rising_spatial_turn_stops_pinned_preview_after_wheel_passes_lagging_action():
   controller = ProjectedLatControlPath()
   spatial_curvature = 0.04
   action_curvature = 0.002
@@ -161,10 +161,9 @@ def test_rising_spatial_turn_keeps_preview_beyond_lagging_action():
     )
 
   assert command is not None
-  assert command.path_offset == rising_turn.pathOffset
-  assert command.path_angle == rising_turn.pathAngle
+  assert 0.0 < equivalent_curvature(command, 7.0) <= action_curvature + 0.006001
   assert command.curvature == 0.0
-  assert command.curvature_rate == 0.001023
+  assert 0.0 < command.curvature_rate < 0.001023
 
 
 def test_spatial_preview_is_symmetric_for_right_turns():
@@ -333,7 +332,7 @@ def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
   assert abs(bounded_preview_arrived.path_angle - target.pathAngle) < 1e-9
 
 
-def test_continuing_model_preview_cannot_extend_c0_past_bounded_angle_corridor():
+def test_continuing_model_preview_is_bounded_after_wheel_passes_angle_corridor():
   model_curvature = 0.04
   desired_angle_curvature = 0.015
   target = model(
@@ -353,8 +352,7 @@ def test_continuing_model_preview_cannot_extend_c0_past_bounded_angle_corridor()
     )
 
   assert command is not None
-  assert abs(command.path_offset - target.pathOffset) < 1e-9
-  assert abs(command.path_angle - target.pathAngle) < 1e-9
+  assert 0.0 < equivalent_curvature(command, 7.0) <= desired_angle_curvature + 0.006001
 
 
 def test_available_c3_does_not_spill_continuation_into_c0():
@@ -1078,6 +1076,72 @@ def test_tracking_extension_remains_available_through_polynomial_handoff():
 
   delivered_curvature = equivalent_curvature(command, 7.0)
   assert -0.03 < delivered_curvature <= -0.02
+
+
+def test_pinned_outward_preview_cannot_keep_turning_after_wheel_passes_desired_angle():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    # Segment 25: the spatial path asks for a future right turn while the action
+    # target is nearly straight and both wheel estimates are already beyond it.
+    target = model(
+      direction * 2.885494,
+      direction * 0.558042,
+      direction * 0.00015,
+      direction * 0.010035,
+    )
+
+    command = controller.update(
+      target, direction * 0.05, 3.7, True, False,
+      projected_measured_curvature=direction * 0.06,
+      desired_angle_curvature=direction * 0.00015,
+      lat_ctl_limit=2,
+    )
+
+    delivered_curvature = direction * equivalent_curvature(command, 7.0)
+    assert 0.0 < delivered_curvature <= 0.006151
+
+
+def test_pinned_outward_preview_keeps_full_authority_before_wheel_arrives():
+  controller = ProjectedLatControlPath()
+  target = model(2.885494, 0.558042, 0.00015, 0.010035)
+
+  command = controller.update(
+    target, 0.0, 3.7, True, False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.00015,
+    lat_ctl_limit=2,
+  )
+
+  assert equivalent_curvature(command, 7.0) > 0.25
+
+
+def test_pinned_outward_preview_relatches_when_desired_moves_beyond_wheel():
+  controller = ProjectedLatControlPath()
+  target = model(2.885494, 0.558042, 0.07, 0.010035)
+
+  command = controller.update(
+    target, 0.05, 3.7, True, False,
+    projected_measured_curvature=0.06,
+    desired_angle_curvature=0.07,
+    lat_ctl_limit=2,
+  )
+
+  assert equivalent_curvature(command, 7.0) > 0.25
+
+
+def test_unwind_sign_c3_is_not_reduced_after_wheel_passes_desired_angle():
+  controller = ProjectedLatControlPath()
+  target = model(2.885494, 0.558042, 0.00015, -0.010035)
+
+  command = controller.update(
+    target, 0.05, 3.7, True, False,
+    projected_measured_curvature=0.06,
+    desired_angle_curvature=0.00015,
+    lat_ctl_limit=2,
+  )
+
+  assert equivalent_curvature(command, 7.0) > 0.25
+  assert command.curvature_rate < 0.0
 
 
 def test_c2_baseband_trim_is_removed_when_projected_wheel_arrives():

@@ -372,6 +372,51 @@ def _preserve_model_direction(coefficients: tuple[float, float, float, float],
   return 0.0, 0.0, 0.0, 0.0
 
 
+def _outward_beyond_error(target: float, wheel_curvature: float) -> float:
+  """Return how far the wheel has passed target in its current direction."""
+  error = target - wheel_curvature
+  return abs(error) if error * wheel_curvature < 0.0 else 0.0
+
+
+def _guard_arrived_outward_preview(coefficients: tuple[float, float, float, float],
+                                   raw_curvature_rate: float,
+                                   desired_curvature: float,
+                                   measured_curvature: float,
+                                   projected_curvature: float) -> tuple[float, float, float, float]:
+  """Taper pinned outward preview only after both wheel estimates pass desired."""
+  command_curvature = _equivalent_curvature(coefficients)
+  c3_limit = PATH_LIMITS[3][1] if raw_curvature_rate >= 0.0 else abs(PATH_LIMITS[3][0])
+  outward_pinned_preview = raw_curvature_rate * measured_curvature > 0.0 and \
+                           abs(raw_curvature_rate) >= c3_limit and \
+                           command_curvature * measured_curvature > 0.0
+  if not outward_pinned_preview:
+    return coefficients
+
+  beyond_error = min(
+    _outward_beyond_error(desired_curvature, measured_curvature),
+    _outward_beyond_error(desired_curvature, projected_curvature),
+  )
+  arrival_share = _interp(
+    beyond_error,
+    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  if arrival_share == 0.0:
+    return coefficients
+
+  # Preserve the polynomial's shape and sign while preventing a saturated
+  # preview term from continuing far beyond the desired wheel-angle corridor.
+  corridor_curvature = abs(desired_curvature) + PATH_C0_CONTINUATION_MARGIN
+  guarded_magnitude = _blend(
+    abs(command_curvature),
+    min(abs(command_curvature), corridor_curvature),
+    arrival_share,
+  )
+  scale = guarded_magnitude / abs(command_curvature)
+  return tuple(value * scale for value in coefficients)
+
+
 def _c3_compatibility_share(curvature_rate: float, desired_curvature: float,
                             projected_curvature: float) -> float:
   if curvature_rate * desired_curvature >= 0.0:
@@ -520,5 +565,12 @@ class ProjectedLatControlPath:
     )
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
+    coefficients = _guard_arrived_outward_preview(
+      coefficients,
+      raw_target[3],
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
+    )
     return LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                               curvature=coefficients[2], curvature_rate=coefficients[3])
