@@ -14,7 +14,8 @@ PATH_LIMITS = (
 )
 PATH_MIN_LOOKAHEAD = 7.0
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
-PATH_BASEBAND_C0_TRACKING_LIMIT = 0.004
+PATH_C0_TRACKING_EXTENSION_LIMIT = 0.004
+PATH_C0_TRACKING_EXTENSION_DEADZONE = 0.00025
 PATH_CLIPPED_AUTHORITY_RECOVERY_LIMIT = 0.006
 PATH_SPATIAL_ONSET_LOOKAHEAD = 12.0
 PATH_SPATIAL_ONSET_RELATIVE_MIN = 0.5
@@ -145,7 +146,7 @@ def _outward_tracking_extension(command_curvature: float, desired_curvature: flo
 
   available_error = min(abs(wheel_error), abs(command_error))
   extension = min(
-    max(available_error - PATH_TRACKING_ERROR_DEADZONE, 0.0),
+    max(available_error - PATH_C0_TRACKING_EXTENSION_DEADZONE, 0.0),
     limit,
   )
   return math.copysign(extension, desired_curvature)
@@ -484,18 +485,17 @@ class ProjectedLatControlPath:
       safe_c2,
       full_target[3],
     )
-    # C2 can trail the desired wheel angle before a request qualifies as a
-    # maneuver. Fill only that reversible shortfall without opening the full
-    # model polynomial inside the ordinary-driving baseband.
+    # C2 or the bounded path polynomial can trail the desired wheel angle.
+    # Fill only that reversible shortfall without changing model geometry.
     if model_curvature * desired_angle_curvature > 0.0:
-      baseband_extension = _outward_tracking_extension(
+      tracking_extension = _outward_tracking_extension(
         _equivalent_curvature(target),
         desired_angle_curvature,
         measured_curvature,
         projected_measured_curvature,
-        PATH_BASEBAND_C0_TRACKING_LIMIT,
-      ) * c2_share
-      target = _add_equivalent_curvature_to_c0(target, baseband_extension)
+        PATH_C0_TRACKING_EXTENSION_LIMIT,
+      )
+      target = _add_equivalent_curvature_to_c0(target, tracking_extension)
 
     requested_coefficients = target[:3] + (requested_c3,)
     coefficient_bounds = tuple(bounds)

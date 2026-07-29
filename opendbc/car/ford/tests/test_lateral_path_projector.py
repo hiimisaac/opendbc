@@ -1063,7 +1063,21 @@ def test_c2_baseband_uses_small_c0_trim_while_wheel_is_behind_desired_angle():
     assert command.curvature == target.curvature
     assert 0.0 < direction * command.path_offset < 0.1
     assert command.path_angle == 0.0
-    assert abs(target.curvature) < abs(equivalent_curvature(command, 7.0)) <= 0.004
+    assert abs(equivalent_curvature(command, 7.0) - direction * 0.00375) < 1e-12
+
+
+def test_tracking_extension_remains_available_through_polynomial_handoff():
+  controller = ProjectedLatControlPath()
+  target = model(-0.2, -0.05, -0.01, -0.0015)
+
+  command = controller.update(
+    target, 0.0, 7.0, True, False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=-0.03,
+  )
+
+  delivered_curvature = equivalent_curvature(command, 7.0)
+  assert -0.03 < delivered_curvature <= -0.02
 
 
 def test_c2_baseband_trim_is_removed_when_projected_wheel_arrives():
