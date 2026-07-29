@@ -98,6 +98,7 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
   .max_curvature_error = 100,         // 0.002 rad/m * curvature_to_can
   .curvature_error_min_speed = 10.0,  // m/s
   .max_steer_power = 0,               // disabled, Ford has no steed power signal
+  .inactive_curvature_is_zero = true, // Ford EPS expects curvature=0 when inactive
 };
 
 // C0/C1 can steer independently of C2 in CAN FD path mode, so measured
