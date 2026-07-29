@@ -13,8 +13,6 @@ PATH_LIMITS = (
   (-0.001024, 0.001023),
 )
 PATH_MIN_LOOKAHEAD = 7.0
-PATH_C2_SLEW = 0.0002
-PATH_C3_SLEW = 0.0002
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
 PATH_SPATIAL_ONSET_LOOKAHEAD = 12.0
 PATH_SPATIAL_ONSET_RELATIVE_MIN = 0.5
@@ -67,14 +65,6 @@ def _deadzone(value: float, deadzone: float) -> float:
 
 def _blend(first: float, second: float, second_share: float) -> float:
   return first + _clip(second_share, (0.0, 1.0)) * (second - first)
-
-
-def _limit_attack(value: float, last: float, max_step: float) -> float:
-  if value * last < 0.0:
-    return math.copysign(min(abs(value), max_step), value)
-  if abs(value) > abs(last):
-    return math.copysign(min(abs(value), abs(last) + max_step), value)
-  return value
 
 
 def _basis(distance: float) -> tuple[float, float, float, float]:
@@ -370,10 +360,6 @@ def _reallocate_c3_to_c0(coefficients: tuple[float, float, float, float],
 class ProjectedLatControlPath:
   """Return one coherent, bounded Ford polynomial through a stable interface."""
 
-  def __init__(self):
-    self._last_command = LateralPathCommand()
-    self._last_allocated_c3 = 0.0
-
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
              projected_measured_curvature: float | None = None,
@@ -385,9 +371,7 @@ class ProjectedLatControlPath:
     v_ego = max(_finite(v_ego), 0.0)
 
     if not active:
-      self._last_command = LateralPathCommand()
-      self._last_allocated_c3 = 0.0
-      return self._last_command
+      return LateralPathCommand()
 
     valid = path is not None and bool(getattr(path, "valid", False))
     if not valid:
@@ -402,19 +386,16 @@ class ProjectedLatControlPath:
     desired_angle_curvature = target[2] if desired_angle_curvature is None else _finite(desired_angle_curvature, target[2])
 
     if driver_override:
-      command = LateralPathCommand(
+      return LateralPathCommand(
         valid=valid,
         path_offset=_clip(0.5 * measured_curvature * PATH_MIN_LOOKAHEAD ** 2, PATH_LIMITS[0]),
         path_angle=_clip(measured_curvature * max(v_ego, PATH_MIN_LOOKAHEAD), PATH_LIMITS[1]),
       )
-      self._last_command = command
-      self._last_allocated_c3 = 0.0
-      return command
 
     raw_target = target
 
-    # The PSCM owns physical steering-rate limits. Keep C0/C1 bounded by the
-    # signal range without adding another stateful attack limit in front of it.
+    # The PSCM owns physical steering-rate limits. Keep every coefficient
+    # bounded by the signal range without adding stateful attack limits.
     bounds = list(PATH_LIMITS)
     maneuver_demand = max(
       _maneuver_demand(raw_target, v_ego, valid),
@@ -430,12 +411,10 @@ class ProjectedLatControlPath:
     # C2 owns normal driving. The complete polynomial is a single continuous
     # authority extension, reaching the previous full-strength command at 0.006.
     c2_share = 1.0 - residual_share
-    safe_c2 = _limit_attack(_clip(raw_target[2] * c2_share, PATH_LIMITS[2]),
-                            self._last_command.curvature, PATH_C2_SLEW)
+    safe_c2 = _clip(raw_target[2] * c2_share, PATH_LIMITS[2])
     bounds[2] = (safe_c2, safe_c2)
     c3_share = _c3_compatibility_share(raw_target[3], desired_angle_curvature, projected_measured_curvature)
-    safe_c3 = _limit_attack(_clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3]),
-                            self._last_allocated_c3, PATH_C3_SLEW)
+    safe_c3 = _clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3])
     bounds[3] = (safe_c3, safe_c3)
 
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
@@ -453,7 +432,6 @@ class ProjectedLatControlPath:
       _clip(value, bound)
       for value, bound in zip(target, coefficient_bounds, strict=True)
     )
-    unallocated_c3 = coefficients[3]
     coefficients = _reallocate_c3_to_c0(
       coefficients,
       model_curvature,
@@ -462,11 +440,7 @@ class ProjectedLatControlPath:
       projected_measured_curvature,
       lat_ctl_limit,
     )
-    c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
-    command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
-                                 curvature=coefficients[2], curvature_rate=coefficients[3])
-    self._last_command = command
-    self._last_allocated_c3 = safe_c3 if c3_was_reallocated else command.curvature_rate
-    return command
+    return LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
+                              curvature=coefficients[2], curvature_rate=coefficients[3])

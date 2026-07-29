@@ -995,7 +995,7 @@ def test_driver_override_projects_the_delivered_wheel_path():
   assert command.curvature_rate == 0.0
 
 
-def test_c0_c1_attack_uses_full_signal_range_and_release_is_immediate():
+def test_all_coefficients_attack_without_software_rate_limits_and_release_is_immediate():
   controller = ProjectedLatControlPath()
 
   attack = controller.update(model(4.0, 0.4, 0.02, 0.001), 0.0, 7.0, True, False)
@@ -1003,11 +1003,22 @@ def test_c0_c1_attack_uses_full_signal_range_and_release_is_immediate():
 
   assert 0.18375 < attack.path_offset <= 4.60
   assert 0.0525 < attack.path_angle <= 0.497
-  assert 0.0 <= attack.curvature_rate <= 0.0002
+  assert attack.curvature_rate == 0.001
   assert release.path_offset == 0.0
   assert release.path_angle == 0.0
   assert release.curvature == 0.0
   assert release.curvature_rate == 0.0
+
+
+def test_c2_attack_is_not_software_rate_limited():
+  controller = ProjectedLatControlPath()
+
+  attack = controller.update(
+    model(0.0, 0.0, 0.002), 0.0, 7.0, True, False,
+    desired_angle_curvature=0.002,
+  )
+
+  assert attack.curvature == 0.002
 
 
 def test_large_undertracking_maneuver_is_not_software_rate_limited():
