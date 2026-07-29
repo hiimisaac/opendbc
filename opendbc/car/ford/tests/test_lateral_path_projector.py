@@ -1047,3 +1047,74 @@ def test_projected_arrival_does_not_reintroduce_c0_c1_attack_limit():
 
   assert 0.18375 < attack.path_offset <= 4.60
   assert 0.0525 < attack.path_angle <= 0.497
+
+
+def test_c2_baseband_uses_small_c0_trim_while_wheel_is_behind_desired_angle():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.049, direction * 0.014, direction * 0.002)
+
+    command = controller.update(
+      target, 0.0, 7.0, True, False,
+      projected_measured_curvature=0.0,
+      desired_angle_curvature=direction * 0.004,
+    )
+
+    assert command.curvature == target.curvature
+    assert 0.0 < direction * command.path_offset < 0.1
+    assert command.path_angle == 0.0
+    assert abs(target.curvature) < abs(equivalent_curvature(command, 7.0)) <= 0.004
+
+
+def test_c2_baseband_trim_is_removed_when_projected_wheel_arrives():
+  for direction in (-1.0, 1.0):
+    controller = ProjectedLatControlPath()
+    target = model(direction * 0.049, direction * 0.014, direction * 0.002)
+
+    command = controller.update(
+      target, 0.0, 7.0, True, False,
+      projected_measured_curvature=direction * 0.004,
+      desired_angle_curvature=direction * 0.004,
+    )
+
+    assert command.path_offset == 0.0
+    assert command.path_angle == 0.0
+    assert command.curvature == target.curvature
+
+
+def test_c2_baseband_trim_requires_model_and_desired_angle_to_agree():
+  controller = ProjectedLatControlPath()
+  target = model(-0.049, -0.014, -0.002)
+
+  command = controller.update(
+    target, 0.0, 7.0, True, False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.004,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert command.curvature == target.curvature
+
+
+def test_clipped_c3_authority_moves_into_c0_only_while_wheel_is_behind():
+  for direction, curvature_rate_limit in ((-1.0, -0.001024), (1.0, 0.001023)):
+    target = model(0.0, 0.0, 0.0, direction * 0.003)
+    behind_controller = ProjectedLatControlPath()
+    arrived_controller = ProjectedLatControlPath()
+
+    behind = behind_controller.update(
+      target, 0.0, 7.0, True, False,
+      projected_measured_curvature=0.0,
+      desired_angle_curvature=direction * 0.02,
+    )
+    arrived = arrived_controller.update(
+      target, 0.0, 7.0, True, False,
+      projected_measured_curvature=direction * 0.021,
+      desired_angle_curvature=direction * 0.02,
+    )
+
+    assert behind.curvature_rate == curvature_rate_limit
+    assert direction * behind.path_offset > 0.0
+    assert abs(equivalent_curvature(behind, 7.0)) > abs(equivalent_curvature(arrived, 7.0))
+    assert arrived.path_offset == 0.0

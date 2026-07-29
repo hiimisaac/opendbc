@@ -14,6 +14,8 @@ PATH_LIMITS = (
 )
 PATH_MIN_LOOKAHEAD = 7.0
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
+PATH_BASEBAND_C0_TRACKING_LIMIT = 0.004
+PATH_CLIPPED_AUTHORITY_RECOVERY_LIMIT = 0.006
 PATH_SPATIAL_ONSET_LOOKAHEAD = 12.0
 PATH_SPATIAL_ONSET_RELATIVE_MIN = 0.5
 PATH_PREVIEW_BP = (0.003, 0.012)
@@ -126,6 +128,60 @@ def _projected_tracking_error(target: float, measured_curvature: float,
     min(abs(measured_error), abs(projected_error)),
     target,
   )
+
+
+def _outward_tracking_extension(command_curvature: float, desired_curvature: float,
+                                measured_curvature: float, projected_curvature: float,
+                                limit: float) -> float:
+  """Return removable authority that cannot carry the command past desired."""
+  wheel_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  command_error = desired_curvature - command_curvature
+  if wheel_error * desired_curvature <= 0.0 or command_error * desired_curvature <= 0.0:
+    return 0.0
+
+  available_error = min(abs(wheel_error), abs(command_error))
+  extension = min(
+    max(available_error - PATH_TRACKING_ERROR_DEADZONE, 0.0),
+    limit,
+  )
+  return math.copysign(extension, desired_curvature)
+
+
+def _add_equivalent_curvature_to_c0(coefficients: tuple[float, float, float, float],
+                                    curvature: float) -> tuple[float, float, float, float]:
+  values = list(coefficients)
+  values[0] = _clip(values[0] + curvature / _basis(PATH_MIN_LOOKAHEAD)[0], PATH_LIMITS[0])
+  return tuple(values)
+
+
+def _recover_clipped_authority(requested: tuple[float, float, float, float],
+                               clipped: tuple[float, float, float, float],
+                               desired_curvature: float, measured_curvature: float,
+                               projected_curvature: float) -> tuple[float, float, float, float]:
+  """Move useful near-field authority lost to signal clipping into C0."""
+  missing_curvature = _equivalent_curvature(requested) - _equivalent_curvature(clipped)
+  if missing_curvature * desired_curvature <= 0.0:
+    return clipped
+
+  extension = _outward_tracking_extension(
+    _equivalent_curvature(clipped),
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+    PATH_CLIPPED_AUTHORITY_RECOVERY_LIMIT,
+  )
+  if extension * missing_curvature <= 0.0:
+    return clipped
+
+  recovered_curvature = math.copysign(
+    min(abs(extension), abs(missing_curvature)),
+    missing_curvature,
+  )
+  return _add_equivalent_curvature_to_c0(clipped, recovered_curvature)
 
 
 def _confirmed_spatial_onset_demand(raw_target: tuple[float, float, float, float],
@@ -414,7 +470,8 @@ class ProjectedLatControlPath:
     safe_c2 = _clip(raw_target[2] * c2_share, PATH_LIMITS[2])
     bounds[2] = (safe_c2, safe_c2)
     c3_share = _c3_compatibility_share(raw_target[3], desired_angle_curvature, projected_measured_curvature)
-    safe_c3 = _clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3])
+    requested_c3 = raw_target[3] * c3_share * residual_share
+    safe_c3 = _clip(requested_c3, PATH_LIMITS[3])
     bounds[3] = (safe_c3, safe_c3)
 
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
@@ -427,10 +484,31 @@ class ProjectedLatControlPath:
       safe_c2,
       full_target[3],
     )
+    # C2 can trail the desired wheel angle before a request qualifies as a
+    # maneuver. Fill only that reversible shortfall without opening the full
+    # model polynomial inside the ordinary-driving baseband.
+    if model_curvature * desired_angle_curvature > 0.0:
+      baseband_extension = _outward_tracking_extension(
+        _equivalent_curvature(target),
+        desired_angle_curvature,
+        measured_curvature,
+        projected_measured_curvature,
+        PATH_BASEBAND_C0_TRACKING_LIMIT,
+      ) * c2_share
+      target = _add_equivalent_curvature_to_c0(target, baseband_extension)
+
+    requested_coefficients = target[:3] + (requested_c3,)
     coefficient_bounds = tuple(bounds)
     coefficients = tuple(
       _clip(value, bound)
       for value, bound in zip(target, coefficient_bounds, strict=True)
+    )
+    coefficients = _recover_clipped_authority(
+      requested_coefficients,
+      coefficients,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
     )
     coefficients = _reallocate_c3_to_c0(
       coefficients,
