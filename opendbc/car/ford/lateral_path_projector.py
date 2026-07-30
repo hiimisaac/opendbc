@@ -25,6 +25,7 @@ ARRIVAL_BP = (0.0005, 0.002)
 TRACKING_DEADZONE = 0.0005
 TRACKING_EXTENSION_DEADZONE = 0.00025
 TRACKING_EXTENSION_LIMIT = 0.004
+FEEDBACK_PREVIEW_LIMIT = 0.0015
 CLIPPED_RECOVERY_LIMIT = 0.006
 C0_TRACKING_LIMIT = 0.02
 C0_CONTINUATION_LIMIT = 0.04
@@ -120,6 +121,52 @@ def _outward_extension(command: float, desired: float, measured: float,
   return math.copysign(extension, desired)
 
 
+def _retain_feedback_preview(coefficients: Coefficients, raw: Coefficients,
+                             desired: float, measured: float,
+                             projected: float, retention_share: float) -> Coefficients:
+  """Keep bounded coherent C0/C1 preview until both wheel estimates arrive."""
+  shortfall = _shortfall(desired, measured, projected)
+  raw_c0_curvature = raw[0] * NEAR_BASIS[0]
+  raw_c1_curvature = raw[1] * NEAR_BASIS[1]
+  local_curvature = raw[2] + raw[3] * NEAR_DISTANCE
+  wheel_has_moved = max(abs(measured), abs(projected)) > TRACKING_DEADZONE
+  direction = math.copysign(1.0, desired)
+  local_support = _ramp(local_curvature * direction, (0.0, 0.5 * abs(desired)))
+  maneuver_support = _ramp(abs(desired), MANEUVER_BP) * local_support * retention_share
+  if shortfall == 0.0 or maneuver_support == 0.0 or not wheel_has_moved or \
+      _curvature(coefficients) * desired <= 0.0 or \
+      raw_c0_curvature * desired <= 0.0 or \
+      raw_c1_curvature * desired <= 0.0:
+    return coefficients
+
+  available_preview = direction * (raw_c0_curvature + raw_c1_curvature)
+  target_extension = min(
+    max(abs(shortfall) - TRACKING_EXTENSION_DEADZONE, 0.0),
+    available_preview,
+    FEEDBACK_PREVIEW_LIMIT,
+  )
+  current_extension = direction * (_curvature(coefficients) - desired)
+  correction = min(
+    max(target_extension - current_extension, 0.0),
+    FEEDBACK_PREVIEW_LIMIT,
+  ) * maneuver_support
+  if correction == 0.0:
+    return coefficients
+
+  c0_share = direction * raw_c0_curvature / available_preview
+  c1_share = direction * raw_c1_curvature / available_preview
+  values = list(coefficients)
+  values[0] = _clip(
+    values[0] + direction * correction * c0_share / NEAR_BASIS[0],
+    PATH_LIMITS[0],
+  )
+  values[1] = _clip(
+    values[1] + direction * correction * c1_share / NEAR_BASIS[1],
+    PATH_LIMITS[1],
+  )
+  return tuple(values)
+
+
 def _tracking_correction(model_target: float, desired_target: float,
                          measured: float, projected: float, limit: float) -> float:
   desired_error = _shortfall(desired_target, measured, projected)
@@ -153,7 +200,7 @@ def _unwind(target: float, measured: float) -> float:
 
 
 def _compose(raw: Coefficients, valid: bool, measured: float, projected: float,
-             desired: float, speed: float) -> tuple[Coefficients, float, float, bool]:
+             desired: float, speed: float) -> tuple[Coefficients, float, float, bool, float]:
   """Normalize model geometry and compose one requested spatial polynomial."""
   c0, c1, c2, c3 = raw
   lookahead = max(speed, NEAR_DISTANCE)
@@ -265,11 +312,11 @@ def _compose(raw: Coefficients, valid: bool, measured: float, projected: float,
         TRACKING_EXTENSION_LIMIT,
       ),
     )
-  return requested, requested_c3, model_target, preserve_direction
+  return requested, requested_c3, model_target, preserve_direction, maneuver_share
 
 
 def _project(requested: Coefficients, requested_c3: float, model_target: float,
-             preserve_direction: bool, raw_c3: float, desired: float,
+             preserve_direction: bool, raw_c2: float, raw_c3: float, desired: float,
              measured: float, projected: float, lat_ctl_limit: int) -> Coefficients:
   """Apply the four non-commuting Ford/PSCM constraints in one place."""
   bounds: Bounds = (
@@ -314,8 +361,21 @@ def _project(requested: Coefficients, requested_c3: float, model_target: float,
     actual_spill = (c0_with_spill - c0) * 6.0 / C3_REALLOCATION_DISTANCE ** 3
     output = c0_with_spill, c1, c2, c3 - actual_spill
 
-  # 3. Clipping may not reverse coherent model geometry.
+  # 3. Blend weak opposing preview toward immediate action while both wheel
+  # estimates remain behind. Local C2+C3*d support and opposing-command
+  # strength crossfade ownership continuously.
   command_curvature = _curvature(output)
+  action_share = 0.0
+  action_demand_share = _ramp(abs(desired), MANEUVER_BP)
+  if lat_ctl_limit == 0 and preserve_direction and model_target * desired < 0.0 and \
+      raw_c2 * desired > 0.0 and action_demand_share > 0.0 and abs(desired) <= PATH_LIMITS[2][1] and \
+      _shortfall(desired, measured, projected) * desired > 0.0:
+    direction = math.copysign(1.0, desired)
+    local_action = (raw_c2 + raw_c3 * NEAR_DISTANCE) * direction
+    local_share = _ramp(local_action, (0.0, 0.5 * abs(desired)))
+    opposing_command = max(-command_curvature * direction, 0.0)
+    action_strength_share = 1.0 - _ramp(opposing_command, (abs(desired), 2.0 * abs(desired)))
+    action_share = action_demand_share * local_share * action_strength_share
   if preserve_direction and model_target * command_curvature < 0.0:
     guarded_curvature = math.copysign(DIRECTION_MARGIN, model_target)
     values = list(output)
@@ -328,6 +388,10 @@ def _project(requested: Coefficients, requested_c3: float, model_target: float,
         break
     else:
       output = (0.0, 0.0, 0.0, 0.0)
+  if action_share > 0.0:
+    command_curvature = _curvature(output)
+    action_target = _lerp(command_curvature, desired, action_share)
+    output = _add_c0(output, action_target - command_curvature)
 
   # 4. Once both wheel estimates pass desired angle, constrain only pinned
   # outward preview. Moving desired outward immediately restores full command.
@@ -390,7 +454,7 @@ class ProjectedLatControlPath:
         path_angle=_clip(measured * lookahead, PATH_LIMITS[1]),
       )
 
-    requested, requested_c3, model_target, preserve_direction = _compose(
+    requested, requested_c3, model_target, preserve_direction, maneuver_share = _compose(
       raw,
       valid,
       measured,
@@ -403,12 +467,22 @@ class ProjectedLatControlPath:
       requested_c3,
       model_target,
       preserve_direction,
+      raw[2],
       raw[3],
       desired,
       measured,
       projected,
       lat_ctl_limit,
     )
+    if lat_ctl_limit == 0 and maneuver_share < 1.0:
+      coefficients = _retain_feedback_preview(
+        coefficients,
+        raw,
+        desired,
+        measured,
+        projected,
+        1.0 - maneuver_share,
+      )
     return LateralPathCommand(
       valid=valid,
       path_offset=coefficients[0],

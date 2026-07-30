@@ -1,7 +1,13 @@
 import math
 from types import SimpleNamespace
+import unittest
 
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.lateral_path_projector import (
+  FEEDBACK_PREVIEW_LIMIT,
+  ProjectedLatControlPath,
+  _curvature,
+  _retain_feedback_preview,
+)
 
 
 def model(path_offset: float, path_angle: float, curvature: float = 0.0, curvature_rate: float = 0.0):
@@ -1274,3 +1280,210 @@ def test_pinned_preview_waits_until_both_wheel_estimates_pass_desired():
   )
 
   assert equivalent_curvature(one_past, 7.0) > equivalent_curvature(both_past, 7.0) > 0.0
+
+
+class TestRoute79Regressions(unittest.TestCase):
+  def test_unresolved_desired_direction_cannot_be_cancelled_by_preview(self):
+    # Route 79 segment 49: C2, C3 at 7 m, and desired angle request a right
+    # turn while C0/C1 still describe the prior left. With both wheel estimates
+    # behind, the preview terms may not cancel the current pull.
+    desired_curvature = 0.0138
+    controller = ProjectedLatControlPath()
+    target = model(-0.37, -0.09, 0.0126, -0.00027)
+
+    command = controller.update(
+      target, -0.0106, 4.7, True, False,
+      projected_measured_curvature=-0.0110,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    self.assertGreaterEqual(
+      equivalent_curvature(command, 7.0),
+      desired_curvature - 0.0005,
+    )
+
+  def test_direction_ownership_is_continuous_at_local_curvature_reversal(self):
+    desired_curvature = 0.0138
+    commands = []
+    for curvature_rate in (-0.0018001, -0.0017999):
+      commands.append(ProjectedLatControlPath().update(
+        model(-0.37, -0.09, 0.0126, curvature_rate),
+        -0.0106,
+        4.7,
+        True,
+        False,
+        projected_measured_curvature=-0.0110,
+        desired_angle_curvature=desired_curvature,
+      ))
+
+    difference = equivalent_curvature(commands[1], 7.0) - \
+      equivalent_curvature(commands[0], 7.0)
+    self.assertGreaterEqual(difference, 0.0)
+    self.assertLess(difference, 0.0001)
+
+  def test_strong_opposing_model_preview_keeps_ownership(self):
+    desired_curvature = 0.0138
+    command = ProjectedLatControlPath().update(
+      model(-0.8, -0.2, 0.0126, -0.00027),
+      -0.0106,
+      4.7,
+      True,
+      False,
+      projected_measured_curvature=-0.0110,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    self.assertLess(equivalent_curvature(command, 7.0), 0.0)
+
+  def test_supported_preview_does_not_collapse_to_c2_while_wheel_is_behind(self):
+    # Route 79 segment 39: the raw polynomial remains strongly outward, but
+    # its instantaneous C3 demand falls below the maneuver-share threshold.
+    desired_curvature = 0.0076
+    controller = ProjectedLatControlPath()
+    target = model(0.28, 0.09, 0.0074, 0.00083)
+
+    command = controller.update(
+      target, 0.0019, 10.3, True, False,
+      projected_measured_curvature=0.0026,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    self.assertGreaterEqual(
+      equivalent_curvature(command, 7.0),
+      desired_curvature + 0.00025,
+    )
+
+  def test_supported_preview_extension_is_removed_at_projected_arrival(self):
+    desired_curvature = 0.0076
+    controller = ProjectedLatControlPath()
+    target = model(0.28, 0.09, 0.0074, 0.00083)
+
+    command = controller.update(
+      target, 0.0019, 10.3, True, False,
+      projected_measured_curvature=desired_curvature,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    self.assertLessEqual(equivalent_curvature(command, 7.0), desired_curvature)
+
+  def test_supported_preview_retention_is_bounded_and_preserves_c2_c3(self):
+    desired_curvature = 0.0076
+    controller = ProjectedLatControlPath()
+    target = model(0.28, 0.09, 0.0074, 0.00083)
+
+    command = controller.update(
+      target, 0.0019, 10.3, True, False,
+      projected_measured_curvature=0.0026,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    extension = equivalent_curvature(command, 7.0) - desired_curvature
+    self.assertGreater(extension, 0.0)
+    self.assertLessEqual(extension, 0.0015 + 1e-12)
+    self.assertEqual(command.curvature, target.curvature)
+    self.assertEqual(command.curvature_rate, 0.0)
+
+  def test_supported_preview_correction_is_bounded_across_large_shortfall(self):
+    before = (0.0, 0.0, 0.0035, 0.0)
+    after = _retain_feedback_preview(
+      before,
+      (0.05, 0.02, 0.0035, 0.0),
+      0.02,
+      0.001,
+      0.001,
+      1.0,
+    )
+
+    self.assertGreater(_curvature(after), _curvature(before))
+    self.assertLessEqual(
+      _curvature(after) - _curvature(before),
+      FEEDBACK_PREVIEW_LIMIT + 1e-12,
+    )
+
+  def test_supported_preview_retention_waits_for_wheel_motion(self):
+    desired_curvature = 0.0076
+    controller = ProjectedLatControlPath()
+    target = model(0.28, 0.09, 0.0074, 0.00083)
+
+    command = controller.update(
+      target, 0.0, 10.3, True, False,
+      projected_measured_curvature=0.0,
+      desired_angle_curvature=desired_curvature,
+    )
+
+    self.assertEqual(command.path_offset, 0.0)
+    self.assertEqual(command.path_angle, 0.0)
+    self.assertEqual(command.curvature, target.curvature)
+    self.assertEqual(command.curvature_rate, 0.0)
+
+  def test_supported_preview_retention_is_continuous_at_desired_maneuver_threshold(self):
+    commands = []
+    for desired_curvature in (0.002999, 0.003001):
+      commands.append(ProjectedLatControlPath().update(
+        model(0.28, 0.09, desired_curvature - 0.00025, 0.00083),
+        0.0010,
+        10.3,
+        True,
+        False,
+        projected_measured_curvature=0.0012,
+        desired_angle_curvature=desired_curvature,
+      ))
+
+    difference = equivalent_curvature(commands[1], 7.0) - \
+      equivalent_curvature(commands[0], 7.0)
+    self.assertGreaterEqual(difference, 0.0)
+    self.assertLess(difference, 0.0001)
+
+  def test_supported_preview_retention_is_continuous_at_local_support_threshold(self):
+    desired_curvature = 0.0076
+    commands = []
+    for curvature_rate in (-0.00100001 / 7.0, -0.00099999 / 7.0):
+      commands.append(ProjectedLatControlPath().update(
+        model(0.28, 0.09, 0.001, curvature_rate),
+        0.0006,
+        10.3,
+        True,
+        False,
+        projected_measured_curvature=0.0007,
+        desired_angle_curvature=desired_curvature,
+      ))
+
+    difference = equivalent_curvature(commands[1], 7.0) - \
+      equivalent_curvature(commands[0], 7.0)
+    self.assertGreaterEqual(difference, 0.0)
+    self.assertLess(difference, 0.0001)
+
+  def test_supported_preview_retention_crossfades_into_polynomial(self):
+    commands = []
+    for curvature_rate in (0.0008737764, 0.0008737964):
+      commands.append(ProjectedLatControlPath().update(
+        model(0.28, 0.09, 0.0074, curvature_rate),
+        0.0019,
+        10.3,
+        True,
+        False,
+        projected_measured_curvature=0.0026,
+        desired_angle_curvature=0.0076,
+      ))
+
+    difference = equivalent_curvature(commands[1], 7.0) - \
+      equivalent_curvature(commands[0], 7.0)
+    self.assertLess(abs(difference), 0.0001)
+
+  def test_supported_preview_retention_does_not_add_authority_at_pscm_limit(self):
+    desired_curvature = 0.0076
+    target = model(0.28, 0.09, 0.0074, 0.00083)
+
+    for lat_ctl_limit in (1, 2, 3):
+      with self.subTest(lat_ctl_limit=lat_ctl_limit):
+        command = ProjectedLatControlPath().update(
+          target, 0.0019, 10.3, True, False,
+          projected_measured_curvature=0.0026,
+          desired_angle_curvature=desired_curvature,
+          lat_ctl_limit=lat_ctl_limit,
+        )
+
+        self.assertEqual(command.path_offset, 0.0)
+        self.assertEqual(command.path_angle, 0.0)
+        self.assertEqual(command.curvature, target.curvature)
+        self.assertEqual(command.curvature_rate, 0.0)
