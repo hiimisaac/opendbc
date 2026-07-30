@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
@@ -1196,3 +1197,80 @@ def test_clipped_c3_authority_moves_into_c0_only_while_wheel_is_behind():
     assert direction * behind.path_offset > 0.0
     assert abs(equivalent_curvature(behind, 7.0)) > abs(equivalent_curvature(arrived, 7.0))
     assert arrived.path_offset == 0.0
+
+
+def test_controller_is_stateless_and_order_independent():
+  target_a = model(0.8, 0.2, 0.015, 0.003)
+  target_b = model(-0.4, -0.1, -0.008, -0.001)
+  controller = ProjectedLatControlPath()
+
+  first = controller.update(
+    target_b, -0.003, 9.0, True, False,
+    projected_measured_curvature=-0.004,
+    desired_angle_curvature=-0.012,
+    lat_ctl_limit=2,
+  )
+  controller.update(
+    target_a, 0.02, 4.0, True, False,
+    projected_measured_curvature=0.03,
+    desired_angle_curvature=0.005,
+    lat_ctl_limit=1,
+  )
+  after_unrelated_call = controller.update(
+    target_b, -0.003, 9.0, True, False,
+    projected_measured_curvature=-0.004,
+    desired_angle_curvature=-0.012,
+    lat_ctl_limit=2,
+  )
+
+  assert after_unrelated_call == first
+  assert ProjectedLatControlPath().update(
+    target_b, -0.003, 9.0, True, False,
+    projected_measured_curvature=-0.004,
+    desired_angle_curvature=-0.012,
+    lat_ctl_limit=2,
+  ) == first
+
+
+def test_inactive_invalid_and_nonfinite_inputs_are_safe():
+  controller = ProjectedLatControlPath()
+  inactive = controller.update(model(1.0, 1.0, 1.0, 1.0), float("nan"), float("inf"), False, False)
+  assert inactive.coefficients() == (0.0, 0.0, 0.0, 0.0)
+  assert not inactive.valid
+
+  invalid = SimpleNamespace(
+    valid=False,
+    curvature=float("nan"),
+  )
+  command = controller.update(
+    invalid, float("nan"), float("-inf"), True, False,
+    projected_measured_curvature=float("inf"),
+    desired_angle_curvature=float("nan"),
+    lat_ctl_limit=99,
+  )
+  assert not command.valid
+  assert all(math.isfinite(value) for value in command.coefficients())
+  assert -4.61 <= command.path_offset <= 4.60
+  assert -0.475 <= command.path_angle <= 0.497
+  assert -0.02 <= command.curvature <= 0.02
+  assert -0.001024 <= command.curvature_rate <= 0.001023
+
+
+def test_pinned_preview_waits_until_both_wheel_estimates_pass_desired():
+  target = model(2.885494, 0.558042, 0.00015, 0.010035)
+  controller = ProjectedLatControlPath()
+
+  one_past = controller.update(
+    target, 0.05, 3.7, True, False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.00015,
+    lat_ctl_limit=2,
+  )
+  both_past = controller.update(
+    target, 0.05, 3.7, True, False,
+    projected_measured_curvature=0.06,
+    desired_angle_curvature=0.00015,
+    lat_ctl_limit=2,
+  )
+
+  assert equivalent_curvature(one_past, 7.0) > equivalent_curvature(both_past, 7.0) > 0.0

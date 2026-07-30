@@ -7,7 +7,7 @@ from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.carcontroller import CarController
-from opendbc.car.ford.lateral_path import LateralPathCommand
+from opendbc.car.ford.lateral_path_projector import LateralPathCommand
 from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
