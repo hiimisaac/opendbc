@@ -6,6 +6,7 @@ from opendbc.car.ford.lateral_path_projector import (
   FEEDBACK_PREVIEW_LIMIT,
   ProjectedLatControlPath,
   _curvature,
+  _project,
   _retain_feedback_preview,
 )
 
@@ -1105,7 +1106,48 @@ def test_pinned_outward_preview_cannot_keep_turning_after_wheel_passes_desired_a
     )
 
     delivered_curvature = direction * equivalent_curvature(command, 7.0)
-    assert 0.0 < delivered_curvature <= 0.006151
+    assert 0.0 < delivered_curvature <= 0.000401
+
+
+def test_unpinned_outward_preview_cannot_keep_turning_after_wheel_passes_desired_angle():
+  controller = ProjectedLatControlPath()
+  target = model(0.9, 0.2, 0.002, 0.0008)
+
+  command = controller.update(
+    target, 0.012, 7.0, True, False,
+    projected_measured_curvature=0.014,
+    desired_angle_curvature=0.002,
+  )
+
+  assert 0.0 < equivalent_curvature(command, 7.0) <= 0.002251
+
+
+def test_pinned_preview_opposing_desired_keeps_existing_unwind_corridor():
+  controller = ProjectedLatControlPath()
+  desired_curvature = -0.001892
+  target = model(4.5618, 0.4713, -0.001677, 0.001174)
+
+  command = controller.update(
+    target, 0.1315, 3.7, True, False,
+    projected_measured_curvature=0.1309,
+    desired_angle_curvature=desired_curvature,
+  )
+
+  assert 0.0 < equivalent_curvature(command, 7.0) <= abs(desired_curvature) + 0.006001
+
+
+def test_unpinned_preview_opposing_desired_cannot_continue_after_arrival():
+  controller = ProjectedLatControlPath()
+  desired_curvature = -0.002
+  target = model(0.9, 0.2, 0.002, 0.0008)
+
+  command = controller.update(
+    target, 0.012, 7.0, True, False,
+    projected_measured_curvature=0.014,
+    desired_angle_curvature=desired_curvature,
+  )
+
+  assert 0.0 < equivalent_curvature(command, 7.0) <= abs(desired_curvature) + 0.006001
 
 
 def test_pinned_outward_preview_keeps_full_authority_before_wheel_arrives():
@@ -1136,7 +1178,7 @@ def test_pinned_outward_preview_relatches_when_desired_moves_beyond_wheel():
   assert equivalent_curvature(command, 7.0) > 0.25
 
 
-def test_unwind_sign_c3_is_not_reduced_after_wheel_passes_desired_angle():
+def test_unwind_sign_c3_is_tapered_with_spatial_preview_after_wheel_arrives():
   controller = ProjectedLatControlPath()
   target = model(2.885494, 0.558042, 0.00015, -0.010035)
 
@@ -1147,8 +1189,68 @@ def test_unwind_sign_c3_is_not_reduced_after_wheel_passes_desired_angle():
     lat_ctl_limit=2,
   )
 
-  assert equivalent_curvature(command, 7.0) > 0.25
+  assert 0.0 < equivalent_curvature(command, 7.0) <= 0.000401
   assert command.curvature_rate < 0.0
+  assert abs(command.curvature_rate) < 0.001024
+
+
+def test_arrival_guard_scales_one_preview_residual_and_preserves_c2():
+  requested = (1.0, 0.2, 0.003, 0.0005)
+  command = _project(
+    requested,
+    requested[3],
+    0.02,
+    True,
+    requested[2],
+    requested[3],
+    0.01,
+    0.013,
+    0.014,
+    0,
+  )
+
+  assert command[2] == requested[2]
+  scales = tuple(command[index] / requested[index] for index in (0, 1, 3))
+  assert 0.0 < scales[0] < 1.0
+  assert max(scales) - min(scales) < 1e-12
+  assert abs(_curvature(command) - 0.01025) < 1e-12
+
+
+def test_pinned_arrival_keeps_legacy_whole_polynomial_c2_reduction():
+  requested = (1.0, 0.2, 0.003, 0.001023)
+  command = _project(
+    requested,
+    requested[3],
+    0.02,
+    True,
+    requested[2],
+    requested[3],
+    0.01,
+    0.013,
+    0.014,
+    0,
+  )
+
+  assert 0.0 < command[2] < requested[2]
+  assert abs(_curvature(command) - 0.01025) < 1e-12
+
+
+def test_arrival_guard_does_not_manipulate_a_c2_only_command():
+  requested = (0.0, 0.0, 0.01, 0.0)
+  command = _project(
+    requested,
+    requested[3],
+    0.01,
+    True,
+    requested[2],
+    requested[3],
+    0.002,
+    0.012,
+    0.014,
+    0,
+  )
+
+  assert command == requested
 
 
 def test_c2_baseband_trim_is_removed_when_projected_wheel_arrives():

@@ -393,28 +393,54 @@ def _project(requested: Coefficients, requested_c3: float, model_target: float,
     action_target = _lerp(command_curvature, desired, action_share)
     output = _add_c0(output, action_target - command_curvature)
 
-  # 4. Once both wheel estimates pass desired angle, constrain only pinned
-  # outward preview. Moving desired outward immediately restores full command.
+  # 4. Keep the proven pinned-C3 whole-polynomial arrival behavior, then
+  # constrain any remaining outward command. Same-direction preview scales
+  # around C2; a stale command opposing desired scales completely so it cannot
+  # prolong C2 into the old direction. Moving desired outward restores both.
   command_curvature = _curvature(output)
+  measured_error = desired - measured
+  projected_error = desired - projected
+  beyond_error = min(
+    abs(measured_error) if measured_error * measured < 0.0 else 0.0,
+    abs(projected_error) if projected_error * projected < 0.0 else 0.0,
+  )
+  arrival_share = _ramp(beyond_error, ARRIVAL_BP)
   c3_limit = PATH_LIMITS[3][1] if raw_c3 >= 0.0 else abs(PATH_LIMITS[3][0])
   outward_pinned = raw_c3 * measured > 0.0 and abs(raw_c3) >= c3_limit and \
                    command_curvature * measured > 0.0
-  if outward_pinned:
-    measured_error = desired - measured
-    projected_error = desired - projected
-    beyond_error = min(
-      abs(measured_error) if measured_error * measured < 0.0 else 0.0,
-      abs(projected_error) if projected_error * projected < 0.0 else 0.0,
+  if arrival_share > 0.0 and outward_pinned:
+    corridor = abs(desired) + CONTINUATION_MARGIN
+    guarded_curvature = _lerp(
+      abs(command_curvature),
+      min(abs(command_curvature), corridor),
+      arrival_share,
     )
-    arrival_share = _ramp(beyond_error, ARRIVAL_BP)
-    if arrival_share > 0.0:
-      corridor = abs(desired) + CONTINUATION_MARGIN
-      guarded = _lerp(
-        abs(command_curvature),
-        min(abs(command_curvature), corridor),
-        arrival_share,
-      )
-      scale = guarded / abs(command_curvature)
+    scale = guarded_curvature / abs(command_curvature)
+    output = tuple(value * scale for value in output)
+
+  command_curvature = _curvature(output)
+  follows_desired = command_curvature * desired >= 0.0
+  corridor_margin = TRACKING_EXTENSION_DEADZONE if follows_desired else CONTINUATION_MARGIN
+  corridor = abs(desired) + corridor_margin
+  if arrival_share > 0.0 and command_curvature * measured > 0.0 and abs(command_curvature) > corridor:
+    guarded_curvature = math.copysign(
+      _lerp(abs(command_curvature), corridor, arrival_share),
+      command_curvature,
+    )
+    if follows_desired:
+      preview_curvature = command_curvature - output[2]
+      if preview_curvature != 0.0:
+        preview_share = _clip(
+          (guarded_curvature - output[2]) / preview_curvature,
+          (0.0, 1.0),
+        )
+        c2_base: Coefficients = (0.0, 0.0, output[2], 0.0)
+        output = tuple(
+          c2_base[index] + preview_share * (output[index] - c2_base[index])
+          for index in range(4)
+        )
+    else:
+      scale = guarded_curvature / command_curvature
       output = tuple(value * scale for value in output)
   return output
 
