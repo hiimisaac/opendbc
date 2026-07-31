@@ -56,8 +56,8 @@ class CarState(CarStateBase):
       # this signal is always 0 on non-CAN FD cars
       lat_ctl_status = cp.vl["Lane_Assist_Data3_FD1"]
       ret.steerFaultTemporary |= lat_ctl_status["LatCtlSte_D_Stat"] not in (1, 2, 3)
-      # Keep the PSCM's own envelope status available to the controller without
-      # changing commands until its behavior is validated across more drives.
+      # Expose the PSCM's own envelope status for bounded coefficient
+      # reallocation in the CAN FD lateral controller.
       self.lat_ctl_limit = int(lat_ctl_status["LatCtlLim_D_Stat"])
 
     # cruise state
