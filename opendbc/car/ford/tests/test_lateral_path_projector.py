@@ -4,6 +4,7 @@ import unittest
 
 from opendbc.car.ford.lateral_path_projector import (
   FEEDBACK_PREVIEW_LIMIT,
+  PATH_LIMITS,
   ProjectedLatControlPath,
   _curvature,
   _project,
@@ -272,7 +273,7 @@ def test_unconfirmed_low_speed_spatial_slope_stays_on_c2():
     assert command.curvature_rate == 0.0
 
 
-def test_confirmed_spatial_onset_is_removed_immediately_at_projected_arrival():
+def test_confirmed_spatial_onset_tapers_at_projection_without_dropping_below_arrival_command():
   controller = ProjectedLatControlPath()
   desired_curvature = 0.006
   spatial_curvature = 0.015
@@ -293,16 +294,24 @@ def test_confirmed_spatial_onset_is_removed_immediately_at_projected_arrival():
 
   assert command is not None
   assert command.path_offset > 0.0
-  arrived = controller.update(
+  projected_arrival = controller.update(
     target, 0.0, 5.0, True, False,
     projected_measured_curvature=desired_curvature,
     desired_angle_curvature=desired_curvature,
   )
+  measured_arrival = controller.update(
+    target, desired_curvature, 5.0, True, False,
+    projected_measured_curvature=desired_curvature,
+    desired_angle_curvature=desired_curvature,
+  )
 
-  assert arrived.path_offset == 0.0
-  assert arrived.path_angle == 0.0
-  assert arrived.curvature > command.curvature
-  assert arrived.curvature_rate == 0.0
+  assert equivalent_curvature(command, 7.0) > equivalent_curvature(projected_arrival, 7.0)
+  assert equivalent_curvature(projected_arrival, 7.0) >= equivalent_curvature(measured_arrival, 7.0)
+  assert equivalent_curvature(projected_arrival, 7.0) >= desired_curvature - 1e-12
+  assert measured_arrival.path_offset == 0.0
+  assert measured_arrival.path_angle == 0.0
+  assert measured_arrival.curvature > command.curvature
+  assert measured_arrival.curvature_rate == 0.0
 
 
 def test_continuing_model_preview_extends_only_c0_after_current_angle_arrival():
@@ -583,7 +592,7 @@ def test_projected_gate_preserves_model_correction_while_both_wheel_estimates_ar
   assert abs(command.path_angle - (model_curvature + tracking_correction) * 7.0) < 1e-9
 
 
-def test_projected_crossing_drops_correction_immediately_without_reversing_model():
+def test_projected_crossing_tapers_correction_and_measured_arrival_releases_it():
   desired_curvature = 0.015
   target = model(
     0.5 * desired_curvature * 7.0 ** 2,
@@ -602,16 +611,284 @@ def test_projected_crossing_drops_correction_immediately_without_reversing_model
     )
 
   assert command is not None
-  arrived = controller.update(
+  projected_arrival = controller.update(
     target, 0.005, 7.0, True, False,
     projected_measured_curvature=0.016,
     desired_angle_curvature=desired_curvature,
   )
+  measured_arrival = controller.update(
+    target, desired_curvature, 7.0, True, False,
+    projected_measured_curvature=0.016,
+    desired_angle_curvature=desired_curvature,
+  )
 
-  assert arrived.path_offset < command.path_offset
-  assert arrived.path_angle < command.path_angle
-  assert abs(arrived.path_offset - target.pathOffset) < 1e-9
-  assert abs(arrived.path_angle - target.pathAngle) < 1e-9
+  assert projected_arrival.path_offset < command.path_offset
+  assert projected_arrival.path_angle < command.path_angle
+  assert equivalent_curvature(projected_arrival, 7.0) >= equivalent_curvature(measured_arrival, 7.0)
+  assert abs(measured_arrival.path_offset - target.pathOffset) < 1e-9
+  assert abs(measured_arrival.path_angle - target.pathAngle) < 1e-9
+
+
+def test_measured_arrival_at_35_then_immediate_200_target_relatches_retained_preview():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  controller = ProjectedLatControlPath()
+  for sample in range(12):
+    progress = sample / 12.0
+    controller.update(
+      target, 0.0035 * progress, 9.0, True, False,
+      projected_measured_curvature=0.0035 * min(progress + 0.04, 1.0),
+      desired_angle_curvature=0.0035,
+    )
+
+  arrived_args = dict(
+    measured_curvature=0.0035,
+    projected_measured_curvature=0.0036,
+    desired_angle_curvature=0.0035,
+  )
+  arrived = controller.update(target, v_ego=9.0, active=True, driver_override=False, **arrived_args)
+  cold_arrived = ProjectedLatControlPath().update(
+    target, v_ego=9.0, active=True, driver_override=False, **arrived_args,
+  )
+  assert arrived == cold_arrived
+
+  outward_args = dict(
+    measured_curvature=0.0035,
+    projected_measured_curvature=0.0036,
+    desired_angle_curvature=0.02,
+  )
+  relatched = controller.update(target, v_ego=9.0, active=True, driver_override=False, **outward_args)
+  cold = ProjectedLatControlPath().update(
+    target, v_ego=9.0, active=True, driver_override=False, **outward_args,
+  )
+  assert equivalent_curvature(relatched, 7.0) > equivalent_curvature(cold, 7.0)
+
+
+def test_constant_tracking_request_is_identical_to_fresh_controller_on_every_sample():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  controller = ProjectedLatControlPath()
+  update_args = dict(
+    measured_curvature=0.001,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.002,
+    desired_angle_curvature=0.01,
+  )
+
+  for _ in range(50):
+    assert controller.update(target, **update_args) == ProjectedLatControlPath().update(target, **update_args)
+
+
+def test_retained_relatch_readiness_decays_to_a_cold_restart_in_finite_time():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  controller = ProjectedLatControlPath()
+  for _ in range(8):
+    controller.update(
+      target, 0.001, 9.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.01,
+    )
+
+  straight = model(0.0, 0.0, 0.0, 0.0)
+  for _ in range(31):
+    update_args = dict(
+      measured_curvature=0.01,
+      v_ego=9.0,
+      active=True,
+      driver_override=False,
+      projected_measured_curvature=0.008,
+      desired_angle_curvature=0.0,
+    )
+    assert controller.update(straight, **update_args) == ProjectedLatControlPath().update(straight, **update_args)
+
+  outward_args = dict(
+    measured_curvature=0.01,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.02,
+  )
+  assert controller.update(target, **outward_args) == ProjectedLatControlPath().update(target, **outward_args)
+
+
+def test_projected_arrival_cannot_erase_retained_pull_while_actual_is_behind():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  controller = ProjectedLatControlPath()
+  for _ in range(8):
+    controller.update(
+      target, 0.001, 9.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.01,
+    )
+
+  projected_arrival = dict(
+    measured_curvature=0.005,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.01,
+  )
+  retained = controller.update(target, **projected_arrival)
+  cold = ProjectedLatControlPath().update(target, **projected_arrival)
+
+  assert equivalent_curvature(retained, 7.0) > equivalent_curvature(cold, 7.0)
+
+
+def test_reversal_override_inactive_invalid_and_unsafe_status_clear_retained_preview():
+  left = model(0.35, 0.08, 0.004, 0.0002)
+  behind = dict(
+    measured_curvature=0.001,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.002,
+    desired_angle_curvature=0.01,
+  )
+
+  def primed_controller():
+    controller = ProjectedLatControlPath()
+    for _ in range(8):
+      controller.update(left, **behind)
+    return controller
+
+  reset_cases = (
+    (left, behind | {"driver_override": True}),
+    (left, behind | {"active": False}),
+    (SimpleNamespace(valid=False, pathOffset=0.0, pathAngle=0.0, curvature=0.004, curvatureRate=0.0), behind),
+    (left, behind | {"lat_ctl_limit": 3}),
+    (left, behind | {"lat_ctl_limit": 99}),
+    (model(float("nan"), 0.08, 0.004, 0.0002), behind),
+    (left, behind | {"measured_curvature": float("nan")}),
+    (left, behind | {"projected_measured_curvature": float("inf")}),
+    (left, behind | {"desired_angle_curvature": float("nan")}),
+    (left, behind | {"v_ego": float("inf")}),
+  )
+  for reset_path, reset_args in reset_cases:
+    controller = primed_controller()
+    controller.update(reset_path, **reset_args)
+    assert controller.update(left, **behind) == ProjectedLatControlPath().update(left, **behind)
+
+  right = model(-0.35, -0.08, -0.004, -0.0002)
+  right_args = {
+    key: -value if key in ("measured_curvature", "projected_measured_curvature", "desired_angle_curvature") else value
+    for key, value in behind.items()
+  }
+  controller = primed_controller()
+  assert controller.update(right, **right_args) == ProjectedLatControlPath().update(right, **right_args)
+
+
+def test_pscm_limit_reached_cannot_build_hidden_relatch_authority():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  limited_args = dict(
+    measured_curvature=0.001,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.002,
+    desired_angle_curvature=0.01,
+    lat_ctl_limit=2,
+  )
+  controller = ProjectedLatControlPath()
+  for _ in range(20):
+    assert controller.update(target, **limited_args) == ProjectedLatControlPath().update(target, **limited_args)
+
+  available_args = limited_args | {"lat_ctl_limit": 0}
+  assert controller.update(target, **available_args) == ProjectedLatControlPath().update(target, **available_args)
+
+
+def test_relatch_extension_changes_only_bounded_c0_c1():
+  target = model(0.35, 0.08, 0.004, 0.0002)
+  controller = ProjectedLatControlPath()
+  for _ in range(8):
+    controller.update(
+      target, 0.001, 7.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.01,
+    )
+  controller.update(
+    target, 0.01, 7.0, True, False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.01,
+  )
+  relatch_args = dict(
+    measured_curvature=0.01,
+    v_ego=7.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.02,
+  )
+  retained = controller.update(target, **relatch_args)
+  cold = ProjectedLatControlPath().update(target, **relatch_args)
+
+  assert retained.curvature == cold.curvature
+  assert retained.curvature_rate == cold.curvature_rate
+  assert retained.path_offset != cold.path_offset or retained.path_angle != cold.path_angle
+  for value, (lower, upper) in zip(retained.coefficients(), PATH_LIMITS, strict=True):
+    assert math.isfinite(value)
+    assert lower <= value <= upper
+
+
+def test_retained_preview_does_not_stack_beyond_desired_command():
+  target = model(0.8, 0.18, 0.02, 0.0008)
+  controller = ProjectedLatControlPath()
+  for _ in range(8):
+    controller.update(
+      target, 0.001, 9.0, True, False,
+      projected_measured_curvature=0.002,
+      desired_angle_curvature=0.01,
+    )
+  controller.update(
+    target, 0.01, 9.0, True, False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.01,
+  )
+
+  relatch_args = dict(
+    measured_curvature=0.01,
+    v_ego=9.0,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=0.011,
+    desired_angle_curvature=0.02,
+  )
+  retained = controller.update(target, **relatch_args)
+  cold = ProjectedLatControlPath().update(target, **relatch_args)
+
+  assert equivalent_curvature(cold, 7.0) > relatch_args["desired_angle_curvature"]
+  assert retained == cold
+
+
+def test_tiny_reopened_target_cannot_expose_large_retained_preview():
+  target = model(-1.16671, -0.24826, -0.00092, -0.01019)
+  controller = ProjectedLatControlPath()
+  for _ in range(8):
+    controller.update(
+      target, -0.001, 7.0, True, False,
+      projected_measured_curvature=-0.002,
+      desired_angle_curvature=-0.01,
+    )
+  controller.update(
+    target, -0.01, 7.0, True, False,
+    projected_measured_curvature=-0.011,
+    desired_angle_curvature=-0.01,
+  )
+
+  reopened_args = dict(
+    measured_curvature=-0.000112,
+    v_ego=0.69,
+    active=True,
+    driver_override=False,
+    projected_measured_curvature=-0.001033,
+    desired_angle_curvature=-0.000956,
+  )
+  retained = controller.update(target, **reopened_args)
+  cold = ProjectedLatControlPath().update(target, **reopened_args)
+  extension = abs(equivalent_curvature(retained, 7.0) - equivalent_curvature(cold, 7.0))
+
+  assert extension <= abs(reopened_args["desired_angle_curvature"] - reopened_args["measured_curvature"]) + 1e-12
 
 
 def test_projected_arrival_tapers_c0_c1_correction_without_a_command_step():
@@ -1307,7 +1584,7 @@ def test_clipped_c3_authority_moves_into_c0_only_while_wheel_is_behind():
     assert arrived.path_offset == 0.0
 
 
-def test_controller_is_stateless_and_order_independent():
+def test_limit_reached_output_is_order_independent():
   target_a = model(0.8, 0.2, 0.015, 0.003)
   target_b = model(-0.4, -0.1, -0.008, -0.001)
   controller = ProjectedLatControlPath()

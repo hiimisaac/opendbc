@@ -1,10 +1,12 @@
-"""Stateless Ford LMC2 polynomial controller."""
+"""Ford LMC2 polynomial controller."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
 from typing import Protocol
+
+from opendbc.car.ford.lateral_path import FORD_PATH_DT
 
 
 Coefficients = tuple[float, float, float, float]
@@ -36,6 +38,8 @@ DIRECTION_MARGIN = 0.0005
 SPATIAL_ONSET_DISTANCE = 12.0
 SPATIAL_ONSET_RELATIVE_MIN = 0.5
 C3_REALLOCATION_DISTANCE = 15.0
+RELATCH_RETENTION_SECONDS = 1.5
+RELATCH_ARRIVAL_POWER = 3.0
 
 
 @dataclass(frozen=True)
@@ -59,8 +63,15 @@ class LateralPathController(Protocol):
     ...
 
 
+def _is_finite(value: float) -> bool:
+  try:
+    return math.isfinite(float(value))
+  except (TypeError, ValueError):
+    return False
+
+
 def _finite(value: float, fallback: float = 0.0) -> float:
-  return float(value) if math.isfinite(value) else fallback
+  return float(value) if _is_finite(value) else fallback
 
 
 def _clip(value: float, limits: tuple[float, float]) -> float:
@@ -105,6 +116,32 @@ def _add_c0(coefficients: Coefficients, curvature: float) -> Coefficients:
   values = list(coefficients)
   values[0] = _clip(values[0] + curvature / NEAR_BASIS[0], PATH_LIMITS[0])
   return tuple(values)
+
+
+def _add_coupled_preview(coefficients: Coefficients, raw: Coefficients,
+                         desired: float, share: float,
+                         max_curvature: float) -> Coefficients:
+  """Add a shared C0/C1 scalar without extending beyond desired."""
+  preview = (raw[0] - NEAR_DISTANCE * raw[1], raw[1], 0.0, 0.0)
+  preview_curvature = _curvature(preview)
+  if share <= 0.0 or preview_curvature * desired <= 0.0:
+    return coefficients
+
+  direction = math.copysign(1.0, desired)
+  command_headroom = max(direction * (desired - _curvature(coefficients)), 0.0)
+  bounded_share = min(
+    _clip(share, (0.0, 1.0)),
+    min(max(_finite(max_curvature), 0.0), command_headroom) / abs(preview_curvature),
+  )
+  for value, delta, limits in zip(coefficients, preview, PATH_LIMITS, strict=True):
+    if delta > 0.0:
+      bounded_share = min(bounded_share, max(limits[1] - value, 0.0) / delta)
+    elif delta < 0.0:
+      bounded_share = min(bounded_share, max(value - limits[0], 0.0) / -delta)
+  return tuple(
+    value + bounded_share * delta
+    for value, delta in zip(coefficients, preview, strict=True)
+  )
 
 
 def _outward_extension(command: float, desired: float, measured: float,
@@ -448,19 +485,75 @@ def _project(requested: Coefficients, requested_c3: float, model_target: float,
 class ProjectedLatControlPath:
   """Convert model intent and wheel feedback into one bounded Ford path."""
 
+  def __init__(self):
+    self._retained_authority = 0.0
+
+  def _relatch_surplus(self, desired: float, measured: float, projected: float,
+                       lat_ctl_limit: int) -> float:
+    if lat_ctl_limit not in (0, 1, 2):
+      self._retained_authority = 0.0
+      return 0.0
+
+    direction = math.copysign(1.0, desired) if desired != 0.0 else 0.0
+    if direction != 0.0 and self._retained_authority * direction < 0.0:
+      self._retained_authority = 0.0
+
+    actual_share = 0.0
+    projected_share = 0.0
+    if direction != 0.0:
+      actual_share = _clip(direction * (desired - measured) / abs(desired), (0.0, 1.0))
+      if actual_share > 0.0:
+        projected_share = _clip(direction * (desired - projected) / abs(desired), (0.0, 1.0))
+    # Retain the peak normalized shortfall while the measured wheel is behind.
+    request = 0.5 * (actual_share + projected_share)
+    decayed = max(
+      abs(self._retained_authority) - FORD_PATH_DT / RELATCH_RETENTION_SECONDS,
+      0.0,
+    )
+    if lat_ctl_limit == 2:
+      latent = decayed
+    elif actual_share > 0.0:
+      latent = max(request, abs(self._retained_authority))
+    else:
+      latent = decayed
+    if direction != 0.0:
+      self._retained_authority = direction * latent
+    elif self._retained_authority != 0.0:
+      self._retained_authority = math.copysign(latent, self._retained_authority)
+
+    # Arrival hides readiness without clearing it, allowing a next-frame relatch.
+    if actual_share == 0.0 or lat_ctl_limit == 2:
+      return 0.0
+    effective = request + max(latent - request, 0.0) * actual_share ** RELATCH_ARRIVAL_POWER
+    status_share = 0.5 if lat_ctl_limit == 1 else 1.0 if lat_ctl_limit == 0 else 0.0
+    return max(effective - request, 0.0) * status_share
+
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
              projected_measured_curvature: float | None = None,
              desired_angle_curvature: float | None = None,
              lat_ctl_limit: int = 0) -> LateralPathCommand:
+    valid = path is not None and bool(getattr(path, "valid", False))
+    state_inputs = [measured_curvature, v_ego]
+    if projected_measured_curvature is not None:
+      state_inputs.append(projected_measured_curvature)
+    if desired_angle_curvature is not None:
+      state_inputs.append(desired_angle_curvature)
+    if valid:
+      state_inputs.extend(
+        getattr(path, field, 0.0)
+        for field in ("pathOffset", "pathAngle", "curvature", "curvatureRate")
+      )
+    state_inputs_finite = all(_is_finite(value) for value in state_inputs)
+
     measured = _finite(measured_curvature)
     projected = measured if projected_measured_curvature is None else \
                 _finite(projected_measured_curvature, measured)
     speed = max(_finite(v_ego), 0.0)
     if not active:
+      self._retained_authority = 0.0
       return LateralPathCommand()
 
-    valid = path is not None and bool(getattr(path, "valid", False))
     if valid:
       raw = (
         _finite(getattr(path, "pathOffset", 0.0)),
@@ -473,12 +566,15 @@ class ProjectedLatControlPath:
     desired = raw[2] if desired_angle_curvature is None else _finite(desired_angle_curvature, raw[2])
 
     if driver_override:
+      self._retained_authority = 0.0
       lookahead = max(speed, NEAR_DISTANCE)
       return LateralPathCommand(
         valid=valid,
         path_offset=_clip(0.5 * measured * NEAR_DISTANCE ** 2, PATH_LIMITS[0]),
         path_angle=_clip(measured * lookahead, PATH_LIMITS[1]),
       )
+    if not valid or not state_inputs_finite:
+      self._retained_authority = 0.0
 
     requested, requested_c3, model_target, preserve_direction, maneuver_share = _compose(
       raw,
@@ -509,6 +605,14 @@ class ProjectedLatControlPath:
         projected,
         1.0 - maneuver_share,
       )
+    coefficients = _add_coupled_preview(
+      coefficients,
+      raw,
+      desired,
+      self._relatch_surplus(desired, measured, projected, lat_ctl_limit)
+      if valid and state_inputs_finite else 0.0,
+      abs(desired - measured),
+    )
     return LateralPathCommand(
       valid=valid,
       path_offset=coefficients[0],
