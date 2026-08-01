@@ -26,6 +26,7 @@ PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
 PATH_PROJECTED_ARRIVAL_ERROR_BP = (0.0005, 0.002)
 PATH_C3_UNWIND_ERROR_BP = PATH_PROJECTED_ARRIVAL_ERROR_BP
+PATH_MEASURED_ARRIVAL_ERROR_BP = PATH_PROJECTED_ARRIVAL_ERROR_BP
 PATH_DIRECTION_MARGIN = 0.0005
 PATH_C3_TO_C0_LOOKAHEAD = 15.0
 
@@ -290,6 +291,65 @@ def _preserve_model_direction(coefficients: tuple[float, float, float, float],
   return 0.0, 0.0, 0.0, 0.0
 
 
+def _taper_stale_outward_preview(coefficients: tuple[float, float, float, float],
+                                  raw_curvature_rate: float,
+                                  desired_curvature: float,
+                                  measured_curvature: float,
+                                  v_ego: float) -> tuple[float, float, float, float]:
+  """Release only outward C0/C1 after actual arrival and a spatial unwind."""
+  if measured_curvature == 0.0:
+    return coefficients
+
+  direction = math.copysign(1.0, measured_curvature)
+  desired_outward_curvature = max(desired_curvature * direction, 0.0)
+  beyond_error = max(abs(measured_curvature) - desired_outward_curvature, 0.0)
+
+  arrival_share = _interp(
+    beyond_error,
+    *PATH_MEASURED_ARRIVAL_ERROR_BP,
+    0.0,
+    1.0,
+  )
+  release_demand = max(
+    -raw_curvature_rate * direction * max(v_ego, PATH_MIN_LOOKAHEAD) / 3.0,
+    0.0,
+  )
+  release_share = arrival_share * _interp(
+    release_demand,
+    *PATH_C2_BASEBAND_BP,
+    0.0,
+    1.0,
+  )
+  if release_share == 0.0:
+    return coefficients
+
+  command_curvature = _equivalent_curvature(coefficients)
+  corridor_curvature = desired_outward_curvature + PATH_C0_CONTINUATION_MARGIN
+  excess_curvature = command_curvature * direction - corridor_curvature
+  if excess_curvature <= 0.0:
+    return coefficients
+
+  basis = _basis(PATH_MIN_LOOKAHEAD)
+  outward_preview_curvature = sum(
+    basis[i] * coefficients[i] * direction
+    for i in (0, 1)
+    if coefficients[i] * direction > 0.0
+  )
+  if outward_preview_curvature <= 0.0:
+    return coefficients
+
+  removed_curvature = min(
+    excess_curvature * release_share,
+    outward_preview_curvature,
+  )
+  preview_share = 1.0 - removed_curvature / outward_preview_curvature
+  values = list(coefficients)
+  for i in (0, 1):
+    if values[i] * direction > 0.0:
+      values[i] *= preview_share
+  return tuple(values)
+
+
 def _c3_compatibility_share(curvature_rate: float, desired_curvature: float,
                             projected_curvature: float) -> float:
   if curvature_rate * desired_curvature >= 0.0:
@@ -421,6 +481,13 @@ class ProjectedLatControlPath:
     c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
+    coefficients = _taper_stale_outward_preview(
+      coefficients,
+      raw_target[3],
+      desired_angle_curvature,
+      measured_curvature,
+      v_ego,
+    )
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
     self._last_command = command

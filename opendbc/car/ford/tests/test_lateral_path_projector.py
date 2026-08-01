@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.lateral_path_projector import PATH_C0_CONTINUATION_MARGIN, ProjectedLatControlPath, _taper_stale_outward_preview
 
 
 def model(path_offset: float, path_angle: float, curvature: float = 0.0, curvature_rate: float = 0.0):
@@ -946,3 +946,191 @@ def test_projected_arrival_does_not_reintroduce_c0_c1_attack_limit():
 
   assert 0.18375 < attack.path_offset <= 4.60
   assert 0.0525 < attack.path_angle <= 0.497
+
+
+def test_measured_arrival_with_inward_spatial_slope_releases_only_outward_preview():
+  desired_curvature = 0.015
+  spatial_curvature = 0.04
+  target = model(
+    0.5 * spatial_curvature * 7.0 ** 2,
+    spatial_curvature * 7.0,
+    desired_curvature,
+    -0.002,
+  )
+  behind_controller = ProjectedLatControlPath()
+  arrived_controller = ProjectedLatControlPath()
+
+  behind = None
+  arrived = None
+  for _ in range(100):
+    behind = behind_controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=0.01,
+      desired_angle_curvature=desired_curvature,
+    )
+    arrived = arrived_controller.update(
+      target, 0.02, 7.0, True, False,
+      projected_measured_curvature=0.02,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert behind is not None
+  assert arrived is not None
+  assert arrived.curvature == 0.0
+  assert arrived.curvature_rate == -0.001024
+  assert 0.0 <= arrived.path_offset < target.pathOffset
+  assert 0.0 <= arrived.path_angle < target.pathAngle
+
+
+def test_projected_arrival_cannot_release_preview_before_measured_wheel_arrives():
+  desired_curvature = 0.015
+  spatial_curvature = 0.04
+  target = model(
+    0.5 * spatial_curvature * 7.0 ** 2,
+    spatial_curvature * 7.0,
+    desired_curvature,
+    -0.002,
+  )
+  measured_controller = ProjectedLatControlPath()
+  projected_controller = ProjectedLatControlPath()
+
+  measured = None
+  projected = None
+  for _ in range(100):
+    measured = measured_controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=0.01,
+      desired_angle_curvature=desired_curvature,
+    )
+    projected = projected_controller.update(
+      target, 0.01, 7.0, True, False,
+      projected_measured_curvature=0.02,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert measured is not None
+  assert projected is not None
+  # This is lctnr's existing projected-wheel behavior. The new measured-wheel
+  # release guard must not add another reduction while the actual wheel trails.
+  assert projected.path_offset == target.pathOffset
+  assert projected.path_angle == target.pathAngle
+  assert projected.curvature == 0.0
+  assert projected.curvature_rate == -0.001024
+
+
+def test_measured_arrival_keeps_outward_preview_while_spatial_path_is_growing():
+  desired_curvature = 0.015
+  spatial_curvature = 0.04
+  target = model(
+    0.5 * spatial_curvature * 7.0 ** 2,
+    spatial_curvature * 7.0,
+    desired_curvature,
+    0.002,
+  )
+  controller = ProjectedLatControlPath()
+
+  command = None
+  for _ in range(100):
+    command = controller.update(
+      target, 0.02, 7.0, True, False,
+      projected_measured_curvature=0.02,
+      desired_angle_curvature=desired_curvature,
+    )
+
+  assert command is not None
+  # Preserve lctnr's existing C0 continuation correction while the spatial
+  # polynomial is still building outward.
+  assert abs(command.path_offset - 1.13925) < 1e-12
+  assert command.path_angle == target.pathAngle
+  assert command.curvature == 0.0
+  assert command.curvature_rate == 0.001023
+
+
+def test_measured_arrival_bounds_known_stale_preview_without_touching_c2_c3():
+  raw_coefficients = (4.669087, 0.716898, 0.004724, -0.017120)
+  desired_curvature = 0.005703
+  measured_curvature = 0.101705
+
+  for direction in (1.0, -1.0):
+    target = model(*(direction * value for value in raw_coefficients))
+    controller = ProjectedLatControlPath()
+
+    command = None
+    for _ in range(100):
+      command = controller.update(
+        target, direction * measured_curvature, 2.719, True, False,
+        projected_measured_curvature=direction * 0.101900,
+        desired_angle_curvature=direction * desired_curvature,
+      )
+
+    assert command is not None
+    assert 0.0 < direction * command.path_offset < abs(raw_coefficients[0])
+    assert 0.0 < direction * command.path_angle < abs(raw_coefficients[1])
+    assert command.curvature == 0.0
+    assert command.curvature_rate == (-0.001024 if direction > 0.0 else 0.001023)
+    assert abs(equivalent_curvature(command, 7.0)) <= desired_curvature + PATH_C0_CONTINUATION_MARGIN + 1e-12
+
+
+def test_measured_arrival_release_does_not_delay_immediate_relatch():
+  releasing_target = model(0.98, 0.28, 0.015, -0.002)
+  arrived_controller = ProjectedLatControlPath()
+  behind_controller = ProjectedLatControlPath()
+
+  arrived = None
+  behind = None
+  for _ in range(100):
+    arrived = arrived_controller.update(
+      releasing_target, 0.020, 7.0, True, False,
+      projected_measured_curvature=0.020,
+      desired_angle_curvature=0.015,
+    )
+    behind = behind_controller.update(
+      releasing_target, 0.010, 7.0, True, False,
+      projected_measured_curvature=0.020,
+      desired_angle_curvature=0.015,
+    )
+
+  assert arrived is not None
+  assert behind is not None
+  assert arrived.path_offset < behind.path_offset
+  assert arrived.path_angle < behind.path_angle
+  assert arrived.curvature == behind.curvature
+  assert arrived.curvature_rate == behind.curvature_rate
+
+  outward_target = model(1.47, 0.42, 0.030, 0.002)
+  arrived_relatch = arrived_controller.update(
+    outward_target, 0.010, 7.0, True, False,
+    projected_measured_curvature=0.010,
+    desired_angle_curvature=0.030,
+  )
+  behind_relatch = behind_controller.update(
+    outward_target, 0.010, 7.0, True, False,
+    projected_measured_curvature=0.010,
+    desired_angle_curvature=0.030,
+  )
+
+  assert arrived_relatch == behind_relatch
+
+
+def test_stale_preview_release_is_continuous_through_desired_zero():
+  coefficients = (1.0, 0.2, 0.004, -0.001)
+  outputs = [
+    _taper_stale_outward_preview(coefficients, -0.003, desired_curvature, 0.020, 7.0)
+    for desired_curvature in (1e-9, 0.0, -1e-9)
+  ]
+
+  for output in outputs:
+    assert output[2:] == coefficients[2:]
+    assert 0.0 <= equivalent_curvature(model(*output), 7.0) <= PATH_C0_CONTINUATION_MARGIN + 2e-9
+  assert max(output[0] for output in outputs) - min(output[0] for output in outputs) < 1e-7
+  assert max(output[1] for output in outputs) - min(output[1] for output in outputs) < 1e-7
+
+
+def test_stale_preview_release_ignores_subthreshold_spatial_noise():
+  coefficients = (1.0, 0.2, 0.004, -0.001)
+
+  output = _taper_stale_outward_preview(
+    coefficients, -0.001, 0.010, 0.020, 7.0,
+  )
+
+  assert output == coefficients
