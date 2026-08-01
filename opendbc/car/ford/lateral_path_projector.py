@@ -16,11 +16,13 @@ PATH_MIN_LOOKAHEAD = 7.0
 PATH_C2_SLEW = 0.0002
 PATH_C3_SLEW = 0.0002
 PATH_C2_BASEBAND_BP = (0.003, 0.006)
+PATH_ACTION_SUPPORT_BP = (0.1, 0.2)
 PATH_PREVIEW_BP = (0.003, 0.012)
 PATH_TRACKING_ERROR_DEADZONE = 0.0005
 PATH_C0_TRACKING_ERROR_LIMIT = 0.02
 PATH_C0_CONTINUATION_ERROR_LIMIT = 0.04
 PATH_C0_CONTINUATION_MARGIN = 0.006
+PATH_ORDINARY_ARRIVAL_MARGIN = 0.00025
 PATH_C1_TRACKING_ERROR_LIMIT = 0.012
 PATH_UNWIND_ERROR_DEADZONE = 0.0005
 PATH_UNWIND_LIMIT = 0.006
@@ -296,7 +298,7 @@ def _taper_stale_outward_preview(coefficients: tuple[float, float, float, float]
                                   desired_curvature: float,
                                   measured_curvature: float,
                                   v_ego: float) -> tuple[float, float, float, float]:
-  """Release only outward C0/C1 after actual arrival and a spatial unwind."""
+  """Release arrived C0/C1 when spatial slope or current action no longer supports them."""
   if measured_curvature == 0.0:
     return coefficients
 
@@ -314,17 +316,31 @@ def _taper_stale_outward_preview(coefficients: tuple[float, float, float, float]
     -raw_curvature_rate * direction * max(v_ego, PATH_MIN_LOOKAHEAD) / 3.0,
     0.0,
   )
-  release_share = arrival_share * _interp(
+  spatial_release_share = _interp(
     release_demand,
     *PATH_C2_BASEBAND_BP,
     0.0,
     1.0,
   )
+  action_support_ratio = desired_outward_curvature / abs(measured_curvature)
+  action_support_share = _interp(
+    action_support_ratio,
+    *PATH_ACTION_SUPPORT_BP,
+    0.0,
+    1.0,
+  )
+  ordinary_release_share = 1.0 - action_support_share
+  release_share = arrival_share * max(spatial_release_share, ordinary_release_share)
   if release_share == 0.0:
     return coefficients
 
   command_curvature = _equivalent_curvature(coefficients)
-  corridor_curvature = desired_outward_curvature + PATH_C0_CONTINUATION_MARGIN
+  corridor_margin = _blend(
+    PATH_ORDINARY_ARRIVAL_MARGIN,
+    PATH_C0_CONTINUATION_MARGIN,
+    action_support_share,
+  )
+  corridor_curvature = desired_outward_curvature + corridor_margin
   excess_curvature = command_curvature * direction - corridor_curvature
   if excess_curvature <= 0.0:
     return coefficients

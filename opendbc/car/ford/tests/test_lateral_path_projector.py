@@ -1134,3 +1134,74 @@ def test_stale_preview_release_ignores_subthreshold_spatial_noise():
   )
 
   assert output == coefficients
+
+
+def test_ordinary_arrival_releases_stale_preview_with_outward_c3():
+  raw_coefficients = (4.253234, 0.512123, 0.000270, 0.003431)
+  desired_curvature = 0.000390
+  measured_curvature = 0.034774
+  ordinary_arrival_margin = 0.00025
+
+  for direction in (1.0, -1.0):
+    controller = ProjectedLatControlPath()
+    target = model(*(direction * value for value in raw_coefficients))
+
+    command = controller.update(
+      target, direction * measured_curvature, 0.50, True, False,
+      projected_measured_curvature=direction * 0.039742,
+      desired_angle_curvature=direction * desired_curvature,
+    )
+
+    assert abs(command.path_offset) < abs(raw_coefficients[0])
+    assert abs(command.path_angle) < abs(raw_coefficients[1])
+    assert command.curvature == 0.0
+    assert command.curvature_rate == direction * 0.0002
+    assert abs(equivalent_curvature(command, 7.0)) <= desired_curvature + ordinary_arrival_margin + 1e-12
+
+
+def test_ordinary_arrival_releases_preview_when_c3_is_zero_without_touching_c2():
+  coefficients = (1.0, 0.2, 0.004, 0.0)
+
+  output = _taper_stale_outward_preview(
+    coefficients, 0.0, 0.001, 0.020, 7.0,
+  )
+
+  assert output[:2] != coefficients[:2]
+  assert output[2:] == coefficients[2:]
+  assert equivalent_curvature(model(*output), 7.0) <= coefficients[2] + 1e-12
+
+
+def test_ordinary_arrival_release_relatches_immediately_when_desired_moves_outward():
+  releasing_target = model(4.253234, 0.512123, 0.000270, 0.003431)
+  arrived_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+
+  arrived = arrived_controller.update(
+    releasing_target, 0.034774, 0.50, True, False,
+    projected_measured_curvature=0.039742,
+    desired_angle_curvature=0.000390,
+  )
+  reference = reference_controller.update(
+    releasing_target, 0.0002, 0.50, True, False,
+    projected_measured_curvature=0.0002,
+    desired_angle_curvature=0.000390,
+  )
+
+  assert arrived.path_offset < reference.path_offset
+  assert arrived.path_angle < reference.path_angle
+  assert arrived.curvature == reference.curvature
+  assert arrived.curvature_rate == reference.curvature_rate
+
+  outward_target = model(1.47, 0.42, 0.030, 0.002)
+  arrived_relatch = arrived_controller.update(
+    outward_target, 0.010, 7.0, True, False,
+    projected_measured_curvature=0.010,
+    desired_angle_curvature=0.030,
+  )
+  reference_relatch = reference_controller.update(
+    outward_target, 0.010, 7.0, True, False,
+    projected_measured_curvature=0.010,
+    desired_angle_curvature=0.030,
+  )
+
+  assert arrived_relatch == reference_relatch
