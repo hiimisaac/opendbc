@@ -19,6 +19,7 @@ class CarState(CarStateBase):
 
     self.distance_button = 0
     self.lc_button = 0
+    self.lat_ctl_limit = 0
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -53,7 +54,11 @@ class CarState(CarStateBase):
 
     if self.CP.flags & FordFlags.CANFD:
       # this signal is always 0 on non-CAN FD cars
-      ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
+      lat_ctl_status = cp.vl["Lane_Assist_Data3_FD1"]
+      ret.steerFaultTemporary |= lat_ctl_status["LatCtlSte_D_Stat"] not in (1, 2, 3)
+      # Expose the PSCM's own envelope status for bounded coefficient
+      # reallocation in the CAN FD lateral controller.
+      self.lat_ctl_limit = int(lat_ctl_status["LatCtlLim_D_Stat"])
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False
