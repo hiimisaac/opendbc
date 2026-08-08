@@ -139,6 +139,50 @@ def _projected_tracking_error(target: float, measured_curvature: float,
   )
 
 
+def _tracking_shortfall_residual_share(raw_target: tuple[float, float, float, float],
+                                       desired_angle_curvature: float,
+                                       measured_curvature: float,
+                                       v_ego: float,
+                                       valid: bool) -> float:
+  """Keep coherent maneuver geometry while the measured wheel trails desired."""
+  if not valid:
+    return 0.0
+
+  model_curvature = _equivalent_curvature(raw_target)
+  spatial_slope = raw_target[3]
+  if model_curvature * desired_angle_curvature <= 0.0 or \
+     spatial_slope * desired_angle_curvature <= 0.0:
+    return 0.0
+
+  tracking_error = desired_angle_curvature - measured_curvature
+  if tracking_error * desired_angle_curvature <= 0.0:
+    return 0.0
+  # Reuse the established C2 crossover so this support is identically zero
+  # for ordinary steering action and tracking error. C3 is converted to its
+  # curvature change over one lookahead; full support uses the same 0.012
+  # threshold as complete spatial preview.
+  tracking_share = _interp(
+    abs(tracking_error),
+    *PATH_C2_BASEBAND_BP,
+    0.0,
+    1.0,
+  )
+  action_share = _interp(
+    abs(desired_angle_curvature),
+    *PATH_C2_BASEBAND_BP,
+    0.0,
+    1.0,
+  )
+  spatial_support_share = _interp(
+    abs(spatial_slope) * max(v_ego, PATH_MIN_LOOKAHEAD) / 3.0,
+    0.0,
+    PATH_PREVIEW_BP[1],
+    0.0,
+    1.0,
+  )
+  return tracking_share * action_share * spatial_support_share
+
+
 def _gated_tracking_correction(model_target: float, desired_angle_target: float,
                                measured_curvature: float, projected_curvature: float,
                                limit: float) -> float:
@@ -459,6 +503,16 @@ class ProjectedLatControlPath:
     bounds = list(PATH_LIMITS)
     maneuver_demand = _maneuver_demand(raw_target, v_ego, valid)
     residual_share = _interp(maneuver_demand, *PATH_C2_BASEBAND_BP, 0.0, 1.0)
+    residual_share = max(
+      residual_share,
+      _tracking_shortfall_residual_share(
+        raw_target,
+        desired_angle_curvature,
+        measured_curvature,
+        v_ego,
+        valid,
+      ),
+    )
     # C2 owns normal driving. The complete polynomial is a single continuous
     # authority extension, reaching the previous full-strength command at 0.006.
     c2_share = 1.0 - residual_share
