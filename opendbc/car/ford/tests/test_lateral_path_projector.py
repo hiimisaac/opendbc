@@ -771,6 +771,65 @@ def test_spatial_slope_crossfades_once_from_c2_to_full_polynomial():
   assert full.path_angle > transition.path_angle
 
 
+def test_coherent_reversal_shortfall_keeps_polynomial_authority_below_spatial_threshold():
+  # Captured from a fast left-to-right reversal. The model path, desired
+  # steering angle, and spatial slope all continue into the new turn while the
+  # wheel is still well behind. C3's spatial demand falls just below the normal
+  # 0.003 polynomial crossover between these samples.
+  for direction in (1.0, -1.0):
+    controller = ProjectedLatControlPath()
+    building = model(*(direction * value for value in (0.027868, 0.025723, 0.005296, 0.000834)))
+    continuing = model(*(direction * value for value in (0.051800, 0.034843, 0.006418, 0.000722)))
+
+    building_command = controller.update(
+      building, direction * -0.001164, 11.02, True, False,
+      projected_measured_curvature=direction * -0.001164,
+      desired_angle_curvature=direction * 0.006059,
+    )
+    continuing_command = controller.update(
+      continuing, direction * 0.002249, 11.18, True, False,
+      projected_measured_curvature=direction * 0.002249,
+      desired_angle_curvature=direction * 0.007435,
+    )
+
+    assert direction * continuing_command.path_offset > 0.0
+    assert direction * continuing_command.path_angle > 0.0
+    assert abs(equivalent_curvature(continuing_command, 7.0)) >= \
+           0.5 * abs(equivalent_curvature(building_command, 7.0))
+
+
+def test_projected_overshoot_cannot_drop_coherent_reversal_before_measured_arrival():
+  controller = ProjectedLatControlPath()
+  continuing = model(0.051800, 0.034843, 0.006418, 0.000722)
+
+  command = controller.update(
+    continuing, 0.002249, 11.18, True, False,
+    # A fast wheel transient can extrapolate beyond desired even while the
+    # measured wheel remains substantially behind it.
+    projected_measured_curvature=0.010000,
+    desired_angle_curvature=0.007435,
+  )
+
+  assert command.path_offset > 0.0
+  assert command.path_angle > 0.0
+
+
+def test_measured_arrival_drops_reversal_shortfall_floor_immediately():
+  controller = ProjectedLatControlPath()
+  continuing = model(0.051800, 0.034843, 0.006418, 0.000722)
+
+  command = controller.update(
+    continuing, 0.007600, 11.18, True, False,
+    projected_measured_curvature=0.002249,
+    desired_angle_curvature=0.007435,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert command.curvature > 0.0
+  assert command.curvature_rate == 0.0
+
+
 def test_single_preview_observation_cannot_pull_ordinary_c2_into_polynomial_transition():
   controller = ProjectedLatControlPath()
   curvature = 0.0017
