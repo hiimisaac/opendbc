@@ -830,6 +830,116 @@ def test_measured_arrival_drops_reversal_shortfall_floor_immediately():
   assert command.curvature_rate == 0.0
 
 
+def test_coherent_c0_c1_shortfall_uses_polynomial_without_c3_support():
+  # Captured while entering a left turn: C0/C1 and the desired steering angle
+  # agree, both measured and projected steering remain behind, and the PSCM is
+  # not close to its limit. C3 has already changed toward unwind, but must not
+  # collapse the still-needed near-field geometry back to C2-only.
+  controller = ProjectedLatControlPath()
+  baseline_controller = ProjectedLatControlPath()
+  target = model(-0.413027, -0.083532, -0.011260, 0.000259)
+
+  command = controller.update(
+    target, -0.010105, 9.23, True, False,
+    projected_measured_curvature=-0.012174,
+    desired_angle_curvature=-0.012917,
+    lat_ctl_limit=0,
+  )
+  baseline = baseline_controller.update(
+    target, -0.010105, 9.23, True, False,
+    projected_measured_curvature=-0.012174,
+    desired_angle_curvature=-0.012917,
+    lat_ctl_limit=1,
+  )
+
+  assert command.path_offset < 0.0
+  assert command.path_angle < 0.0
+  assert 0.0 < abs(equivalent_curvature(command, 7.0) - equivalent_curvature(baseline, 7.0)) <= \
+                abs(-0.012917 - -0.012174)
+
+
+def test_c0_c1_shortfall_extension_drops_at_projected_arrival():
+  controller = ProjectedLatControlPath()
+  target = model(-0.413027, -0.083532, -0.011260, 0.000259)
+
+  command = controller.update(
+    target, -0.010105, 9.23, True, False,
+    projected_measured_curvature=-0.012917,
+    desired_angle_curvature=-0.012917,
+    lat_ctl_limit=0,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_c0_c1_shortfall_extension_defers_to_pscm_limit_status():
+  controller = ProjectedLatControlPath()
+  target = model(-0.413027, -0.083532, -0.011260, 0.0)
+
+  command = controller.update(
+    target, -0.010105, 9.23, True, False,
+    projected_measured_curvature=-0.012174,
+    desired_angle_curvature=-0.012917,
+    lat_ctl_limit=1,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_c0_c1_shortfall_extension_stays_out_of_ordinary_edge_curve():
+  # Captured from ordinary Edge steering below 10 degrees. C0/C1 are coherent,
+  # but their geometry is not large enough to justify maneuver authority.
+  controller = ProjectedLatControlPath()
+  target = model(0.134285, 0.048518, 0.003200, 0.0)
+
+  command = controller.update(
+    target, 0.001500, 9.6, True, False,
+    projected_measured_curvature=0.002335,
+    desired_angle_curvature=0.003200,
+    lat_ctl_limit=0,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_c0_c1_shortfall_extension_stays_out_of_ordinary_highway_curve():
+  controller = ProjectedLatControlPath()
+  target = model(0.1715, 0.14, 0.004, 0.0)
+
+  command = controller.update(
+    target, 0.0025, 20.0, True, False,
+    projected_measured_curvature=0.003,
+    desired_angle_curvature=0.004,
+    lat_ctl_limit=0,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_c0_c1_shortfall_extension_respects_aggregate_model_allocation():
+  target = model(0.40618104697643687, 0.24009829608833588,
+                 0.005067795021689749, 0.0006409813585709391)
+  normal_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  args = (
+    target, 0.009449273650111256, 28.965969542162057, True, False,
+  )
+  kwargs = {
+    "projected_measured_curvature": -0.0062674601564500845,
+    "desired_angle_curvature": 0.010909133211626072,
+  }
+
+  command = normal_controller.update(*args, lat_ctl_limit=0, **kwargs)
+  extension_disabled = reference_controller.update(*args, lat_ctl_limit=3, **kwargs)
+
+  assert command.path_offset == extension_disabled.path_offset
+  assert command.path_angle == extension_disabled.path_angle
+
+
 def test_single_preview_observation_cannot_pull_ordinary_c2_into_polynomial_transition():
   controller = ProjectedLatControlPath()
   curvature = 0.0017
