@@ -452,6 +452,80 @@ def _reallocate_c3_to_c0(coefficients: tuple[float, float, float, float],
   return c0_with_spill, c1, c2, c3 - actual_spill
 
 
+def _extend_c0_c1_for_geometry_shortfall(coefficients: tuple[float, float, float, float],
+                                         raw_target: tuple[float, float, float, float],
+                                         desired_curvature: float,
+                                         measured_curvature: float,
+                                         projected_curvature: float,
+                                         v_ego: float,
+                                         valid: bool,
+                                         lat_ctl_limit: int,
+                                         residual_share: float) -> tuple[float, float, float, float]:
+  """Use only unused model C0/C1 to cover a verified steering shortfall."""
+  if not valid or lat_ctl_limit != 0 or residual_share >= 1.0:
+    return coefficients
+
+  lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
+  offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
+  angle_curvature = raw_target[1] / lookahead
+  model_curvature = _equivalent_curvature(raw_target)
+  if offset_curvature * angle_curvature <= 0.0 or \
+     offset_curvature * desired_curvature <= 0.0 or \
+     raw_target[2] * desired_curvature < 0.0 or \
+     model_curvature * desired_curvature <= 0.0:
+    return coefficients
+
+  tracking_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  extension_curvature = min(
+    abs(_deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE)),
+    PATH_C1_TRACKING_ERROR_LIMIT,
+  )
+  extension_curvature *= _interp(
+    min(abs(offset_curvature), abs(angle_curvature)),
+    PATH_C2_BASEBAND_BP[1],
+    PATH_PREVIEW_BP[1],
+    0.0,
+    1.0,
+  )
+  extension_curvature *= _interp(
+    abs(desired_curvature),
+    PATH_C2_BASEBAND_BP[1],
+    PATH_PREVIEW_BP[1],
+    0.0,
+    1.0,
+  )
+  if extension_curvature == 0.0:
+    return coefficients
+
+  direction = math.copysign(1.0, desired_curvature)
+  basis = _basis(PATH_MIN_LOOKAHEAD)
+  raw_preview_curvature = sum(basis[i] * raw_target[i] for i in (0, 1))
+  command_preview_curvature = sum(basis[i] * coefficients[i] for i in (0, 1))
+  aggregate_available_curvature = (raw_preview_curvature - command_preview_curvature) * direction
+  if aggregate_available_curvature <= 0.0:
+    return coefficients
+
+  available = [
+    max((raw_target[i] - coefficients[i]) * direction, 0.0) * basis[i]
+    for i in (0, 1)
+  ]
+  available_curvature = sum(available)
+  if available_curvature == 0.0:
+    return coefficients
+
+  used_curvature = min(extension_curvature, available_curvature, aggregate_available_curvature)
+  values = list(coefficients)
+  for i in (0, 1):
+    if available[i] > 0.0:
+      coefficient_delta = direction * used_curvature * available[i] / available_curvature / basis[i]
+      values[i] = _clip(values[i] + coefficient_delta, PATH_LIMITS[i])
+  return tuple(values)
+
+
 class ProjectedLatControlPath:
   """Return one coherent, bounded Ford polynomial through a stable interface."""
 
@@ -547,6 +621,17 @@ class ProjectedLatControlPath:
       measured_curvature,
       projected_measured_curvature,
       lat_ctl_limit,
+    )
+    coefficients = _extend_c0_c1_for_geometry_shortfall(
+      coefficients,
+      raw_target,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
+      v_ego,
+      valid,
+      lat_ctl_limit,
+      residual_share,
     )
     c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
