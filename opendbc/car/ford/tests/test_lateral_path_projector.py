@@ -920,6 +920,161 @@ def test_c0_c1_shortfall_extension_stays_out_of_ordinary_highway_curve():
   assert command.path_angle == 0.0
 
 
+def test_opposite_side_reversal_uses_c0_until_the_wheel_changes_direction():
+  # Captured from a low-speed S-turn. The action and spatial slope have entered
+  # the new turn while C0/C1 still describe the preceding arc and the wheel is
+  # physically delivering that old direction.
+  target = model(-0.0549, -0.0063, 0.0033, 0.000515)
+  reversal_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+
+  reversal = reversal_controller.update(
+    target, -0.00241, 6.6, True, False,
+    projected_measured_curvature=-0.00170,
+    desired_angle_curvature=0.00326,
+    lat_ctl_limit=0,
+  )
+  reference = reference_controller.update(
+    target, -0.00241, 6.6, True, False,
+    projected_measured_curvature=-0.00170,
+    desired_angle_curvature=0.00326,
+    lat_ctl_limit=1,
+  )
+
+  assert reversal.path_offset > reference.path_offset
+  assert reversal.path_angle == reference.path_angle
+  assert equivalent_curvature(reversal, 7.0) > equivalent_curvature(reference, 7.0)
+
+
+def test_opposite_side_reversal_c0_drops_when_projection_changes_direction():
+  target = model(-0.0549, -0.0063, 0.0033, 0.000515)
+  controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+
+  crossed = controller.update(
+    target, -0.00241, 6.6, True, False,
+    projected_measured_curvature=0.0001,
+    desired_angle_curvature=0.00326,
+    lat_ctl_limit=0,
+  )
+  reference = reference_controller.update(
+    target, -0.00241, 6.6, True, False,
+    projected_measured_curvature=-0.00170,
+    desired_angle_curvature=0.00326,
+    lat_ctl_limit=1,
+  )
+
+  assert crossed.path_offset == reference.path_offset
+  assert crossed.path_angle == reference.path_angle
+
+
+def test_opposite_side_reversal_c0_ignores_small_action_sign_noise():
+  target = model(-0.01, -0.002, 0.0015, 0.000515)
+  controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    target, -0.0015, 6.6, True, False,
+    projected_measured_curvature=-0.001,
+    desired_angle_curvature=0.0015,
+    lat_ctl_limit=0,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_opposite_side_reversal_c0_is_symmetric():
+  commands = []
+  for direction in (1.0, -1.0):
+    controller = ProjectedLatControlPath()
+    target = model(*(direction * value for value in (-0.0549, -0.0063, 0.0033, 0.000515)))
+    commands.append(controller.update(
+      target, direction * -0.00241, 6.6, True, False,
+      projected_measured_curvature=direction * -0.00170,
+      desired_angle_curvature=direction * 0.00326,
+      lat_ctl_limit=0,
+    ))
+
+  positive, negative = commands
+  assert abs(positive.path_offset + negative.path_offset) < 1e-12
+  assert abs(positive.path_angle + negative.path_angle) < 1e-12
+  assert abs(equivalent_curvature(positive, 7.0) + equivalent_curvature(negative, 7.0)) < 1e-12
+
+
+def test_opposite_side_reversal_c0_cannot_exceed_tracking_correction_budget():
+  preceding_arc = model(-0.2, -0.04, 0.009, 0.0008)
+  target = model(0.0525008, 0.0003996, -0.0087378, -0.0007653)
+  controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  for candidate, limit in ((controller, 0), (reference_controller, 3)):
+    candidate.update(
+      preceding_arc, -0.003, 7.0, True, False,
+      projected_measured_curvature=-0.003,
+      desired_angle_curvature=0.009,
+      lat_ctl_limit=limit,
+    )
+
+  command = controller.update(
+    target, 0.00301, 4.68, True, False,
+    projected_measured_curvature=0.00304,
+    desired_angle_curvature=-0.009125,
+    lat_ctl_limit=0,
+  )
+  reference = reference_controller.update(
+    target, 0.00301, 4.68, True, False,
+    projected_measured_curvature=0.00304,
+    desired_angle_curvature=-0.009125,
+    lat_ctl_limit=3,
+  )
+
+  added_curvature = equivalent_curvature(reference, 7.0) - equivalent_curvature(command, 7.0)
+  assert 0.0 < added_curvature <= 0.006
+
+
+def test_opposite_side_reversal_c0_support_is_not_speed_scheduled():
+  target = model(0.0, 0.0, 0.0031, 0.00006)
+  additions = []
+  for speed in (7.0, 30.0):
+    controller = ProjectedLatControlPath()
+    reference_controller = ProjectedLatControlPath()
+    command = controller.update(
+      target, -0.001, speed, True, False,
+      projected_measured_curvature=-0.0021,
+      desired_angle_curvature=0.0031,
+      lat_ctl_limit=0,
+    )
+    reference = reference_controller.update(
+      target, -0.001, speed, True, False,
+      projected_measured_curvature=-0.0021,
+      desired_angle_curvature=0.0031,
+      lat_ctl_limit=3,
+    )
+    additions.append(equivalent_curvature(command, 7.0) - equivalent_curvature(reference, 7.0))
+
+  assert abs(additions[0] - additions[1]) < 1e-12
+
+
+def test_opposite_side_reversal_c0_ignores_noisy_zero_measured_wheel():
+  target = model(0.0, 0.0, 0.0031, 0.0003)
+  controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    target, -1e-12, 7.0, True, False,
+    projected_measured_curvature=-0.0021,
+    desired_angle_curvature=0.0031,
+    lat_ctl_limit=0,
+  )
+  reference = reference_controller.update(
+    target, -1e-12, 7.0, True, False,
+    projected_measured_curvature=-0.0021,
+    desired_angle_curvature=0.0031,
+    lat_ctl_limit=3,
+  )
+
+  assert equivalent_curvature(command, 7.0) == equivalent_curvature(reference, 7.0)
+
+
 def test_c0_c1_shortfall_extension_respects_aggregate_model_allocation():
   target = model(0.40618104697643687, 0.24009829608833588,
                  0.005067795021689749, 0.0006409813585709391)

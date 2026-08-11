@@ -526,6 +526,72 @@ def _extend_c0_c1_for_geometry_shortfall(coefficients: tuple[float, float, float
   return tuple(values)
 
 
+def _extend_c0_for_opposite_side_reversal(coefficients: tuple[float, float, float, float],
+                                           raw_target: tuple[float, float, float, float],
+                                           desired_curvature: float,
+                                           measured_curvature: float,
+                                           projected_curvature: float,
+                                           valid: bool,
+                                           lat_ctl_limit: int,
+                                           residual_share: float) -> tuple[float, float, float, float]:
+  """Bridge verified direction changes with immediately removable C0."""
+  if not valid or lat_ctl_limit != 0 or residual_share >= 1.0 or \
+     abs(desired_curvature) <= PATH_C2_BASEBAND_BP[0]:
+    return coefficients
+
+  # C2 is the steady-state anchor, but the PSCM can retain its preceding arc
+  # during a quick reversal. Only bridge while both the measured and projected
+  # wheel remain on that old side and the model action and spatial slope agree
+  # on the new direction.
+  if measured_curvature * desired_curvature >= 0.0 or \
+     projected_curvature * desired_curvature >= 0.0 or \
+     raw_target[2] * desired_curvature <= 0.0 or \
+     raw_target[3] * desired_curvature <= 0.0:
+    return coefficients
+
+  spatial_demand = abs(raw_target[3]) * PATH_MIN_LOOKAHEAD / 3.0
+  if spatial_demand <= PATH_TRACKING_ERROR_DEADZONE:
+    return coefficients
+
+  tracking_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  correction_curvature = min(
+    abs(_deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE)),
+    PATH_UNWIND_LIMIT,
+  )
+  if correction_curvature == 0.0:
+    return coefficients
+
+  action_share = _interp(
+    abs(desired_curvature),
+    *PATH_C2_BASEBAND_BP,
+    0.0,
+    1.0,
+  )
+  old_side_share = min(
+    _interp(abs(measured_curvature), *PATH_MEASURED_ARRIVAL_ERROR_BP, 0.0, 1.0),
+    _interp(abs(projected_curvature), *PATH_PROJECTED_ARRIVAL_ERROR_BP, 0.0, 1.0),
+  )
+  direction = math.copysign(1.0, desired_curvature)
+  command_curvature = _equivalent_curvature(coefficients)
+  corridor_curvature = abs(desired_curvature) + correction_curvature
+  missing_curvature = max(corridor_curvature - command_curvature * direction, 0.0)
+  extension_curvature = min(missing_curvature, correction_curvature) * action_share * old_side_share
+  if extension_curvature == 0.0:
+    return coefficients
+
+  values = list(coefficients)
+  c0_basis = _basis(PATH_MIN_LOOKAHEAD)[0]
+  values[0] = _clip(
+    values[0] + direction * extension_curvature / c0_basis,
+    PATH_LIMITS[0],
+  )
+  return tuple(values)
+
+
 class ProjectedLatControlPath:
   """Return one coherent, bounded Ford polynomial through a stable interface."""
 
@@ -629,6 +695,16 @@ class ProjectedLatControlPath:
       measured_curvature,
       projected_measured_curvature,
       v_ego,
+      valid,
+      lat_ctl_limit,
+      residual_share,
+    )
+    coefficients = _extend_c0_for_opposite_side_reversal(
+      coefficients,
+      raw_target,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
       valid,
       lat_ctl_limit,
       residual_share,
