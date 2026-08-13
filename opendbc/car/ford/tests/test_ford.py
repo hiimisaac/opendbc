@@ -119,6 +119,47 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
     assert len(can_sends) == 1
 
+  def test_canfd_controller_transfers_changing_spatial_path_out_of_c2(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+
+    CC = CarControl(latActive=True)
+    CC.actuators.lateralPath.valid = True
+    CC.actuators.lateralPath.pathOffset = 0.5 * 0.004 * 7.0 ** 2 + 0.0005 * 7.0 ** 3 / 6.0
+    CC.actuators.lateralPath.pathAngle = 0.004 * 7.0 + 0.5 * 0.0005 * 7.0 ** 2
+    CC.actuators.lateralPath.curvature = 0.004
+    CC.actuators.lateralPath.curvatureRate = 0.0005
+    CC.actuators.steeringAngleDeg = math.degrees(controller.VM.get_steer_from_curvature(-0.004, 7.0, 0.0))
+    CC.hudControl.leadDistanceBars = 0
+
+    CS = SimpleNamespace(
+      out=SimpleNamespace(
+        cruiseState=SimpleNamespace(available=False, standstill=False),
+        steeringAngleDeg=0.0,
+        steeringPressed=False,
+        steeringTorque=0.0,
+        vEgoRaw=7.0,
+        vEgo=7.0,
+        yawRate=0.0,
+      ),
+      buttons_stock_values={},
+      acc_tja_status_stock_values={"Tja_D_Stat": 0},
+      lkas_status_stock_values={},
+      lat_ctl_limit=0,
+    )
+    controller.lkas_enabled_last = True
+    controller.lead_distance_bars_last = 0
+
+    output = None
+    for _ in range(30):
+      controller.frame = CarControllerParams.STEER_STEP
+      output, _ = controller.update(CC.as_reader(), CS, 0)
+
+    assert output is not None
+    assert output.lateralPath.curvature < CC.actuators.lateralPath.curvature
+    assert output.lateralPath.pathOffset > 0.0
+    assert output.lateralPath.pathAngle > 0.0
+
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
       assert ecu in ECU_ADDRESSES, "Unknown ECU"
