@@ -84,7 +84,8 @@ def test_model_geometry_retains_path_authority_missing_from_action():
 
   assert command.path_offset > 0.1
   assert command.path_angle > 0.05
-  assert math.isclose(first.curvature, 0.0002)
+  assert first.curvature == 0.0
+  assert equivalent_curvature(first) > 0.015
 
 
 def test_falling_action_does_not_unwind_while_model_still_requires_turn():
@@ -580,8 +581,9 @@ def test_conditioning_cannot_reverse_coherent_geometry_toward_the_action():
     driver_override=False,
   )
 
-  assert command.path_offset < -0.01
-  assert command.path_angle < -0.04
+  assert command.path_offset < 0.0
+  assert command.path_angle < 0.0
+  assert equivalent_curvature(command) < -0.01
 
 
 def test_large_turn_keeps_c2_flushed_until_the_wheel_settles():
@@ -593,6 +595,100 @@ def test_large_turn_keeps_c2_flushed_until_the_wheel_settles():
 
   assert early_exit.curvature == 0.0
   assert math.isclose(settled.curvature, 0.0002)
+
+
+def test_steady_spatial_geometry_retains_c2_authority():
+  controller = LatControlPath()
+
+  command = None
+  for _ in range(30):
+    command = controller.update(
+      with_action(polynomial_model(0.004), 0.004), 0.004, 15.0, True, False,
+    )
+
+  assert command is not None
+  assert command.curvature > 0.002
+
+
+def test_small_spatial_noise_does_not_move_steady_authority_out_of_c2():
+  steady_controller = LatControlPath()
+  noisy_controller = LatControlPath()
+
+  for _ in range(30):
+    steady = steady_controller.update(
+      with_action(polynomial_model(0.004, 0.0, lookahead=15.0), 0.004), 0.004, 15.0, True, False,
+    )
+    noisy = noisy_controller.update(
+      with_action(polynomial_model(0.004, 0.00005, lookahead=15.0), 0.004), 0.004, 15.0, True, False,
+    )
+
+  assert math.isclose(noisy.curvature, steady.curvature)
+
+
+def test_changing_spatial_geometry_transfers_c2_authority_to_c0_c1():
+  steady_controller = LatControlPath()
+  changing_controller = LatControlPath()
+
+  for _ in range(30):
+    steady = steady_controller.update(
+      with_action(polynomial_model(0.004), 0.004), 0.004, 7.0, True, False,
+    )
+    changing = changing_controller.update(
+      with_action(polynomial_model(0.004, 0.0005), 0.004), 0.004, 7.0, True, False,
+    )
+
+  assert changing.curvature < steady.curvature
+  assert abs(changing.path_offset) > abs(steady.path_offset)
+  assert abs(changing.path_angle) > abs(steady.path_angle)
+
+
+def test_coherent_upcoming_reversal_drains_conflicting_c2_early():
+  controller = LatControlPath()
+
+  for _ in range(30):
+    controller.update(with_action(polynomial_model(0.003), 0.003), 0.003, 7.0, True, False)
+  reversal = controller.update(
+    with_action(polynomial_model(-0.004, -0.0003), 0.003), 0.003, 7.0, True, False,
+  )
+
+  assert reversal.curvature == 0.0
+  assert reversal.path_offset < 0.0
+  assert reversal.path_angle < 0.0
+
+
+def test_spatial_transfer_is_continuous_through_c0_c1_sign_crossing():
+  negative_angle_controller = LatControlPath()
+  positive_angle_controller = LatControlPath()
+
+  for controller in (negative_angle_controller, positive_angle_controller):
+    for _ in range(30):
+      controller.update(with_action(polynomial_model(0.004), 0.004), 0.004, 30.0, True, False)
+
+  positive_path = split_geometry_model(0.01, 1e-8)
+  positive_path.curvatureRate = 0.0007
+  negative_path = split_geometry_model(0.01, -1e-8)
+  negative_path.curvatureRate = 0.0007
+  negative_angle = negative_angle_controller.update(
+    with_action(negative_path, 0.004), 0.004, 30.0, True, False,
+  )
+  positive_angle = positive_angle_controller.update(
+    with_action(positive_path, 0.004), 0.004, 30.0, True, False,
+  )
+
+  assert math.isclose(negative_angle.curvature, positive_angle.curvature)
+  assert math.isclose(equivalent_curvature(negative_angle), equivalent_curvature(positive_angle), abs_tol=1e-5)
+
+
+def test_spatial_slope_transfers_c2_during_asynchronous_relatch():
+  controller = LatControlPath()
+
+  for _ in range(30):
+    controller.update(with_action(polynomial_model(0.004), 0.004), 0.004, 7.0, True, False)
+  relatch_path = split_geometry_model(-0.008, 0.001)
+  relatch_path.curvatureRate = -0.0005
+  relatch = controller.update(with_action(relatch_path, 0.004), 0.004, 7.0, True, False)
+
+  assert 0.0 < relatch.curvature < 0.002
 
 
 def test_inactive_resets_the_previous_command():

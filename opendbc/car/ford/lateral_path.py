@@ -14,6 +14,7 @@ PATH_MIN_LOOKAHEAD = 7.0
 
 PATH_C2_FADE_BP = (0.006, 0.012)
 PATH_C2_SETTLED_BP = (0.003, 0.006)
+PATH_C2_SPATIAL_DELTA_BP = (0.0015, 0.0045)
 PATH_C2_SLEW = 0.0002
 PATH_MODEL_MANEUVER_MIN = 0.003
 PATH_MODEL_GEOMETRY_FULL = 0.012
@@ -234,6 +235,37 @@ def _spatial_unwind_compatibility_share(curvature_rate: float, desired_angle_cur
   return 1.0 - conflict_share
 
 
+def _geometry_coherence_share(valid: bool, offset_curvature: float, angle_curvature: float) -> float:
+  if not valid:
+    return 0.0
+  return _interp(
+    offset_curvature * angle_curvature,
+    0.0, PATH_MODEL_MANEUVER_MIN ** 2,
+    0.0, 1.0,
+  )
+
+
+def _steady_c2_share(valid: bool, desired_curvature: float, offset_curvature: float,
+                     angle_curvature: float, curvature_rate: float, lookahead: float) -> float:
+  """Keep C2 for spatially steady paths and hand changing geometry to C0/C1."""
+  if not valid:
+    return 1.0
+
+  # C0 and C1 can cross zero at different spatial samples during a reversal.
+  # Fade geometry confidence continuously through that interval; a meaningful
+  # C3 slope can still move the changing action out of persistent C2.
+  geometry_confidence = _geometry_coherence_share(valid, offset_curvature, angle_curvature)
+  geometry_delta = geometry_confidence * max(
+    abs(offset_curvature - desired_curvature),
+    abs(angle_curvature - desired_curvature),
+  )
+  spatial_delta = max(
+    abs(curvature_rate) * lookahead,
+    geometry_delta,
+  )
+  return _interp(spatial_delta, *PATH_C2_SPATIAL_DELTA_BP, 1.0, 0.0)
+
+
 class LatControlPath:
   """Map action, path preview, and measured wheel curvature to one polynomial.
 
@@ -292,7 +324,8 @@ class LatControlPath:
     # C0 placement and C1 heading remain coherent when they agree on direction.
     # Requiring both views to clear the maneuver threshold created a turn-exit
     # cliff: one fading term could discard the complete, still-valid polynomial.
-    geometry_is_coherent = valid and offset_curvature * angle_curvature > 0.0
+    geometry_coherence_share = _geometry_coherence_share(valid, offset_curvature, angle_curvature)
+    geometry_is_coherent = geometry_coherence_share > 0.0
     model_command = LateralPathCommand(
       valid=valid,
       path_offset=path_offset,
@@ -316,9 +349,9 @@ class LatControlPath:
     action_opposes_geometry = offset_curvature * desired_curvature < 0.0
     if geometry_is_coherent:
       model_geometry_demand = max(geometry_demand, abs(geometry_equivalent_curvature)) if delivered_model_exit else geometry_demand
-      model_geometry_share = 1.0 if action_opposes_geometry else _interp(
+      model_geometry_share = geometry_coherence_share * (1.0 if action_opposes_geometry else _interp(
         model_geometry_demand, PATH_MODEL_MANEUVER_MIN, PATH_MODEL_GEOMETRY_FULL, 0.0, 1.0,
-      )
+      ))
     else:
       model_geometry_share = 0.0
     coherent_model_maneuver = model_geometry_share > 0.0
@@ -400,7 +433,11 @@ class LatControlPath:
     action_tracking_error = desired_curvature - measured_curvature
     unresolved = max(abs(desired_curvature), abs(measured_curvature), abs(action_tracking_error))
     c2_settled_share = _interp(unresolved, *PATH_C2_SETTLED_BP, 1.0, 0.0)
-    c2_share = min(c2_action_share, c2_settled_share)
+    c2_spatial_share = _steady_c2_share(
+      valid, desired_curvature, offset_curvature, angle_curvature,
+      spatial_curvature_rate, lookahead,
+    )
+    c2_share = min(c2_action_share, c2_settled_share, c2_spatial_share)
     allocated_c2 = _clip(desired_curvature * c2_share, PATH_C2_LIMITS)
     curvature = allocated_c2
     curvature = _limit_attack(curvature, self._last_command.curvature, PATH_C2_SLEW)
