@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path_projector import PATH_C0_CONTINUATION_MARGIN, ProjectedLatControlPath, _taper_stale_outward_preview
@@ -10,6 +11,25 @@ def model(path_offset: float, path_angle: float, curvature: float = 0.0, curvatu
     pathAngle=path_angle,
     curvature=curvature,
     curvatureRate=curvature_rate,
+  )
+
+
+def polynomial_model(curvature: float, curvature_rate: float = 0.0, lookahead: float = 7.0):
+  return model(
+    0.5 * curvature * 7.0 ** 2 + curvature_rate * 7.0 ** 3 / 6.0,
+    curvature * lookahead + 0.5 * curvature_rate * lookahead ** 2,
+    curvature,
+    curvature_rate,
+  )
+
+
+def split_geometry_model(offset_curvature: float, angle_curvature: float,
+                         curvature: float, curvature_rate: float = 0.0):
+  return model(
+    0.5 * offset_curvature * 7.0 ** 2,
+    angle_curvature * 7.0,
+    curvature,
+    curvature_rate,
   )
 
 
@@ -70,6 +90,155 @@ def test_large_turn_flushes_c2_and_projects_its_path_into_other_coefficients():
   assert command is not None
   assert command.curvature == 0.0
   assert command.path_offset > target.pathOffset or command.path_angle > target.pathAngle
+
+
+def test_changing_spatial_geometry_transfers_c2_authority_to_c0_c1():
+  steady_controller = ProjectedLatControlPath()
+  changing_controller = ProjectedLatControlPath()
+
+  for _ in range(30):
+    steady = steady_controller.update(
+      polynomial_model(0.004), 0.004, 7.0, True, False,
+      desired_angle_curvature=0.004,
+    )
+    changing = changing_controller.update(
+      polynomial_model(0.004, 0.0005), 0.001, 7.0, True, False,
+      projected_measured_curvature=0.001,
+      desired_angle_curvature=0.004,
+    )
+
+  assert changing.curvature < steady.curvature
+  assert abs(changing.path_offset) > abs(steady.path_offset)
+  assert abs(changing.path_angle) > abs(steady.path_angle)
+
+
+def test_spatial_transfer_preserves_near_field_authority():
+  transfer_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  target = polynomial_model(0.004, 0.0005)
+
+  for _ in range(30):
+    transfer = transfer_controller.update(
+      target, 0.001, 7.0, True, False,
+      projected_measured_curvature=0.001,
+      desired_angle_curvature=0.004,
+      lat_ctl_limit=0,
+    )
+    reference = reference_controller.update(
+      target, 0.001, 7.0, True, False,
+      projected_measured_curvature=0.001,
+      desired_angle_curvature=0.004,
+      lat_ctl_limit=3,
+    )
+
+  assert transfer.coefficients() != reference.coefficients()
+  assert math.isclose(
+    equivalent_curvature(transfer, 7.0),
+    equivalent_curvature(reference, 7.0),
+    abs_tol=1e-12,
+  )
+
+
+def test_steady_spatial_geometry_retains_c2_authority():
+  controller = ProjectedLatControlPath()
+
+  for _ in range(30):
+    command = controller.update(
+      polynomial_model(0.004, lookahead=15.0), 0.004, 15.0, True, False,
+      desired_angle_curvature=0.004,
+    )
+
+  assert command.curvature > 0.002
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_coherent_upcoming_reversal_drains_conflicting_c2_early():
+  controller = ProjectedLatControlPath()
+
+  for _ in range(30):
+    controller.update(
+      polynomial_model(0.003), 0.003, 7.0, True, False,
+      desired_angle_curvature=0.003,
+    )
+
+  reversal_path = polynomial_model(-0.004, -0.0003)
+  reversal_path.curvature = 0.003
+  reversal = controller.update(
+    reversal_path, 0.003, 7.0, True, False,
+    projected_measured_curvature=0.003,
+    desired_angle_curvature=-0.003,
+  )
+
+  assert reversal.curvature > 0.0
+
+
+def test_spatial_transfer_does_not_remove_opposite_direction_c2():
+  transfer_controller = ProjectedLatControlPath()
+  reference_controller = ProjectedLatControlPath()
+  steady = polynomial_model(0.003)
+  reversal_path = polynomial_model(-0.004, -0.0003)
+  reversal_path.curvature = 0.003
+
+  for controller in (transfer_controller, reference_controller):
+    for _ in range(30):
+      controller.update(
+        steady, 0.003, 7.0, True, False,
+        desired_angle_curvature=0.003,
+      )
+
+  transfer = transfer_controller.update(
+    reversal_path, 0.003, 7.0, True, False,
+    projected_measured_curvature=0.003,
+    desired_angle_curvature=-0.003,
+    lat_ctl_limit=0,
+  )
+  reference = reference_controller.update(
+    reversal_path, 0.003, 7.0, True, False,
+    projected_measured_curvature=0.003,
+    desired_angle_curvature=-0.003,
+    lat_ctl_limit=3,
+  )
+
+  assert transfer.coefficients() == reference.coefficients()
+
+
+def test_spatial_slope_transfers_c2_during_asynchronous_relatch():
+  controller = ProjectedLatControlPath()
+
+  for _ in range(30):
+    controller.update(
+      polynomial_model(0.004), 0.004, 7.0, True, False,
+      desired_angle_curvature=0.004,
+    )
+
+  relatch = controller.update(
+    split_geometry_model(-0.008, 0.001, 0.004, -0.0005),
+    0.004, 7.0, True, False,
+    projected_measured_curvature=0.004,
+    desired_angle_curvature=-0.004,
+  )
+
+  assert 0.0 < relatch.curvature < 0.002
+
+
+def test_small_spatial_noise_does_not_move_steady_authority_out_of_c2():
+  steady_controller = ProjectedLatControlPath()
+  noisy_controller = ProjectedLatControlPath()
+
+  for _ in range(30):
+    steady = steady_controller.update(
+      polynomial_model(0.004, lookahead=15.0), 0.004, 15.0, True, False,
+      desired_angle_curvature=0.004,
+    )
+    noisy = noisy_controller.update(
+      polynomial_model(0.004, 0.00005, lookahead=15.0), 0.004, 15.0, True, False,
+      desired_angle_curvature=0.004,
+    )
+
+  assert noisy.curvature == steady.curvature
+  assert noisy.path_offset == steady.path_offset
+  assert noisy.path_angle == steady.path_angle
 
 
 def test_meaningful_model_exit_cannot_project_to_the_opposite_direction():
