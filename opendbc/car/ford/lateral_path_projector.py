@@ -536,7 +536,8 @@ def _extend_c0_c1_for_geometry_shortfall(coefficients: tuple[float, float, float
                                          lat_ctl_limit: int,
                                          residual_share: float) -> tuple[float, float, float, float]:
   """Use only unused model C0/C1 to cover a verified steering shortfall."""
-  if not valid or lat_ctl_limit != 0 or residual_share >= 1.0:
+  del residual_share  # Remaining raw C0/C1 is the authority bound at every blend share.
+  if not valid or lat_ctl_limit != 0:
     return coefficients
 
   lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
@@ -558,20 +559,25 @@ def _extend_c0_c1_for_geometry_shortfall(coefficients: tuple[float, float, float
     abs(_deadzone(tracking_error, PATH_TRACKING_ERROR_DEADZONE)),
     PATH_C1_TRACKING_ERROR_LIMIT,
   )
-  extension_curvature *= _interp(
+  geometry_share = _interp(
     min(abs(offset_curvature), abs(angle_curvature)),
     PATH_C2_BASEBAND_BP[1],
     PATH_PREVIEW_BP[1],
     0.0,
     1.0,
   )
-  extension_curvature *= _interp(
+  action_share = _interp(
     abs(desired_curvature),
     PATH_C2_BASEBAND_BP[1],
     PATH_PREVIEW_BP[1],
     0.0,
     1.0,
   )
+  # Both signals must independently identify a maneuver, but multiplying them
+  # twice made the verified shortfall correction disproportionately timid at
+  # turn onset. Their geometric mean preserves both zero gates while exposing
+  # more of the model's unused C0/C1 as confidence rises.
+  extension_curvature *= math.sqrt(geometry_share * action_share)
   if extension_curvature == 0.0:
     return coefficients
 

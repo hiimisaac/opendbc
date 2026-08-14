@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from opendbc.car.ford.lateral_path_projector import PATH_C0_CONTINUATION_MARGIN, ProjectedLatControlPath, _taper_stale_outward_preview
+from opendbc.car.ford.lateral_path_projector import (
+  PATH_C0_CONTINUATION_MARGIN,
+  ProjectedLatControlPath,
+  _extend_c0_c1_for_geometry_shortfall,
+  _taper_stale_outward_preview,
+)
 
 
 def model(path_offset: float, path_angle: float, curvature: float = 0.0, curvature_rate: float = 0.0):
@@ -1059,6 +1064,45 @@ def test_c0_c1_shortfall_extension_stays_out_of_ordinary_highway_curve():
 
   assert command.path_offset == 0.0
   assert command.path_angle == 0.0
+
+
+def test_c0_c1_shortfall_extension_uses_unused_model_geometry_at_full_residual_share():
+  coefficients = (0.0, 0.0, 0.0, 0.0)
+  raw_target = (0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, 0.015, 0.003)
+
+  command = _extend_c0_c1_for_geometry_shortfall(
+    coefficients,
+    raw_target,
+    desired_curvature=0.015,
+    measured_curvature=0.005,
+    projected_curvature=0.005,
+    v_ego=7.0,
+    valid=True,
+    lat_ctl_limit=0,
+    residual_share=1.0,
+  )
+
+  assert 0.0 < command[0] <= raw_target[0]
+  assert 0.0 < command[1] <= raw_target[1]
+
+
+def test_c0_c1_shortfall_extension_remains_zero_at_projected_arrival():
+  coefficients = (0.0, 0.0, 0.0, 0.0)
+  raw_target = (0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, 0.015, 0.003)
+
+  command = _extend_c0_c1_for_geometry_shortfall(
+    coefficients,
+    raw_target,
+    desired_curvature=0.015,
+    measured_curvature=0.005,
+    projected_curvature=0.015,
+    v_ego=7.0,
+    valid=True,
+    lat_ctl_limit=0,
+    residual_share=1.0,
+  )
+
+  assert command == coefficients
 
 
 def test_opposite_side_reversal_uses_c0_until_the_wheel_changes_direction():
