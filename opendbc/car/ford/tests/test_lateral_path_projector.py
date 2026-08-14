@@ -1,4 +1,3 @@
-import math
 from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path_projector import PATH_C0_CONTINUATION_MARGIN, ProjectedLatControlPath, _taper_stale_outward_preview
@@ -92,7 +91,7 @@ def test_large_turn_flushes_c2_and_projects_its_path_into_other_coefficients():
   assert command.path_offset > target.pathOffset or command.path_angle > target.pathAngle
 
 
-def test_changing_spatial_geometry_transfers_c2_authority_to_c0_c1():
+def test_changing_spatial_geometry_adds_c0_c1_without_replacing_c2():
   steady_controller = ProjectedLatControlPath()
   changing_controller = ProjectedLatControlPath()
 
@@ -107,36 +106,9 @@ def test_changing_spatial_geometry_transfers_c2_authority_to_c0_c1():
       desired_angle_curvature=0.004,
     )
 
-  assert changing.curvature < steady.curvature
+  assert changing.curvature == steady.curvature
   assert abs(changing.path_offset) > abs(steady.path_offset)
   assert abs(changing.path_angle) > abs(steady.path_angle)
-
-
-def test_spatial_transfer_preserves_near_field_authority():
-  transfer_controller = ProjectedLatControlPath()
-  reference_controller = ProjectedLatControlPath()
-  target = polynomial_model(0.004, 0.0005)
-
-  for _ in range(30):
-    transfer = transfer_controller.update(
-      target, 0.001, 7.0, True, False,
-      projected_measured_curvature=0.001,
-      desired_angle_curvature=0.004,
-      lat_ctl_limit=0,
-    )
-    reference = reference_controller.update(
-      target, 0.001, 7.0, True, False,
-      projected_measured_curvature=0.001,
-      desired_angle_curvature=0.004,
-      lat_ctl_limit=3,
-    )
-
-  assert transfer.coefficients() != reference.coefficients()
-  assert math.isclose(
-    equivalent_curvature(transfer, 7.0),
-    equivalent_curvature(reference, 7.0),
-    abs_tol=1e-12,
-  )
 
 
 def test_steady_spatial_geometry_retains_c2_authority():
@@ -203,7 +175,7 @@ def test_spatial_transfer_does_not_remove_opposite_direction_c2():
   assert transfer.coefficients() == reference.coefficients()
 
 
-def test_spatial_slope_transfers_c2_during_asynchronous_relatch():
+def test_spatial_slope_does_not_drain_c2_during_asynchronous_relatch():
   controller = ProjectedLatControlPath()
 
   for _ in range(30):
@@ -219,7 +191,7 @@ def test_spatial_slope_transfers_c2_during_asynchronous_relatch():
     desired_angle_curvature=-0.004,
   )
 
-  assert 0.0 < relatch.curvature < 0.002
+  assert 0.002 < relatch.curvature <= 0.004
 
 
 def test_small_spatial_noise_does_not_move_steady_authority_out_of_c2():
@@ -1287,6 +1259,45 @@ def test_single_preview_observation_cannot_pull_ordinary_c2_into_polynomial_tran
   assert command.path_offset == 0.0
   assert command.path_angle == 0.0
   assert abs(command.curvature - curvature) < 1e-9
+
+
+def test_low_speed_coherent_preview_acts_before_tracking_error_without_replacing_c2():
+  controller = ProjectedLatControlPath()
+  target = model(0.245, 0.07, 0.004, 0.0005)
+
+  command = controller.update(
+    target, 0.004, 5.0, True, False,
+    projected_measured_curvature=0.004,
+    desired_angle_curvature=0.004,
+  )
+
+  assert 0.0 < command.path_offset <= target.pathOffset
+  assert 0.0 < command.path_angle <= target.pathAngle
+  assert command.curvature == target.curvature
+
+
+def test_coherent_preview_cannot_oppose_desired_steering_direction():
+  controller = ProjectedLatControlPath()
+  target = model(0.245, 0.07, 0.004, 0.0005)
+
+  command = controller.update(
+    target, -0.004, 5.0, True, False,
+    projected_measured_curvature=-0.004,
+    desired_angle_curvature=-0.004,
+  )
+
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+
+
+def test_ordinary_c2_is_immediate_but_sign_reversal_remains_bounded():
+  controller = ProjectedLatControlPath()
+
+  outward = controller.update(model(0.0, 0.0, 0.004), 0.0, 5.0, True, False)
+  reversal = controller.update(model(0.0, 0.0, -0.004), 0.0, 5.0, True, False)
+
+  assert outward.curvature == 0.004
+  assert reversal.curvature == -0.0002
 
 
 def test_meaningful_c3_preview_can_leave_c2_baseband():

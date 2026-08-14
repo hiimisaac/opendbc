@@ -79,6 +79,15 @@ def _limit_attack(value: float, last: float, max_step: float) -> float:
   return value
 
 
+def _apply_c2_attack(value: float, last: float) -> float:
+  """Deliver the ordinary C2 band immediately without changing large-turn attack."""
+  if value * last < 0.0:
+    return _limit_attack(value, last, PATH_C2_SLEW)
+  if abs(value) <= PATH_C2_BASEBAND_BP[1]:
+    return value
+  return _limit_attack(value, last, PATH_C2_SLEW)
+
+
 def _basis(distance: float) -> tuple[float, float, float, float]:
   return 2.0 / distance ** 2, 2.0 / distance, 1.0, distance / 3.0
 
@@ -109,107 +118,67 @@ def _maneuver_demand(raw_target: tuple[float, float, float, float],
   )
 
 
-def _spatial_transfer_share(raw_target: tuple[float, float, float, float],
-                            measured_curvature: float, projected_curvature: float,
-                            desired_angle_curvature: float, v_ego: float,
-                            valid: bool, lat_ctl_limit: int) -> float:
-  """Move changing action out of persistent C2 only with measured support."""
-  if not valid or lat_ctl_limit != 0:
+def _proactive_preview_share(raw_target: tuple[float, float, float, float],
+                             desired_angle_curvature: float,
+                             v_ego: float, valid: bool) -> float:
+  """Expose coherent model preview before the delivered wheel falls behind."""
+  if not valid:
     return 0.0
 
+  lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
+  offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
+  angle_curvature = raw_target[1] / lookahead
   spatial_slope = raw_target[3]
+  if offset_curvature * angle_curvature <= 0.0 or \
+     offset_curvature * spatial_slope <= 0.0 or \
+     raw_target[2] * spatial_slope < 0.0 or \
+     desired_angle_curvature * spatial_slope < 0.0:
+    return 0.0
+
+  geometry_growth = max(
+    min(abs(offset_curvature), abs(angle_curvature)) - abs(raw_target[2]),
+    0.0,
+  )
+  geometry_share = _interp(
+    geometry_growth,
+    PATH_TRACKING_ERROR_DEADZONE,
+    PATH_C2_BASEBAND_BP[0],
+    0.0,
+    1.0,
+  )
   slope_share = _interp(
     abs(spatial_slope) * PATH_MIN_LOOKAHEAD,
     *PATH_C2_SPATIAL_DELTA_BP,
     0.0,
     1.0,
   )
-  if slope_share == 0.0:
-    return 0.0
-
-  # During normal turn-in, move authority only while both the measured and
-  # projected wheel are still behind the desired angle. Arrival immediately
-  # restores the steady C2 anchor.
-  tracking_error = _projected_tracking_error(
-    desired_angle_curvature,
-    measured_curvature,
-    projected_curvature,
-  )
-  # A future direction must also exist in C0/C1. This prevents a noisy C3 from
-  # moving ordinary action into preview that still describes the preceding arc.
-  lookahead = max(v_ego, PATH_MIN_LOOKAHEAD)
-  offset_curvature = 2.0 * raw_target[0] / PATH_MIN_LOOKAHEAD ** 2
-  angle_curvature = raw_target[1] / lookahead
-  supporting_geometry = max(
-    abs(offset_curvature) if offset_curvature * spatial_slope > 0.0 else 0.0,
-    abs(angle_curvature) if angle_curvature * spatial_slope > 0.0 else 0.0,
-  )
-  opposing_geometry = max(
-    abs(offset_curvature) if offset_curvature * spatial_slope < 0.0 else 0.0,
-    abs(angle_curvature) if angle_curvature * spatial_slope < 0.0 else 0.0,
-  )
-  preview_share = _interp(
-    supporting_geometry - opposing_geometry,
-    PATH_TRACKING_ERROR_DEADZONE,
-    PATH_C2_BASEBAND_BP[0],
-    0.0,
-    1.0,
-  )
-  tracking_share = _interp(
-    abs(tracking_error),
-    *PATH_PROJECTED_ARRIVAL_ERROR_BP,
-    0.0,
-    1.0,
-  ) * preview_share if spatial_slope * desired_angle_curvature > 0.0 else 0.0
-  return slope_share * tracking_share
+  return geometry_share * slope_share
 
 
-def _budget_spatial_preview(path_offset: float, path_angle: float,
-                            transfer_share: float, curvature_budget: float) -> tuple[float, float]:
-  """Scale C0/C1 together without exceeding the C2 authority being moved."""
-  path_offset *= transfer_share
-  path_angle *= transfer_share
-  preview_curvature = _equivalent_curvature((path_offset, path_angle, 0.0, 0.0))
-  if preview_curvature == 0.0 or curvature_budget == 0.0:
-    return 0.0, 0.0
-
-  budget_share = min(abs(curvature_budget / preview_curvature), 1.0)
-  return path_offset * budget_share, path_angle * budget_share
-
-
-def _transfer_c2_to_spatial_preview(coefficients: tuple[float, float, float, float],
-                                    full_target: tuple[float, float, float, float],
-                                    transfer_share: float,
-                                    base_c2_share: float) -> tuple[float, float, float, float]:
-  """Make a final, authority-neutral C2-to-C0/C1 allocation."""
-  c0, c1, c2, c3 = coefficients
-  if transfer_share == 0.0 or base_c2_share == 0.0 or c2 == 0.0:
+def _extend_c0_c1_for_proactive_preview(coefficients: tuple[float, float, float, float],
+                                        raw_target: tuple[float, float, float, float],
+                                        preview_share: float) -> tuple[float, float, float, float]:
+  """Add bounded model C0/C1 without borrowing from the C2 anchor."""
+  if preview_share == 0.0:
     return coefficients
 
-  requested_c2 = c2 * min(transfer_share / base_c2_share, 1.0)
-  requested_c0, requested_c1 = _budget_spatial_preview(
-    full_target[0],
-    full_target[1],
-    transfer_share,
-    requested_c2,
-  )
-
-  values = [c0, c1, c2, c3]
-  deltas = [0.0, 0.0]
-  for i, requested_delta in enumerate((requested_c0, requested_c1)):
-    available_delta = full_target[i] - values[i]
-    if requested_delta * available_delta <= 0.0:
-      continue
-    delta = math.copysign(min(abs(requested_delta), abs(available_delta)), requested_delta)
-    updated = _clip(values[i] + delta, PATH_LIMITS[i])
-    deltas[i] = updated - values[i]
-    values[i] = updated
-
-  delivered_preview = _equivalent_curvature((deltas[0], deltas[1], 0.0, 0.0))
-  if delivered_preview * c2 <= 0.0:
+  direction = math.copysign(1.0, raw_target[3])
+  basis = _basis(PATH_MIN_LOOKAHEAD)
+  values = list(coefficients)
+  available = [
+    max((raw_target[i] - values[i]) * direction, 0.0) * basis[i]
+    for i in (0, 1)
+  ]
+  available_curvature = sum(available)
+  if available_curvature == 0.0:
     return coefficients
-  removable_c2 = min(abs(c2), abs(requested_c2), abs(delivered_preview))
-  values[2] = c2 - math.copysign(removable_c2, c2)
+
+  preview_budget = abs(raw_target[3]) * PATH_MIN_LOOKAHEAD / 3.0 * preview_share
+  used_curvature = min(preview_budget, available_curvature)
+  for i in (0, 1):
+    if available[i] > 0.0:
+      coefficient_delta = direction * used_curvature * available[i] / available_curvature / basis[i]
+      values[i] = _clip(values[i] + coefficient_delta, PATH_LIMITS[i])
   return tuple(values)
 
 
@@ -702,8 +671,8 @@ class ProjectedLatControlPath:
 
   def __init__(self):
     self._last_command = LateralPathCommand()
-    self._last_allocated_c3 = 0.0
     self._last_c2_anchor = 0.0
+    self._last_allocated_c3 = 0.0
 
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
@@ -717,8 +686,8 @@ class ProjectedLatControlPath:
 
     if not active:
       self._last_command = LateralPathCommand()
-      self._last_allocated_c3 = 0.0
       self._last_c2_anchor = 0.0
+      self._last_allocated_c3 = 0.0
       return self._last_command
 
     valid = path is not None and bool(getattr(path, "valid", False))
@@ -740,8 +709,8 @@ class ProjectedLatControlPath:
         path_angle=_clip(measured_curvature * max(v_ego, PATH_MIN_LOOKAHEAD), PATH_LIMITS[1]),
       )
       self._last_command = command
-      self._last_allocated_c3 = 0.0
       self._last_c2_anchor = 0.0
+      self._last_allocated_c3 = 0.0
       return command
 
     raw_target = target
@@ -761,27 +730,26 @@ class ProjectedLatControlPath:
         valid,
       ),
     )
-    spatial_transfer_share = (1.0 - residual_share) * _spatial_transfer_share(
+    proactive_preview_share = (1.0 - residual_share) * _proactive_preview_share(
       raw_target,
-      measured_curvature,
-      projected_measured_curvature,
       desired_angle_curvature,
       v_ego,
       valid,
-      lat_ctl_limit,
     )
     # C2 owns normal driving. The complete polynomial is a single continuous
     # authority extension, reaching the previous full-strength command at 0.006.
     base_c2_share = 1.0 - residual_share
-    anchored_c2 = _limit_attack(
+    anchored_c2 = _apply_c2_attack(
       _clip(raw_target[2] * base_c2_share, PATH_LIMITS[2]),
       self._last_c2_anchor,
-      PATH_C2_SLEW,
     )
     bounds[2] = (anchored_c2, anchored_c2)
     c3_share = _c3_compatibility_share(raw_target[3], desired_angle_curvature, projected_measured_curvature)
-    safe_c3 = _limit_attack(_clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3]),
-                            self._last_allocated_c3, PATH_C3_SLEW)
+    safe_c3 = _limit_attack(
+      _clip(raw_target[3] * c3_share * residual_share, PATH_LIMITS[3]),
+      self._last_allocated_c3,
+      PATH_C3_SLEW,
+    )
     bounds[3] = (safe_c3, safe_c3)
 
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
@@ -798,6 +766,11 @@ class ProjectedLatControlPath:
     coefficients = tuple(
       _clip(value, bound)
       for value, bound in zip(target, coefficient_bounds, strict=True)
+    )
+    coefficients = _extend_c0_c1_for_proactive_preview(
+      coefficients,
+      raw_target,
+      proactive_preview_share,
     )
     unallocated_c3 = coefficients[3]
     coefficients = _reallocate_c3_to_c0(
@@ -819,6 +792,7 @@ class ProjectedLatControlPath:
       lat_ctl_limit,
       residual_share,
     )
+    c3_was_reallocated = coefficients[3] != unallocated_c3
     coefficients = _extend_c0_for_opposite_side_reversal(
       coefficients,
       raw_target,
@@ -829,7 +803,6 @@ class ProjectedLatControlPath:
       lat_ctl_limit,
       residual_share,
     )
-    c3_was_reallocated = coefficients[3] != unallocated_c3
     if preserve_model_direction:
       coefficients = _preserve_model_direction(coefficients, coefficient_bounds, model_curvature)
     coefficients = _taper_stale_outward_preview(
@@ -838,12 +811,6 @@ class ProjectedLatControlPath:
       desired_angle_curvature,
       measured_curvature,
       v_ego,
-    )
-    coefficients = _transfer_c2_to_spatial_preview(
-      coefficients,
-      full_target,
-      spatial_transfer_share,
-      base_c2_share,
     )
     command = LateralPathCommand(valid=valid, path_offset=coefficients[0], path_angle=coefficients[1],
                                  curvature=coefficients[2], curvature_rate=coefficients[3])
