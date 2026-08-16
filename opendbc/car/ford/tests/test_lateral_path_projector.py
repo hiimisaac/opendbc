@@ -917,6 +917,57 @@ def test_spatial_slope_crossfades_once_from_c2_to_full_polynomial():
   assert full.path_angle > transition.path_angle
 
 
+def test_c0_c1_carry_c2_handoff_until_slow_anchor_arrives():
+  # Captured from a right-turn collapse after a brief driver correction. The
+  # model's complete polynomial still asks for the turn, but maneuver demand
+  # crosses below the C0/C1 threshold while C2 is restarting from zero.
+  for direction in (1.0, -1.0):
+    controller = ProjectedLatControlPath()
+    strong = model(*(direction * value for value in (
+      1.100723624, 0.283491492, 0.018789796, -0.000230324,
+    )))
+    controller.update(
+      strong, direction * 0.023635519, 10.361, True, False,
+      projected_measured_curvature=direction * 0.019882582,
+      desired_angle_curvature=direction * 0.022392068,
+    )
+
+    override_samples = (
+      (1.046459317, 0.268339455, 0.018728370, -0.000238370,
+       0.020665589, 0.013989830, 0.022316933),
+      (0.982645273, 0.257616222, 0.019059796, -0.000116112,
+       0.020397064, 0.013695550, 0.022714867),
+      (0.954809308, 0.256530553, 0.019226456, 0.000042498,
+       0.020821513, 0.015184017, 0.022912957),
+    )
+    for c0, c1, c2, c3, measured, projected, desired in override_samples:
+      controller.update(
+        model(*(direction * value for value in (c0, c1, c2, c3))),
+        direction * measured, 10.46, True, True,
+        projected_measured_curvature=direction * projected,
+        desired_angle_curvature=direction * desired,
+      )
+
+    release_samples = (
+      (0.912020087, 0.246393055, 0.019684806, 0.000222714,
+       0.021310644, 0.017298289, 0.023446815),
+      (0.880617678, 0.238525912, 0.019948771, 0.000280214,
+       0.021681554, 0.019768474, 0.023769662),
+      (0.876937568, 0.241124481, 0.019665301, 0.000372190,
+       0.021863119, 0.021730294, 0.023431917),
+    )
+    for c0, c1, c2, c3, measured, projected, desired in release_samples:
+      command = controller.update(
+        model(*(direction * value for value in (c0, c1, c2, c3))),
+        direction * measured, 10.55, True, False,
+        projected_measured_curvature=direction * projected,
+        desired_angle_curvature=direction * desired,
+      )
+      # C0/C1 must bridge the missing C2 allocation rather than allowing the
+      # total command to collapse almost to zero during the transfer.
+      assert direction * equivalent_curvature(command, 7.0) >= 0.015
+
+
 def test_coherent_reversal_shortfall_keeps_polynomial_authority_below_spatial_threshold():
   # Captured from a fast left-to-right reversal. The model path, desired
   # steering angle, and spatial slope all continue into the new turn while the
@@ -1000,8 +1051,10 @@ def test_coherent_c0_c1_shortfall_uses_polynomial_without_c3_support():
 
   assert command.path_offset < 0.0
   assert command.path_angle < 0.0
-  assert 0.0 < abs(equivalent_curvature(command, 7.0) - equivalent_curvature(baseline, 7.0)) <= \
-                abs(-0.012917 - -0.012174)
+  # The polynomial now also substitutes for the slow C2 anchor during this
+  # handoff. It may exceed the projected tracking-error correction alone, but
+  # remains inside the desired-angle curvature that C2 is rebuilding toward.
+  assert abs(equivalent_curvature(baseline, 7.0)) < abs(equivalent_curvature(command, 7.0)) <= 0.012917
 
 
 def test_c0_c1_shortfall_extension_drops_at_projected_arrival():
