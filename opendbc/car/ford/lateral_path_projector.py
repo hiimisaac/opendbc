@@ -391,6 +391,34 @@ def _compose_path_target(raw_target: tuple[float, float, float, float],
   return target, model_target, preserve_model_direction
 
 
+def _c2_handoff_residual_share(residual_share: float,
+                               full_target: tuple[float, float, float, float],
+                               target_c2: float, anchored_c2: float,
+                               desired_curvature: float, measured_curvature: float,
+                               projected_curvature: float, lat_ctl_limit: int) -> float:
+  """Keep C0/C1 carrying C2 authority that its slow anchor has not delivered."""
+  tracking_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  same_side_tracking = measured_curvature * desired_curvature > 0.0 and \
+                       projected_curvature * desired_curvature > 0.0
+  if lat_ctl_limit != 0 or not same_side_tracking or tracking_error == 0.0:
+    return residual_share
+
+  c2_shortfall = target_c2 - anchored_c2
+  preview_curvature = sum(
+    _basis(PATH_MIN_LOOKAHEAD)[i] * full_target[i]
+    for i in (0, 1)
+  )
+  if c2_shortfall * preview_curvature <= 0.0:
+    return residual_share
+
+  missing_share = abs(c2_shortfall / preview_curvature)
+  return _clip(residual_share + missing_share, (residual_share, 1.0))
+
+
 def _preserve_model_direction(coefficients: tuple[float, float, float, float],
                               bounds: tuple[tuple[float, float], ...],
                               model_curvature: float) -> tuple[float, float, float, float]:
@@ -745,8 +773,9 @@ class ProjectedLatControlPath:
     # C2 owns normal driving. The complete polynomial is a single continuous
     # authority extension, reaching the previous full-strength command at 0.006.
     base_c2_share = 1.0 - residual_share
+    target_c2 = _clip(raw_target[2] * base_c2_share, PATH_LIMITS[2])
     anchored_c2 = _apply_c2_attack(
-      _clip(raw_target[2] * base_c2_share, PATH_LIMITS[2]),
+      target_c2,
       self._last_c2_anchor,
     )
     bounds[2] = (anchored_c2, anchored_c2)
@@ -761,6 +790,16 @@ class ProjectedLatControlPath:
     full_target, model_curvature, preserve_model_direction = _compose_path_target(
       raw_target, measured_curvature, projected_measured_curvature, desired_angle_curvature,
       v_ego, valid, safe_c3,
+    )
+    residual_share = _c2_handoff_residual_share(
+      residual_share,
+      full_target,
+      target_c2,
+      anchored_c2,
+      desired_angle_curvature,
+      measured_curvature,
+      projected_measured_curvature,
+      lat_ctl_limit,
     )
     target = (
       full_target[0] * residual_share,
