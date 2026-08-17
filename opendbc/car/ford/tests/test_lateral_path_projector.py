@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path_projector import (
   PATH_C0_CONTINUATION_MARGIN,
+  LateralPathCommand,
   ProjectedLatControlPath,
   _extend_c0_c1_for_geometry_shortfall,
+  lmc2_control_utilization,
   _taper_stale_outward_preview,
 )
 
@@ -44,6 +46,25 @@ def equivalent_curvature(command, distance: float) -> float:
   y = path_offset + path_angle * distance + 0.5 * command.curvature * distance ** 2 + \
       curvature_rate * distance ** 3 / 6.0
   return 2.0 * y / distance ** 2
+
+
+def test_lmc2_control_utilization_tracks_strongest_coefficient_and_direction():
+  half_positive_c2 = LateralPathCommand(True, 0.0, 0.0, 0.01, 0.0)
+  half_negative_c2 = LateralPathCommand(True, 0.0, 0.0, -0.01, 0.0)
+  full_positive_c3 = LateralPathCommand(True, 0.0, 0.0, 0.0, 0.001023)
+
+  assert lmc2_control_utilization(half_positive_c2, 0) == 0.5
+  assert lmc2_control_utilization(half_negative_c2, 0) == -0.5
+  assert lmc2_control_utilization(full_positive_c3, 0) == 1.0
+
+
+def test_lmc2_control_utilization_includes_pscm_limit_state():
+  low_command = LateralPathCommand(True, 0.0, 0.0, 0.002, 0.0)
+
+  assert lmc2_control_utilization(low_command, 0) == 0.1
+  assert lmc2_control_utilization(low_command, 1) == 0.8
+  assert lmc2_control_utilization(low_command, 2) == 1.0
+  assert lmc2_control_utilization(low_command, 3) == 0.1
 
 
 def test_feasible_steady_model_is_reproduced_by_c2():

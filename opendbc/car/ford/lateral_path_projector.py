@@ -97,6 +97,31 @@ def _equivalent_curvature(coefficients: tuple[float, float, float, float], dista
   return sum(basis[i] * coefficients[i] for i in range(4))
 
 
+def lmc2_control_utilization(command: LateralPathCommand, lat_ctl_limit: int) -> float:
+  """Return signed LMC2 command-envelope usage, augmented by PSCM limit status.
+
+  Coefficient saturation and the PSCM's physical steering limit are not the
+  same thing. The coefficient ratios provide a continuous meter, while the
+  PSCM status raises the meter near/full only when it reports LimitClose or
+  LimitReached. LimitWithDriverActive deliberately does not imply saturation.
+  """
+  coefficients = command.coefficients()
+  coefficient_utilization = [
+    abs(value) / (limits[1] if value >= 0.0 else abs(limits[0]))
+    for value, limits in zip(coefficients, PATH_LIMITS, strict=True)
+  ]
+  magnitude = _clip(max(coefficient_utilization), (0.0, 1.0))
+  if lat_ctl_limit == 1:  # LimitClose
+    magnitude = max(magnitude, 0.8)
+  elif lat_ctl_limit == 2:  # LimitReached
+    magnitude = 1.0
+
+  direction_source = _equivalent_curvature(coefficients, PATH_MIN_LOOKAHEAD)
+  if abs(direction_source) < 1e-9 and magnitude > 0.0:
+    direction_source = coefficients[max(range(4), key=coefficient_utilization.__getitem__)]
+  return math.copysign(magnitude, direction_source) if magnitude > 0.0 else 0.0
+
+
 def _maneuver_demand(raw_target: tuple[float, float, float, float],
                      v_ego: float, valid: bool) -> float:
   """Use polynomial authority for spatial curvature change or C2 overflow."""

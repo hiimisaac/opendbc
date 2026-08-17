@@ -387,6 +387,18 @@ struct CarControl {
     torqueOutputCan @8: Float32;   # value sent over can to the car
     speed @6: Float32;  # m/s
 
+    # Generic reporting of the car-specific steering command envelope. These
+    # are telemetry only and must not be used as an actuator input.
+    steeringControlUtilization @10: Float32;  # signed [-1.0, 1.0]
+    steeringControlLimit @11: SteeringControlLimit;
+
+    enum SteeringControlLimit {
+      notReached @0;
+      close @1;
+      reached @2;
+      driverActive @3;
+    }
+
     enum LongControlState @0xe40f3a917d908282{
       off @0;
       pid @1;
