@@ -60,11 +60,13 @@ def test_lmc2_control_utilization_tracks_strongest_coefficient_and_direction():
 
 def test_lmc2_control_utilization_includes_pscm_limit_state():
   low_command = LateralPathCommand(True, 0.0, 0.0, 0.002, 0.0)
+  zero_command = LateralPathCommand(True, 0.0, 0.0, 0.0, 0.0)
 
   assert lmc2_control_utilization(low_command, 0) == 0.1
   assert lmc2_control_utilization(low_command, 1) == 0.8
   assert lmc2_control_utilization(low_command, 2) == 1.0
   assert lmc2_control_utilization(low_command, 3) == 0.1
+  assert lmc2_control_utilization(zero_command, 2) == 0.0
 
 
 def test_feasible_steady_model_is_reproduced_by_c2():
