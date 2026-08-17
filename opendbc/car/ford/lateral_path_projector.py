@@ -110,16 +110,20 @@ def lmc2_control_utilization(command: LateralPathCommand, lat_ctl_limit: int) ->
     abs(value) / (limits[1] if value >= 0.0 else abs(limits[0]))
     for value, limits in zip(coefficients, PATH_LIMITS, strict=True)
   ]
-  magnitude = _clip(max(coefficient_utilization), (0.0, 1.0))
+  coefficient_magnitude = _clip(max(coefficient_utilization), (0.0, 1.0))
+  if coefficient_magnitude == 0.0:
+    return 0.0
+
+  magnitude = coefficient_magnitude
   if lat_ctl_limit == 1:  # LimitClose
     magnitude = max(magnitude, 0.8)
   elif lat_ctl_limit == 2:  # LimitReached
     magnitude = 1.0
 
   direction_source = _equivalent_curvature(coefficients, PATH_MIN_LOOKAHEAD)
-  if abs(direction_source) < 1e-9 and magnitude > 0.0:
+  if abs(direction_source) < 1e-9:
     direction_source = coefficients[max(range(4), key=coefficient_utilization.__getitem__)]
-  return math.copysign(magnitude, direction_source) if magnitude > 0.0 else 0.0
+  return math.copysign(magnitude, direction_source)
 
 
 def _maneuver_demand(raw_target: tuple[float, float, float, float],
