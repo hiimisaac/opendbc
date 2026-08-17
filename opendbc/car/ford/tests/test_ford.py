@@ -117,6 +117,8 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
+    assert output.steeringControlUtilization == 1.0
+    assert output.steeringControlLimit == CarControl.Actuators.SteeringControlLimit.reached
     assert len(can_sends) == 1
 
   def test_canfd_controller_transfers_changing_spatial_path_out_of_c2(self):

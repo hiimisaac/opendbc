@@ -5,7 +5,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.lateral_path import driver_steering_opposes_command, SteeringAngleProjector
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.lateral_path_projector import LateralPathCommand, ProjectedLatControlPath, lmc2_control_utilization
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -20,7 +20,15 @@ def lmc2_precision(cooperative_control: bool) -> int:
 
 
 LongCtrlState = structs.CarControl.Actuators.LongControlState
+SteeringControlLimit = structs.CarControl.Actuators.SteeringControlLimit
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
+
+STEERING_CONTROL_LIMIT_STATES = (
+  SteeringControlLimit.notReached,
+  SteeringControlLimit.close,
+  SteeringControlLimit.reached,
+  SteeringControlLimit.driverActive,
+)
 
 def ford_curvature_from_steering_angle(VM, steering_angle_deg: float, v_ego: float) -> float:
   """Convert steering-wheel angle to Ford's opposite-sign curvature."""
@@ -253,6 +261,17 @@ class CarController(CarControllerBase):
     new_actuators.lateralPath.pathAngle = self.path_angle_last
     new_actuators.lateralPath.curvature = self.apply_curvature_last
     new_actuators.lateralPath.curvatureRate = self.curvature_rate_last
+    if self.CP.flags & FordFlags.CANFD and CC.latActive:
+      output_command = LateralPathCommand(
+        self.path_valid_last,
+        self.path_offset_last,
+        self.path_angle_last,
+        self.apply_curvature_last,
+        self.curvature_rate_last,
+      )
+      new_actuators.steeringControlUtilization = lmc2_control_utilization(output_command, CS.lat_ctl_limit)
+      limit_state = CS.lat_ctl_limit if 0 <= CS.lat_ctl_limit < len(STEERING_CONTROL_LIMIT_STATES) else 0
+      new_actuators.steeringControlLimit = STEERING_CONTROL_LIMIT_STATES[limit_state]
     new_actuators.accel = self.accel
     new_actuators.gas = self.gas
 
