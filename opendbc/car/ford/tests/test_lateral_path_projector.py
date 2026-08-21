@@ -4,6 +4,8 @@ from opendbc.car.ford.lateral_path_projector import (
   PATH_C0_CONTINUATION_MARGIN,
   LateralPathCommand,
   ProjectedLatControlPath,
+  _c2_handoff_residual_share,
+  _equivalent_curvature,
   _extend_c0_c1_for_geometry_shortfall,
   lmc2_control_utilization,
   _taper_stale_outward_preview,
@@ -989,6 +991,82 @@ def test_c0_c1_carry_c2_handoff_until_slow_anchor_arrives():
       # C0/C1 must bridge the missing C2 allocation rather than allowing the
       # total command to collapse almost to zero during the transfer.
       assert direction * equivalent_curvature(command, 7.0) >= 0.015
+
+
+def test_c0_c1_handoff_is_bumpless_when_measured_wheel_reaches_desired_first():
+  # Captured at 49.60 s in a right turn. The measured wheel has just crossed
+  # desired by 0.00048 curvature, but its projected motion falls behind while
+  # the replacement C2 anchor has delivered only 0.001 of its 0.01979 target.
+  # Dropping C0/C1 here reduced the complete command from 0.028 to 0.0106.
+  full_target = (-1.023405299, -0.134673623, 0.0, 0.0)
+  residual_share = 0.119916234
+  target_c2 = -0.019792420
+  anchored_c2 = -0.001
+  desired = -0.026289789
+
+  bridged_share = _c2_handoff_residual_share(
+    residual_share,
+    full_target,
+    target_c2,
+    anchored_c2,
+    desired,
+    -0.026766363,
+    -0.024140635,
+    0,
+  )
+  bridged_command = (
+    full_target[0] * bridged_share,
+    full_target[1] * bridged_share,
+    anchored_c2,
+    full_target[3],
+  )
+
+  assert abs(_equivalent_curvature(bridged_command)) >= 0.018
+  assert abs(_equivalent_curvature(bridged_command)) <= abs(desired) + 1e-9
+
+
+def test_c0_c1_handoff_does_not_double_count_existing_preview_at_arrival():
+  # One sample earlier, existing C0/C1 already carries at least the desired
+  # angle. The handoff must not add the entire C2 shortfall on top of it.
+  full_target = (-1.057629511, -0.145116130, 0.0, 0.0)
+  residual_share = 0.322197744
+  bridged_share = _c2_handoff_residual_share(
+    residual_share,
+    full_target,
+    -0.015348541,
+    -0.0008,
+    -0.026465200,
+    -0.026584354,
+    -0.022403748,
+    0,
+  )
+
+  assert bridged_share == residual_share
+
+
+def test_c0_c1_handoff_preserves_existing_authority_while_undertracking():
+  # The preceding sample is still genuinely undertracking. Preserve the
+  # established full C2-shortfall bridge rather than applying the new arrival
+  # corridor early and weakening turn authority.
+  full_target = (-1.075147733, -0.153263244, 0.0, 0.0)
+  bridged_share = _c2_handoff_residual_share(
+    0.386818440,
+    full_target,
+    -0.014270190,
+    -0.0006,
+    -0.027180146,
+    -0.027041810,
+    -0.021547687,
+    0,
+  )
+  bridged_command = (
+    full_target[0] * bridged_share,
+    full_target[1] * bridged_share,
+    -0.0006,
+    full_target[3],
+  )
+
+  assert abs(_equivalent_curvature(bridged_command)) >= 0.048
 
 
 def test_coherent_reversal_shortfall_keeps_polynomial_authority_below_spatial_threshold():

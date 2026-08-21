@@ -426,14 +426,7 @@ def _c2_handoff_residual_share(residual_share: float,
                                desired_curvature: float, measured_curvature: float,
                                projected_curvature: float, lat_ctl_limit: int) -> float:
   """Keep C0/C1 carrying C2 authority that its slow anchor has not delivered."""
-  tracking_error = _projected_tracking_error(
-    desired_curvature,
-    measured_curvature,
-    projected_curvature,
-  )
-  same_side_tracking = measured_curvature * desired_curvature > 0.0 and \
-                       projected_curvature * desired_curvature > 0.0
-  if lat_ctl_limit != 0 or not same_side_tracking or tracking_error == 0.0:
+  if lat_ctl_limit != 0:
     return residual_share
 
   c2_shortfall = target_c2 - anchored_c2
@@ -441,10 +434,46 @@ def _c2_handoff_residual_share(residual_share: float,
     _basis(PATH_MIN_LOOKAHEAD)[i] * full_target[i]
     for i in (0, 1)
   )
-  if c2_shortfall * preview_curvature <= 0.0:
+  if c2_shortfall * preview_curvature <= 0.0 or \
+     c2_shortfall * desired_curvature <= 0.0 or \
+     preview_curvature * desired_curvature <= 0.0:
     return residual_share
 
-  missing_share = abs(c2_shortfall / preview_curvature)
+  tracking_error = _projected_tracking_error(
+    desired_curvature,
+    measured_curvature,
+    projected_curvature,
+  )
+  same_side_tracking = measured_curvature * desired_curvature > 0.0 and \
+                       projected_curvature * desired_curvature > 0.0
+  ordinary_handoff = same_side_tracking and tracking_error != 0.0
+  if ordinary_handoff:
+    missing_share = abs(c2_shortfall / preview_curvature)
+    return _clip(residual_share + missing_share, (residual_share, 1.0))
+
+  # Only relax the arrival gate when C2 itself is carrying large-turn
+  # authority. Ordinary/reversal C2 must still release immediately at arrival.
+  large_turn_handoff = abs(target_c2) >= PATH_PREVIEW_BP[1]
+  if not large_turn_handoff:
+    return residual_share
+
+  # Crossing desired angle does not mean the slow C2 anchor has completed the
+  # coefficient-ownership transfer. Cover only the shortfall in the complete
+  # command, so C0/C1 already present at residual_share is not double counted.
+  base_command = (
+    full_target[0] * residual_share,
+    full_target[1] * residual_share,
+    anchored_c2,
+    full_target[3],
+  )
+  direction = math.copysign(1.0, desired_curvature)
+  base_command_curvature = _equivalent_curvature(base_command)
+  desired_shortfall = max(
+    abs(desired_curvature) - base_command_curvature * direction,
+    0.0,
+  )
+  bridge_curvature = min(abs(c2_shortfall), desired_shortfall)
+  missing_share = bridge_curvature / abs(preview_curvature)
   return _clip(residual_share + missing_share, (residual_share, 1.0))
 
 
