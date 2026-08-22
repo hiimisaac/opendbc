@@ -7,7 +7,7 @@ from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.carcontroller import CarController
-from opendbc.car.ford.lateral_path import LateralPathCommand
+from opendbc.car.ford.lateral_path_projector import LateralPathCommand, ProjectedLatControlPath
 from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
@@ -69,7 +69,7 @@ class TestFordFW(unittest.TestCase):
     controller = CarController(DBC[CP.carFingerprint], CP)
     controller.frame = CarControllerParams.STEER_STEP
 
-    class RecordingPathController:
+    class RecordingPathController(ProjectedLatControlPath):
       def __init__(self):
         self.path = None
         self.lat_ctl_limit = None
@@ -119,14 +119,14 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
     assert len(can_sends) == 1
 
-  def test_canfd_controller_transfers_changing_spatial_path_out_of_c2(self):
+  def test_canfd_controller_consumes_one_origin_spatial_path(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
 
     CC = CarControl(latActive=True)
     CC.actuators.lateralPath.valid = True
-    CC.actuators.lateralPath.pathOffset = 0.5 * 0.004 * 7.0 ** 2 + 0.0005 * 7.0 ** 3 / 6.0
-    CC.actuators.lateralPath.pathAngle = 0.004 * 7.0 + 0.5 * 0.0005 * 7.0 ** 2
+    CC.actuators.lateralPath.pathOffset = 0.0
+    CC.actuators.lateralPath.pathAngle = 0.0
     CC.actuators.lateralPath.curvature = 0.004
     CC.actuators.lateralPath.curvatureRate = 0.0005
     CC.actuators.steeringAngleDeg = math.degrees(controller.VM.get_steer_from_curvature(-0.004, 7.0, 0.0))
@@ -156,9 +156,9 @@ class TestFordFW(unittest.TestCase):
       output, _ = controller.update(CC.as_reader(), CS, 0)
 
     assert output is not None
-    assert output.lateralPath.curvature < CC.actuators.lateralPath.curvature
-    assert output.lateralPath.pathOffset > 0.0
-    assert output.lateralPath.pathAngle > 0.0
+    assert math.isclose(output.lateralPath.curvature, CC.actuators.lateralPath.curvature, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathOffset, 0.5 * 0.004 * 7.0 ** 2 + 0.0005 * 7.0 ** 3 / 6.0, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathAngle, 0.004 * 7.0 + 0.5 * 0.0005 * 7.0 ** 2, rel_tol=1e-6)
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:

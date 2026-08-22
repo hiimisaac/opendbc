@@ -132,9 +132,6 @@ class CarController(CarControllerBase):
         cooperative_control = driver_override
         measured_curvature = ford_curvature_from_steering_angle(self.VM, actual_angle_deg, CS.out.vEgoRaw)
         projected_wheel_curvature = ford_curvature_from_steering_angle(self.VM, projected_angle_deg, CS.out.vEgoRaw)
-        desired_angle_curvature = ford_curvature_from_steering_angle(
-          self.VM, actuators.steeringAngleDeg, CS.out.vEgoRaw,
-        )
         path_target = actuators.lateralPath
         if desired_curvature != path_target.curvature:
           path_target = path_target.as_builder()
@@ -143,7 +140,6 @@ class CarController(CarControllerBase):
           path_target, measured_curvature, CS.out.vEgoRaw,
           CC.latActive, driver_override,
           projected_measured_curvature=projected_wheel_curvature,
-          desired_angle_curvature=desired_angle_curvature,
           lat_ctl_limit=CS.lat_ctl_limit,
         )
         apply_curvature = cmd.curvature
