@@ -119,7 +119,7 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
     assert len(can_sends) == 1
 
-  def test_canfd_controller_consumes_one_origin_spatial_path(self):
+  def test_canfd_controller_keeps_small_spatial_noise_out_of_ordinary_c2(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
 
@@ -157,8 +157,9 @@ class TestFordFW(unittest.TestCase):
 
     assert output is not None
     assert math.isclose(output.lateralPath.curvature, CC.actuators.lateralPath.curvature, rel_tol=1e-6)
-    assert math.isclose(output.lateralPath.pathOffset, 0.5 * 0.004 * 7.0 ** 2 + 0.0005 * 7.0 ** 3 / 6.0, rel_tol=1e-6)
-    assert math.isclose(output.lateralPath.pathAngle, 0.004 * 7.0 + 0.5 * 0.0005 * 7.0 ** 2, rel_tol=1e-6)
+    assert output.lateralPath.pathOffset == 0.0
+    assert output.lateralPath.pathAngle == 0.0
+    assert output.lateralPath.curvatureRate == 0.0
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:

@@ -16,7 +16,7 @@ def path(c0: float = 0.0, c1: float = 0.0,
   )
 
 
-def test_preview_command_is_the_path_error_at_one_spatial_origin():
+def test_ordinary_driving_is_c2_only():
   controller = ProjectedLatControlPath()
 
   command = controller.update(
@@ -25,8 +25,8 @@ def test_preview_command_is_the_path_error_at_one_spatial_origin():
     projected_measured_curvature=0.0,
   )
 
-  assert math.isclose(command.path_offset, 0.5 * 0.004 * 7.0 ** 2)
-  assert math.isclose(command.path_angle, 0.004 * 7.0)
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
   assert math.isclose(command.curvature, 0.004)
   assert command.curvature_rate == 0.0
 
@@ -45,7 +45,7 @@ def test_preview_authority_disappears_when_wheel_is_on_the_path():
   assert math.isclose(command.curvature, 0.004)
 
 
-def test_preview_authority_reverses_when_wheel_is_ahead_of_the_path():
+def test_ordinary_c2_is_not_contaminated_by_wheel_tracking_error():
   controller = ProjectedLatControlPath()
 
   command = controller.update(
@@ -54,12 +54,12 @@ def test_preview_authority_reverses_when_wheel_is_ahead_of_the_path():
     projected_measured_curvature=0.006,
   )
 
-  assert command.path_offset < 0.0
-  assert command.path_angle < 0.0
-  assert command.curvature > 0.0
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert math.isclose(command.curvature, 0.004)
 
 
-def test_c0_c1_cover_large_c2_while_its_anchor_builds():
+def test_large_maneuver_transfers_c2_fully_into_fast_coefficients():
   controller = ProjectedLatControlPath()
 
   command = controller.update(
@@ -68,12 +68,13 @@ def test_c0_c1_cover_large_c2_while_its_anchor_builds():
     projected_measured_curvature=0.0,
   )
 
-  assert math.isclose(command.curvature, 0.0002)
-  assert math.isclose(command.path_offset, 0.5 * 0.014 * 7.0 ** 2)
-  assert math.isclose(command.path_angle, 0.014 * 7.0)
+  assert command.curvature == 0.0
+  assert command.path_offset < 0.0
+  assert command.path_angle > 0.0
+  assert math.isclose(command_equivalent_curvature(command), 0.028)
 
 
-def test_spatial_slope_uses_the_same_preview_origin_for_c0_and_c1():
+def test_small_spatial_slope_does_not_disturb_ordinary_c2():
   controller = ProjectedLatControlPath()
 
   command = controller.update(
@@ -82,9 +83,23 @@ def test_spatial_slope_uses_the_same_preview_origin_for_c0_and_c1():
     projected_measured_curvature=0.004,
   )
 
-  assert math.isclose(command.path_offset, 0.0004 * 7.0 ** 3 / 6.0)
-  assert math.isclose(command.path_angle, 0.5 * 0.0004 * 7.0 ** 2)
-  assert math.isclose(command.curvature_rate, 0.0002)
+  assert command.path_offset == 0.0
+  assert command.path_angle == 0.0
+  assert math.isclose(command.curvature, 0.004)
+  assert command.curvature_rate == 0.0
+
+
+def test_model_supported_reversal_uses_fast_coefficients_and_zeros_c2():
+  controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    path(c0=0.12, c2=-0.002), measured_curvature=-0.006, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.006,
+  )
+
+  assert command.curvature == 0.0
+  assert command_equivalent_curvature(command) > 0.0
 
 
 def test_pscm_limit_blocks_outward_growth_but_allows_release():
@@ -124,12 +139,12 @@ def test_driver_override_and_release_are_bumpless():
     projected_measured_curvature=0.007,
   )
 
-  assert override.path_offset == 0.0
-  assert override.path_angle == 0.0
-  assert math.isclose(override.curvature, 0.007)
-  assert resumed.curvature > override.curvature
-  assert resumed.path_offset > 0.0
+  assert override.path_offset > 0.0
   assert resumed.path_angle > 0.0
+  assert override.curvature == 0.0
+  assert resumed.curvature == 0.0
+  assert command_equivalent_curvature(override) > 0.0
+  assert command_equivalent_curvature(resumed) > 0.0
 
 
 def test_left_and_right_paths_are_symmetric():

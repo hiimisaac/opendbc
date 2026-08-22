@@ -15,9 +15,10 @@ PATH_LIMITS = (
 PATH_MIN_PREVIEW_DISTANCE = 7.0
 PATH_MAX_PREVIEW_DISTANCE = 12.0
 PATH_PREVIEW_TIME = 0.35
-PATH_C2_BASEBAND = 0.006
-PATH_C2_SLEW = 0.0002
-PATH_C3_SLEW = 0.0002
+PATH_C2_MANEUVER_BP = (0.006, 0.012)
+PATH_C3_MANEUVER_BP = (0.003, 0.006)
+PATH_PREVIEW_GEOMETRY_BP = (0.0015, 0.0045)
+PATH_TRACKING_ERROR_BP = (0.003, 0.006)
 
 
 @dataclass(frozen=True)
@@ -40,20 +41,12 @@ def _clip(value: float, limits: tuple[float, float]) -> float:
   return min(max(value, limits[0]), limits[1])
 
 
-def _limit_attack(value: float, last: float, max_step: float) -> float:
-  """Limit authority growth while allowing an immediate reduction."""
-  if value * last < 0.0:
-    return math.copysign(min(abs(value), max_step), value)
-  if abs(value) > abs(last):
-    return math.copysign(min(abs(value), abs(last) + max_step), value)
-  return value
-
-
-def _apply_c2_attack(value: float, last: float) -> float:
-  """Keep ordinary curvature immediate and bound only large C2 transitions."""
-  if value * last >= 0.0 and abs(value) <= PATH_C2_BASEBAND:
-    return value
-  return _limit_attack(value, last, PATH_C2_SLEW)
+def _interp(value: float, lower: float, upper: float) -> float:
+  if value <= lower:
+    return 0.0
+  if value >= upper:
+    return 1.0
+  return (value - lower) / (upper - lower)
 
 
 def _basis(distance: float) -> tuple[float, float, float, float]:
@@ -83,9 +76,16 @@ def _path_pose(coefficients: tuple[float, float, float, float],
   return offset, angle
 
 
-def _vehicle_pose(curvature: float, distance: float) -> tuple[float, float]:
-  """Project the delivered wheel arc over the same spatial preview."""
-  return 0.5 * curvature * distance ** 2, curvature * distance
+def _conservative_tracking_error(target: float, measured: float, projected: float) -> float:
+  """Use projected wheel motion only while it approaches target without crossing."""
+  measured_error = target - measured
+  projected_error = target - projected
+  projected_motion = projected - measured
+  if measured_error == 0.0 or projected_motion * measured_error <= 0.0:
+    return measured_error
+  if projected_error * measured_error <= 0.0:
+    return 0.0
+  return projected_error if abs(projected_error) < abs(measured_error) else measured_error
 
 
 def _constrain_outward_growth(coefficients: tuple[float, float, float, float],
@@ -143,13 +143,9 @@ class ProjectedLatControlPath:
 
   def __init__(self):
     self._last_command = LateralPathCommand()
-    self._last_c2 = 0.0
-    self._last_c3 = 0.0
 
   def _reset(self) -> LateralPathCommand:
     self._last_command = LateralPathCommand()
-    self._last_c2 = 0.0
-    self._last_c3 = 0.0
     return self._last_command
 
   def update(self, path, measured_curvature: float, v_ego: float,
@@ -173,30 +169,81 @@ class ProjectedLatControlPath:
     )
 
     if driver_override:
-      curvature = _clip(measured_curvature, PATH_LIMITS[2])
-      command = LateralPathCommand(valid=valid, curvature=curvature)
+      distance = _preview_distance(v_ego)
+      command = LateralPathCommand(
+        valid=valid,
+        path_offset=_clip(0.5 * measured_curvature * distance ** 2, PATH_LIMITS[0]),
+        path_angle=_clip(measured_curvature * distance, PATH_LIMITS[1]),
+      )
       self._last_command = command
-      self._last_c2 = curvature
-      self._last_c3 = 0.0
       return command
 
-    target_c2 = _clip(raw[2], PATH_LIMITS[2])
-    anchored_c2 = _apply_c2_attack(target_c2, self._last_c2)
-    target_c3 = _clip(raw[3], PATH_LIMITS[3])
-    allocated_c3 = _limit_attack(target_c3, self._last_c3, PATH_C3_SLEW)
-
-    if valid:
-      distance = _preview_distance(v_ego)
-      desired_offset, desired_angle = _path_pose(raw, distance)
-      vehicle_offset, vehicle_angle = _vehicle_pose(projected_curvature, distance)
-      coefficients = (
-        _clip(desired_offset - vehicle_offset, PATH_LIMITS[0]),
-        _clip(desired_angle - vehicle_angle, PATH_LIMITS[1]),
-        anchored_c2,
-        allocated_c3,
+    if not valid:
+      command = LateralPathCommand(
+        curvature=_clip(raw[2], PATH_LIMITS[2]),
       )
-    else:
-      coefficients = (0.0, 0.0, anchored_c2, 0.0)
+      self._last_command = command
+      return command
+
+    distance = _preview_distance(v_ego)
+    target_equivalent = _equivalent_curvature(raw, distance)
+    preview_equivalent = target_equivalent - raw[2]
+    tracking_error = _conservative_tracking_error(
+      target_equivalent,
+      measured_curvature,
+      projected_curvature,
+    )
+
+    maneuver_share = max(
+      _interp(abs(raw[2]), *PATH_C2_MANEUVER_BP),
+      _interp(abs(raw[3]) * distance / 3.0, *PATH_C3_MANEUVER_BP),
+    )
+    preview_magnitude_share = _interp(
+      abs(preview_equivalent),
+      *PATH_PREVIEW_GEOMETRY_BP,
+    )
+    preview_support = preview_magnitude_share \
+      if preview_equivalent * tracking_error > 0.0 else 0.0
+    release_share = preview_support * _interp(
+      abs(tracking_error),
+      *PATH_TRACKING_ERROR_BP,
+    )
+    ownership_share = max(maneuver_share, release_share)
+
+    # C2 owns ordinary driving and is exactly zero at full maneuver ownership.
+    # C3 is spatial geometry only; it never carries action/model disagreement.
+    allocated_c2 = raw[2] * (1.0 - ownership_share)
+    allocated_c3 = raw[3] * maneuver_share
+
+    # Fade model preview geometry independently from coefficient ownership.
+    # This keeps tiny ordinary model noise out of C0/C1 without coupling the
+    # requested path to measured wheel error.
+    geometry_share = max(maneuver_share, preview_magnitude_share)
+    desired_offset, desired_angle = _path_pose(raw, distance)
+    ordinary_offset = 0.5 * raw[2] * distance ** 2
+    ordinary_angle = raw[2] * distance
+    desired_offset = ordinary_offset + geometry_share * (desired_offset - ordinary_offset)
+    desired_angle = ordinary_angle + geometry_share * (desired_angle - ordinary_angle)
+
+    # Algebraically transfer the path endpoint and heading from C2 into the
+    # fast coefficients. This changes coefficient ownership, not the path.
+    c1 = desired_angle - allocated_c2 * distance - 0.5 * allocated_c3 * distance ** 2
+    c0 = desired_offset - c1 * distance - 0.5 * allocated_c2 * distance ** 2 - \
+         allocated_c3 * distance ** 3 / 6.0
+
+    # Add the projected tracking error once, and only while fast coefficients
+    # own the maneuver. Ordinary C2 driving remains untouched.
+    feedback = tracking_error * ownership_share
+    c0 += 0.25 * feedback * distance ** 2
+    c1 += 0.25 * feedback * distance
+    coefficients = tuple(
+      _clip(value, limits)
+      for value, limits in zip(
+        (c0, c1, allocated_c2, allocated_c3),
+        PATH_LIMITS,
+        strict=True,
+      )
+    )
 
     coefficients = _constrain_outward_growth(
       coefficients,
@@ -211,9 +258,4 @@ class ProjectedLatControlPath:
       curvature_rate=coefficients[3],
     )
     self._last_command = command
-    # The next attack limit must start at the command the PSCM actually saw.
-    # This only differs from the allocated targets when limit feedback forced
-    # us to retain the previous command.
-    self._last_c2 = command.curvature
-    self._last_c3 = command.curvature_rate
     return command
