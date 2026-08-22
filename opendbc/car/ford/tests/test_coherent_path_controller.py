@@ -69,9 +69,23 @@ def test_large_maneuver_transfers_c2_fully_into_fast_coefficients():
   )
 
   assert command.curvature == 0.0
-  assert command.path_offset < 0.0
+  assert command.path_offset > 0.0
   assert command.path_angle > 0.0
   assert math.isclose(command_equivalent_curvature(command), 0.028)
+
+
+def test_verified_large_undertracking_retains_fast_ownership():
+  controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    path(c2=0.008), measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+  )
+
+  assert 0.0 < command.curvature < 0.004
+  assert command.path_offset > 0.0
+  assert command.path_angle > 0.0
 
 
 def test_small_spatial_slope_does_not_disturb_ordinary_c2():

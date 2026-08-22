@@ -16,6 +16,7 @@ PATH_MIN_PREVIEW_DISTANCE = 7.0
 PATH_MAX_PREVIEW_DISTANCE = 12.0
 PATH_PREVIEW_TIME = 0.35
 PATH_C2_MANEUVER_BP = (0.006, 0.012)
+PATH_C2_UNDERTRACKING_BP = (0.006, 0.009)
 PATH_C3_MANEUVER_BP = (0.003, 0.006)
 PATH_PREVIEW_GEOMETRY_BP = (0.0015, 0.0045)
 PATH_TRACKING_ERROR_BP = (0.003, 0.006)
@@ -208,7 +209,13 @@ class ProjectedLatControlPath:
       abs(tracking_error),
       *PATH_TRACKING_ERROR_BP,
     )
-    ownership_share = max(maneuver_share, release_share)
+    undertracking_share = 0.0
+    if tracking_error * target_equivalent > 0.0:
+      undertracking_share = min(
+        _interp(abs(raw[2]), *PATH_C2_UNDERTRACKING_BP),
+        _interp(abs(tracking_error), *PATH_TRACKING_ERROR_BP),
+      )
+    ownership_share = max(maneuver_share, release_share, undertracking_share)
 
     # C2 owns ordinary driving and is exactly zero at full maneuver ownership.
     # C3 is spatial geometry only; it never carries action/model disagreement.
@@ -219,23 +226,21 @@ class ProjectedLatControlPath:
     # This keeps tiny ordinary model noise out of C0/C1 without coupling the
     # requested path to measured wheel error.
     geometry_share = max(maneuver_share, preview_magnitude_share)
-    desired_offset, desired_angle = _path_pose(raw, distance)
+    desired_offset, _ = _path_pose(raw, distance)
     ordinary_offset = 0.5 * raw[2] * distance ** 2
-    ordinary_angle = raw[2] * distance
     desired_offset = ordinary_offset + geometry_share * (desired_offset - ordinary_offset)
-    desired_angle = ordinary_angle + geometry_share * (desired_angle - ordinary_angle)
 
-    # Algebraically transfer the path endpoint and heading from C2 into the
-    # fast coefficients. This changes coefficient ownership, not the path.
-    c1 = desired_angle - allocated_c2 * distance - 0.5 * allocated_c3 * distance ** 2
-    c0 = desired_offset - c1 * distance - 0.5 * allocated_c2 * distance ** 2 - \
-         allocated_c3 * distance ** 3 / 6.0
-
-    # Add the projected tracking error once, and only while fast coefficients
-    # own the maneuver. Ordinary C2 driving remains untouched.
+    # Add projected tracking error once, and only while fast coefficients own
+    # the maneuver. Ordinary C2 driving remains untouched.
     feedback = tracking_error * ownership_share
-    c0 += 0.25 * feedback * distance ** 2
-    c1 += 0.25 * feedback * distance
+    desired_equivalent = 2.0 * desired_offset / distance ** 2
+    fast_equivalent = desired_equivalent - allocated_c2 - allocated_c3 * distance / 3.0 + feedback
+
+    # C0 and C1 are independent fast PSCM inputs, not a lossless replacement
+    # for C2. Split their equivalent-curvature contribution evenly so they
+    # reinforce one another without adding a vehicle-specific gain.
+    c0 = 0.5 * fast_equivalent / _basis(distance)[0]
+    c1 = 0.5 * fast_equivalent / _basis(distance)[1]
     coefficients = tuple(
       _clip(value, limits)
       for value, limits in zip(
