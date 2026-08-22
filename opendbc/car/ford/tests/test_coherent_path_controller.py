@@ -69,9 +69,78 @@ def test_large_maneuver_transfers_c2_fully_into_fast_coefficients():
   )
 
   assert command.curvature == 0.0
-  assert command.path_offset > 0.0
+  assert command.path_offset >= 0.0
   assert command.path_angle > 0.0
-  assert math.isclose(command_equivalent_curvature(command), 0.028)
+  assert math.isclose(command_equivalent_curvature(command), 0.014)
+
+
+def test_wheel_ahead_does_not_reverse_a_model_supported_turn():
+  controller = ProjectedLatControlPath()
+
+  requested = path(c2=-0.0365018, c3=0.0084159)
+  command = controller.update(
+    requested, measured_curvature=-0.06, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.06,
+    desired_angle_curvature=-0.03,
+  )
+
+  requested_curvature = 2.0 * requested.pathOffset / 7.0 ** 2 + 2.0 * requested.pathAngle / 7.0 + \
+                        requested.curvature + requested.curvatureRate * 7.0 / 3.0
+  assert requested_curvature < 0.0
+  assert math.isclose(command_equivalent_curvature(command), requested_curvature, abs_tol=1e-9)
+
+
+def test_fast_coefficients_fit_the_model_across_multiple_horizons():
+  controller = ProjectedLatControlPath()
+
+  requested = path(c2=-0.0625301, c3=0.0044267)
+  command = controller.update(
+    requested, measured_curvature=-0.08, v_ego=2.97,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.08,
+  )
+
+  horizons = (3.0, 5.0, 7.0, 10.0)
+  errors = [
+    command_equivalent_curvature(command, distance) - path_equivalent_curvature(requested, distance)
+    for distance in horizons
+  ]
+  rms_error = math.sqrt(sum(error ** 2 for error in errors) / len(errors))
+
+  assert math.isclose(command_equivalent_curvature(command), path_equivalent_curvature(requested), abs_tol=1e-9)
+  assert rms_error < 0.05
+
+
+def test_clipped_c3_cannot_overrun_the_active_preview_target():
+  controller = ProjectedLatControlPath()
+
+  requested = path(c2=-0.01, c3=0.005)
+  command = controller.update(
+    requested, measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+  )
+
+  assert path_equivalent_curvature(requested) > 0.0
+  assert math.isclose(
+    command_equivalent_curvature(command),
+    path_equivalent_curvature(requested),
+    abs_tol=1e-9,
+  )
+
+
+def test_large_maneuver_adds_bounded_angle_authority_only_while_behind():
+  controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    path(c2=0.014), measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.01,
+  )
+
+  assert math.isclose(command_equivalent_curvature(command), 0.024, abs_tol=1e-9)
 
 
 def test_verified_large_undertracking_retains_fast_ownership():
@@ -84,8 +153,9 @@ def test_verified_large_undertracking_retains_fast_ownership():
   )
 
   assert 0.0 < command.curvature < 0.004
-  assert command.path_offset > 0.0
+  assert command.path_offset >= 0.0
   assert command.path_angle > 0.0
+  assert math.isclose(command_equivalent_curvature(command), 0.008)
 
 
 def test_small_spatial_slope_does_not_disturb_ordinary_c2():
@@ -123,10 +193,17 @@ def test_pscm_limit_blocks_outward_growth_but_allows_release():
     active=True, driver_override=False,
     projected_measured_curvature=0.002,
   )
+  unconstrained = ProjectedLatControlPath().update(
+    path(c2=0.008), measured_curvature=0.002, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.002,
+    desired_angle_curvature=0.02,
+  )
   constrained = controller.update(
     path(c2=0.008), measured_curvature=0.002, v_ego=5.0,
     active=True, driver_override=False,
     projected_measured_curvature=0.002,
+    desired_angle_curvature=0.02,
     lat_ctl_limit=1,
   )
   released = controller.update(
@@ -136,6 +213,7 @@ def test_pscm_limit_blocks_outward_growth_but_allows_release():
     lat_ctl_limit=2,
   )
 
+  assert command_equivalent_curvature(unconstrained) > command_equivalent_curvature(baseline)
   assert abs(command_equivalent_curvature(constrained)) <= abs(command_equivalent_curvature(baseline)) + 1e-9
   assert command_equivalent_curvature(released) < command_equivalent_curvature(constrained)
 
@@ -161,6 +239,48 @@ def test_driver_override_and_release_are_bumpless():
   assert command_equivalent_curvature(resumed) > 0.0
 
 
+def test_driver_release_immediately_restores_the_model_path():
+  controller = ProjectedLatControlPath()
+  requested = path(c2=0.0117)
+  controller.update(
+    requested, measured_curvature=0.018, v_ego=5.0,
+    active=True, driver_override=True,
+    projected_measured_curvature=0.018,
+  )
+
+  resumed = controller.update(
+    requested, measured_curvature=0.018, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.018,
+    desired_angle_curvature=0.006,
+  )
+
+  assert math.isclose(
+    command_equivalent_curvature(resumed),
+    path_equivalent_curvature(requested),
+    abs_tol=1e-9,
+  )
+
+
+def test_model_turn_exit_releases_without_retained_angle_authority():
+  controller = ProjectedLatControlPath()
+  controller.update(
+    path(c2=-0.03, c3=0.006), measured_curvature=-0.01, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.01,
+    desired_angle_curvature=-0.02,
+  )
+
+  released = controller.update(
+    path(), measured_curvature=-0.02, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.015,
+    desired_angle_curvature=0.0,
+  )
+
+  assert released.coefficients() == (0.0, 0.0, 0.0, 0.0)
+
+
 def test_left_and_right_paths_are_symmetric():
   left = ProjectedLatControlPath().update(
     path(c2=0.005, c3=0.0003), measured_curvature=0.001, v_ego=8.0,
@@ -177,9 +297,14 @@ def test_left_and_right_paths_are_symmetric():
     assert math.isclose(left_value, -right_value)
 
 
-def command_equivalent_curvature(command) -> float:
+def command_equivalent_curvature(command, distance: float = 7.0) -> float:
   c0, c1, c2, c3 = command.coefficients()
-  return 2.0 * c0 / 7.0 ** 2 + 2.0 * c1 / 7.0 + c2 + c3 * 7.0 / 3.0
+  return 2.0 * c0 / distance ** 2 + 2.0 * c1 / distance + c2 + c3 * distance / 3.0
+
+
+def path_equivalent_curvature(requested, distance: float = 7.0) -> float:
+  return 2.0 * requested.pathOffset / distance ** 2 + 2.0 * requested.pathAngle / distance + \
+         requested.curvature + requested.curvatureRate * distance / 3.0
 
 
 def test_driver_override_requires_torque_opposing_the_angle_request():

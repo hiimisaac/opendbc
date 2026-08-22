@@ -20,6 +20,7 @@ PATH_C2_UNDERTRACKING_BP = (0.006, 0.009)
 PATH_C3_MANEUVER_BP = (0.003, 0.006)
 PATH_PREVIEW_GEOMETRY_BP = (0.0015, 0.0045)
 PATH_TRACKING_ERROR_BP = (0.003, 0.006)
+PATH_FIT_HORIZONS = (3.0, 5.0, 7.0, 10.0)
 
 
 @dataclass(frozen=True)
@@ -69,12 +70,123 @@ def _preview_distance(v_ego: float) -> float:
   )
 
 
-def _path_pose(coefficients: tuple[float, float, float, float],
-               distance: float) -> tuple[float, float]:
-  c0, c1, c2, c3 = coefficients
-  offset = c0 + c1 * distance + 0.5 * c2 * distance ** 2 + c3 * distance ** 3 / 6.0
-  angle = c1 + c2 * distance + 0.5 * c3 * distance ** 2
-  return offset, angle
+def _fit_box_coefficients(rows: list[tuple[float, float, float, float]],
+                          lower: tuple[float, float],
+                          upper: tuple[float, float]) -> tuple[float, float]:
+  """Solve a weighted two-variable least-squares fit inside a box."""
+  candidates: list[tuple[float, float]] = []
+  s00 = sum(weight * a0 * a0 for weight, a0, _, _ in rows)
+  s01 = sum(weight * a0 * a1 for weight, a0, a1, _ in rows)
+  s11 = sum(weight * a1 * a1 for weight, _, a1, _ in rows)
+  t0 = sum(weight * a0 * target for weight, a0, _, target in rows)
+  t1 = sum(weight * a1 * target for weight, _, a1, target in rows)
+  determinant = s00 * s11 - s01 ** 2
+  if abs(determinant) > 1e-12:
+    solution = (
+      (t0 * s11 - t1 * s01) / determinant,
+      (t1 * s00 - t0 * s01) / determinant,
+    )
+    if all(lower[index] <= solution[index] <= upper[index] for index in (0, 1)):
+      candidates.append(solution)
+
+  for fixed_index in (0, 1):
+    free_index = 1 - fixed_index
+    for fixed in (lower[fixed_index], upper[fixed_index]):
+      denominator = sum(weight * row[free_index] ** 2 for weight, *row, _ in rows)
+      numerator = sum(
+        weight * row[free_index] * (target - row[fixed_index] * fixed)
+        for weight, *row, target in rows
+      )
+      free = 0.0 if denominator == 0.0 else numerator / denominator
+      values = [0.0, 0.0]
+      values[fixed_index] = fixed
+      values[free_index] = _clip(free, (lower[free_index], upper[free_index]))
+      candidates.append((values[0], values[1]))
+
+  candidates.extend(
+    (c0, c1)
+    for c0 in (lower[0], upper[0])
+    for c1 in (lower[1], upper[1])
+  )
+  return min(
+    candidates,
+    key=lambda values: sum(
+      weight * (a0 * values[0] + a1 * values[1] - target) ** 2
+      for weight, a0, a1, target in rows
+    ),
+  )
+
+
+def _fit_fast_coefficients(desired: tuple[float, float, float, float],
+                           allocated_c2: float, allocated_c3: float,
+                           anchor_distance: float,
+                           direction: float) -> tuple[float, float]:
+  """Fit C0/C1 across space while preserving the active preview target."""
+  rows = []
+  for distance in PATH_FIT_HORIZONS:
+    a0, a1, _, _ = _basis(distance)
+    target = _equivalent_curvature(desired, distance) - allocated_c2 - allocated_c3 * distance / 3.0
+    rows.append((PATH_MIN_PREVIEW_DISTANCE / distance, a0, a1, target))
+
+  lower = [PATH_LIMITS[0][0], PATH_LIMITS[1][0]]
+  upper = [PATH_LIMITS[0][1], PATH_LIMITS[1][1]]
+  if direction > 0.0:
+    lower = [max(value, 0.0) for value in lower]
+  elif direction < 0.0:
+    upper = [min(value, 0.0) for value in upper]
+
+  anchor_a0, anchor_a1, _, _ = _basis(anchor_distance)
+  anchor_target = _equivalent_curvature(desired, anchor_distance) - \
+                  allocated_c2 - allocated_c3 * anchor_distance / 3.0
+  c1_lower = max(lower[1], (anchor_target - anchor_a0 * upper[0]) / anchor_a1)
+  c1_upper = min(upper[1], (anchor_target - anchor_a0 * lower[0]) / anchor_a1)
+  if c1_lower <= c1_upper:
+    constant_scale = anchor_target / anchor_a0
+    anchor_ratio = anchor_a1 / anchor_a0
+    numerator = 0.0
+    denominator = 0.0
+    for weight, a0, a1, target in rows:
+      constant = a0 * constant_scale
+      slope = a1 - a0 * anchor_ratio
+      numerator += weight * slope * (target - constant)
+      denominator += weight * slope ** 2
+    c1 = _clip(
+      0.0 if denominator == 0.0 else numerator / denominator,
+      (c1_lower, c1_upper),
+    )
+    c0 = (anchor_target - anchor_a1 * c1) / anchor_a0
+    return c0, c1
+
+  # An exact anchor can become infeasible when a clipped C3 alone exceeds the
+  # target while C0/C1 are constrained to reinforce the requested direction.
+  # In that case return the closest bounded spatial fit instead of opposing it.
+  return _fit_box_coefficients(rows, (lower[0], lower[1]), (upper[0], upper[1]))
+
+
+def _bound_nonfast_anchor(desired: tuple[float, float, float, float],
+                          allocated_c2: float, allocated_c3: float,
+                          anchor_distance: float) -> tuple[float, float]:
+  """Keep allocated C2/C3 from overrunning the active-preview target."""
+  anchor_target = _equivalent_curvature(desired, anchor_distance)
+  if abs(anchor_target) < 1e-12:
+    return allocated_c2, allocated_c3
+
+  direction = math.copysign(1.0, anchor_target)
+  nonfast_anchor = allocated_c2 + allocated_c3 * anchor_distance / 3.0
+  excess = direction * nonfast_anchor - abs(anchor_target)
+  if excess <= 0.0:
+    return allocated_c2, allocated_c3
+
+  # C3 is the clipped, maneuver-only geometry term, so give it back first.
+  c3_anchor = direction * allocated_c3 * anchor_distance / 3.0
+  c3_reduction = min(excess, max(c3_anchor, 0.0))
+  allocated_c3 -= direction * c3_reduction * 3.0 / anchor_distance
+  excess -= c3_reduction
+
+  # C2 can also overrun the anchor around a mixed-sign transition.
+  c2_reduction = min(excess, max(direction * allocated_c2, 0.0))
+  allocated_c2 -= direction * c2_reduction
+  return allocated_c2, allocated_c3
 
 
 def _conservative_tracking_error(target: float, measured: float, projected: float) -> float:
@@ -152,10 +264,13 @@ class ProjectedLatControlPath:
   def update(self, path, measured_curvature: float, v_ego: float,
              active: bool, driver_override: bool,
              projected_measured_curvature: float | None = None,
+             desired_angle_curvature: float | None = None,
              lat_ctl_limit: int = 0) -> LateralPathCommand:
     measured_curvature = _finite(measured_curvature)
     projected_curvature = measured_curvature if projected_measured_curvature is None else \
                           _finite(projected_measured_curvature, measured_curvature)
+    desired_angle_curvature = None if desired_angle_curvature is None else \
+                              _finite(desired_angle_curvature)
     v_ego = max(_finite(v_ego), 0.0)
 
     if not active:
@@ -219,28 +334,55 @@ class ProjectedLatControlPath:
 
     # C2 owns ordinary driving and is exactly zero at full maneuver ownership.
     # C3 is spatial geometry only; it never carries action/model disagreement.
-    allocated_c2 = raw[2] * (1.0 - ownership_share)
-    allocated_c3 = raw[3] * maneuver_share
+    allocated_c2 = _clip(raw[2] * (1.0 - ownership_share), PATH_LIMITS[2])
+    allocated_c3 = _clip(raw[3] * maneuver_share, PATH_LIMITS[3])
 
     # Fade model preview geometry independently from coefficient ownership.
     # This keeps tiny ordinary model noise out of C0/C1 without coupling the
     # requested path to measured wheel error.
     geometry_share = max(maneuver_share, preview_magnitude_share)
-    desired_offset, _ = _path_pose(raw, distance)
-    ordinary_offset = 0.5 * raw[2] * distance ** 2
-    desired_offset = ordinary_offset + geometry_share * (desired_offset - ordinary_offset)
+    desired_path = (
+      raw[0] * geometry_share,
+      raw[1] * geometry_share,
+      raw[2],
+      raw[3] * geometry_share,
+    )
+    allocated_c2, allocated_c3 = _bound_nonfast_anchor(
+      desired_path,
+      allocated_c2,
+      allocated_c3,
+      distance,
+    )
 
-    # Add projected tracking error once, and only while fast coefficients own
-    # the maneuver. Ordinary C2 driving remains untouched.
-    feedback = tracking_error * ownership_share
-    desired_equivalent = 2.0 * desired_offset / distance ** 2
-    fast_equivalent = desired_equivalent - allocated_c2 - allocated_c3 * distance / 3.0 + feedback
+    # Fit the fast coefficients across space while matching the active preview
+    # exactly. Both coefficients reinforce the maneuver instead of canceling
+    # one another to reproduce an unclippable polynomial.
+    c0, c1 = _fit_fast_coefficients(
+      desired_path,
+      allocated_c2,
+      allocated_c3,
+      distance,
+      target_equivalent,
+    )
 
-    # C0 and C1 are independent fast PSCM inputs, not a lossless replacement
-    # for C2. Split their equivalent-curvature contribution evenly so they
-    # reinforce one another without adding a vehicle-specific gain.
-    c0 = 0.5 * fast_equivalent / _basis(distance)[0]
-    c1 = 0.5 * fast_equivalent / _basis(distance)[1]
+    # Measured steering may only extend the complete model path while both the
+    # measured and projected wheel remain behind the current desired angle.
+    # It can never subtract from or reverse the model command.
+    feedback = 0.0
+    if desired_angle_curvature is not None and lat_ctl_limit not in (1, 2):
+      angle_error = _conservative_tracking_error(
+        desired_angle_curvature,
+        measured_curvature,
+        projected_curvature,
+      )
+      if angle_error * desired_angle_curvature > 0.0 and \
+         angle_error * target_equivalent > 0.0:
+        feedback = math.copysign(
+          ownership_share * min(abs(angle_error), abs(desired_angle_curvature)),
+          angle_error,
+        )
+    c0 += 0.5 * feedback / _basis(distance)[0]
+    c1 += 0.5 * feedback / _basis(distance)[1]
     coefficients = tuple(
       _clip(value, limits)
       for value, limits in zip(
