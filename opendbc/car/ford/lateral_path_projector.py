@@ -228,6 +228,30 @@ def _constrain_outward_growth(coefficients: tuple[float, float, float, float],
   return previous
 
 
+def _apply_fast_error_arc(coefficients: tuple[float, float, float, float],
+                          curvature_error: float,
+                          distance: float) -> tuple[float, float, float, float]:
+  """Express one steering shortfall as a bounded C0/C1 path-pose correction."""
+  if curvature_error == 0.0:
+    return coefficients
+
+  deltas = (
+    0.5 * curvature_error * distance ** 2,
+    curvature_error * distance,
+  )
+  scale = 1.0
+  for index, delta in enumerate(deltas):
+    if delta == 0.0:
+      continue
+    limit = PATH_LIMITS[index][1] if delta > 0.0 else PATH_LIMITS[index][0]
+    scale = min(scale, max((limit - coefficients[index]) / delta, 0.0))
+
+  values = list(coefficients)
+  values[0] += scale * deltas[0]
+  values[1] += scale * deltas[1]
+  return tuple(values)
+
+
 def lmc2_control_utilization(command: LateralPathCommand, lat_ctl_limit: int) -> float:
   """Return signed coefficient-envelope usage augmented by PSCM limit status."""
   coefficients = command.coefficients()
@@ -377,12 +401,19 @@ class ProjectedLatControlPath:
       )
       if angle_error * desired_angle_curvature > 0.0 and \
          angle_error * target_equivalent > 0.0:
+        feedback_share = max(
+          ownership_share,
+          _interp(abs(desired_angle_curvature), *PATH_C2_MANEUVER_BP),
+        )
         feedback = math.copysign(
-          ownership_share * min(abs(angle_error), abs(desired_angle_curvature)),
+          feedback_share * min(abs(angle_error), abs(desired_angle_curvature)),
           angle_error,
         )
-    c0 += 0.5 * feedback / _basis(distance)[0]
-    c1 += 0.5 * feedback / _basis(distance)[1]
+    c0, c1, allocated_c2, allocated_c3 = _apply_fast_error_arc(
+      (c0, c1, allocated_c2, allocated_c3),
+      feedback,
+      distance,
+    )
     coefficients = tuple(
       _clip(value, limits)
       for value, limits in zip(

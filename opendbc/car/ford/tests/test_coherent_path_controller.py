@@ -59,6 +59,17 @@ def test_ordinary_c2_is_not_contaminated_by_wheel_tracking_error():
   assert math.isclose(command.curvature, 0.004)
 
 
+def test_ordinary_c2_remains_unmodified_with_production_angle_inputs():
+  command = ProjectedLatControlPath().update(
+    path(c2=0.004), measured_curvature=0.003, v_ego=12.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0035,
+    desired_angle_curvature=0.004,
+  )
+
+  assert command.coefficients() == (0.0, 0.0, 0.004, 0.0)
+
+
 def test_large_maneuver_transfers_c2_fully_into_fast_coefficients():
   controller = ProjectedLatControlPath()
 
@@ -130,7 +141,7 @@ def test_clipped_c3_cannot_overrun_the_active_preview_target():
   )
 
 
-def test_large_maneuver_adds_bounded_angle_authority_only_while_behind():
+def test_large_maneuver_adds_a_coherent_fast_error_arc_while_behind():
   controller = ProjectedLatControlPath()
 
   command = controller.update(
@@ -140,7 +151,76 @@ def test_large_maneuver_adds_bounded_angle_authority_only_while_behind():
     desired_angle_curvature=0.01,
   )
 
-  assert math.isclose(command_equivalent_curvature(command), 0.024, abs_tol=1e-9)
+  assert math.isclose(command_equivalent_curvature(command), 0.044, abs_tol=1e-9)
+
+
+def test_fast_error_arc_disappears_at_projected_arrival():
+  controller = ProjectedLatControlPath()
+
+  command = controller.update(
+    path(c2=0.014), measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.01,
+    desired_angle_curvature=0.01,
+  )
+
+  assert math.isclose(command_equivalent_curvature(command), 0.014, abs_tol=1e-9)
+
+
+def test_fast_error_arc_scales_uniformly_to_coefficient_headroom():
+  requested = path(c0=2.0, c1=0.4, c2=0.014)
+  arrived = ProjectedLatControlPath().update(
+    requested, measured_curvature=0.02, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.02,
+    desired_angle_curvature=0.02,
+  )
+  behind = ProjectedLatControlPath().update(
+    requested, measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.02,
+  )
+
+  c0_delta = behind.path_offset - arrived.path_offset
+  c1_delta = behind.path_angle - arrived.path_angle
+  assert math.isclose(behind.path_angle, 0.497)
+  assert c0_delta > 0.0
+  assert math.isclose(c0_delta / c1_delta, 0.5 * 7.0)
+
+
+def test_negative_fast_error_arc_scales_uniformly_to_asymmetric_headroom():
+  requested = path(c0=-2.0, c1=-0.4, c2=-0.014)
+  arrived = ProjectedLatControlPath().update(
+    requested, measured_curvature=-0.02, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=-0.02,
+    desired_angle_curvature=-0.02,
+  )
+  behind = ProjectedLatControlPath().update(
+    requested, measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=-0.02,
+  )
+
+  c0_delta = behind.path_offset - arrived.path_offset
+  c1_delta = behind.path_angle - arrived.path_angle
+  assert math.isclose(behind.path_angle, -0.475)
+  assert c0_delta < 0.0
+  assert math.isclose(c0_delta / c1_delta, 0.5 * 7.0)
+
+
+def test_large_desired_angle_gets_full_error_arc_with_modest_model_curvature():
+  command = ProjectedLatControlPath().update(
+    path(c2=0.004), measured_curvature=0.0, v_ego=5.0,
+    active=True, driver_override=False,
+    projected_measured_curvature=0.0,
+    desired_angle_curvature=0.014,
+  )
+
+  assert math.isclose(command.curvature, 0.004)
+  assert math.isclose(command_equivalent_curvature(command), 0.046, abs_tol=1e-9)
 
 
 def test_verified_large_undertracking_retains_fast_ownership():
