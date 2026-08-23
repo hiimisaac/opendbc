@@ -1,14 +1,12 @@
+from hashlib import sha256
+from struct import pack
 from types import SimpleNamespace
 
 from opendbc.car.ford.lateral_path_projector import (
   PATH_C0_CONTINUATION_MARGIN,
   LateralPathCommand,
   ProjectedLatControlPath,
-  _c2_handoff_residual_share,
-  _equivalent_curvature,
-  _extend_c0_c1_for_geometry_shortfall,
   lmc2_control_utilization,
-  _taper_stale_outward_preview,
 )
 
 
@@ -48,6 +46,39 @@ def equivalent_curvature(command, distance: float) -> float:
   y = path_offset + path_angle * distance + 0.5 * command.curvature * distance ** 2 + \
       curvature_rate * distance ** 3 / 6.0
   return 2.0 * y / distance ** 2
+
+
+def test_controller_sequence_matches_tsfdo_golden_output():
+  """Protect the complete stateful C0-C3 behavior while internals are refactored."""
+  state = 0x5A17C9E3
+
+  def sample(scale: float) -> float:
+    nonlocal state
+    state = (1664525 * state + 1013904223) & 0xFFFFFFFF
+    return ((state / 0xFFFFFFFF) * 2.0 - 1.0) * scale
+
+  controllers = [ProjectedLatControlPath() for _ in range(4)]
+  digest = sha256()
+  for i in range(10000):
+    path = model(sample(6.0), sample(0.7), sample(0.04), sample(0.002))
+    path.valid = i % 197 != 0
+    measured_curvature = sample(0.04)
+    projected_curvature = sample(0.04)
+    desired_curvature = sample(0.05)
+    v_ego = abs(sample(40.0))
+    command = controllers[i % len(controllers)].update(
+      path,
+      measured_curvature,
+      v_ego,
+      i % 271 != 0,
+      i % 113 == 0,
+      projected_measured_curvature=projected_curvature,
+      desired_angle_curvature=desired_curvature,
+      lat_ctl_limit=(0, 0, 0, 1, 2, 3)[i % 6],
+    )
+    digest.update(pack("!?4d", command.valid, *command.coefficients()))
+
+  assert digest.hexdigest() == "7a399cf06008979ff62c3deba2b9401f6dcf88d423a17422f2409f0e78ae5f4c"
 
 
 def test_lmc2_control_utilization_tracks_strongest_coefficient_and_direction():
@@ -993,82 +1024,6 @@ def test_c0_c1_carry_c2_handoff_until_slow_anchor_arrives():
       assert direction * equivalent_curvature(command, 7.0) >= 0.015
 
 
-def test_c0_c1_handoff_is_bumpless_when_measured_wheel_reaches_desired_first():
-  # Captured at 49.60 s in a right turn. The measured wheel has just crossed
-  # desired by 0.00048 curvature, but its projected motion falls behind while
-  # the replacement C2 anchor has delivered only 0.001 of its 0.01979 target.
-  # Dropping C0/C1 here reduced the complete command from 0.028 to 0.0106.
-  full_target = (-1.023405299, -0.134673623, 0.0, 0.0)
-  residual_share = 0.119916234
-  target_c2 = -0.019792420
-  anchored_c2 = -0.001
-  desired = -0.026289789
-
-  bridged_share = _c2_handoff_residual_share(
-    residual_share,
-    full_target,
-    target_c2,
-    anchored_c2,
-    desired,
-    -0.026766363,
-    -0.024140635,
-    0,
-  )
-  bridged_command = (
-    full_target[0] * bridged_share,
-    full_target[1] * bridged_share,
-    anchored_c2,
-    full_target[3],
-  )
-
-  assert abs(_equivalent_curvature(bridged_command)) >= 0.018
-  assert abs(_equivalent_curvature(bridged_command)) <= abs(desired) + 1e-9
-
-
-def test_c0_c1_handoff_does_not_double_count_existing_preview_at_arrival():
-  # One sample earlier, existing C0/C1 already carries at least the desired
-  # angle. The handoff must not add the entire C2 shortfall on top of it.
-  full_target = (-1.057629511, -0.145116130, 0.0, 0.0)
-  residual_share = 0.322197744
-  bridged_share = _c2_handoff_residual_share(
-    residual_share,
-    full_target,
-    -0.015348541,
-    -0.0008,
-    -0.026465200,
-    -0.026584354,
-    -0.022403748,
-    0,
-  )
-
-  assert bridged_share == residual_share
-
-
-def test_c0_c1_handoff_preserves_existing_authority_while_undertracking():
-  # The preceding sample is still genuinely undertracking. Preserve the
-  # established full C2-shortfall bridge rather than applying the new arrival
-  # corridor early and weakening turn authority.
-  full_target = (-1.075147733, -0.153263244, 0.0, 0.0)
-  bridged_share = _c2_handoff_residual_share(
-    0.386818440,
-    full_target,
-    -0.014270190,
-    -0.0006,
-    -0.027180146,
-    -0.027041810,
-    -0.021547687,
-    0,
-  )
-  bridged_command = (
-    full_target[0] * bridged_share,
-    full_target[1] * bridged_share,
-    -0.0006,
-    full_target[3],
-  )
-
-  assert abs(_equivalent_curvature(bridged_command)) >= 0.048
-
-
 def test_coherent_reversal_shortfall_keeps_polynomial_authority_below_spatial_threshold():
   # Captured from a fast left-to-right reversal. The model path, desired
   # steering angle, and spatial slope all continue into the new turn while the
@@ -1218,45 +1173,6 @@ def test_c0_c1_shortfall_extension_stays_out_of_ordinary_highway_curve():
 
   assert command.path_offset == 0.0
   assert command.path_angle == 0.0
-
-
-def test_c0_c1_shortfall_extension_uses_unused_model_geometry_at_full_residual_share():
-  coefficients = (0.0, 0.0, 0.0, 0.0)
-  raw_target = (0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, 0.015, 0.003)
-
-  command = _extend_c0_c1_for_geometry_shortfall(
-    coefficients,
-    raw_target,
-    desired_curvature=0.015,
-    measured_curvature=0.005,
-    projected_curvature=0.005,
-    v_ego=7.0,
-    valid=True,
-    lat_ctl_limit=0,
-    residual_share=1.0,
-  )
-
-  assert 0.0 < command[0] <= raw_target[0]
-  assert 0.0 < command[1] <= raw_target[1]
-
-
-def test_c0_c1_shortfall_extension_remains_zero_at_projected_arrival():
-  coefficients = (0.0, 0.0, 0.0, 0.0)
-  raw_target = (0.5 * 0.015 * 7.0 ** 2, 0.015 * 7.0, 0.015, 0.003)
-
-  command = _extend_c0_c1_for_geometry_shortfall(
-    coefficients,
-    raw_target,
-    desired_curvature=0.015,
-    measured_curvature=0.005,
-    projected_curvature=0.015,
-    v_ego=7.0,
-    valid=True,
-    lat_ctl_limit=0,
-    residual_share=1.0,
-  )
-
-  assert command == coefficients
 
 
 def test_opposite_side_reversal_uses_c0_until_the_wheel_changes_direction():
@@ -1814,30 +1730,6 @@ def test_measured_arrival_release_does_not_delay_immediate_relatch():
   assert arrived_relatch == behind_relatch
 
 
-def test_stale_preview_release_is_continuous_through_desired_zero():
-  coefficients = (1.0, 0.2, 0.004, -0.001)
-  outputs = [
-    _taper_stale_outward_preview(coefficients, -0.003, desired_curvature, 0.020, 7.0)
-    for desired_curvature in (1e-9, 0.0, -1e-9)
-  ]
-
-  for output in outputs:
-    assert output[2:] == coefficients[2:]
-    assert 0.0 <= equivalent_curvature(model(*output), 7.0) <= PATH_C0_CONTINUATION_MARGIN + 2e-9
-  assert max(output[0] for output in outputs) - min(output[0] for output in outputs) < 1e-7
-  assert max(output[1] for output in outputs) - min(output[1] for output in outputs) < 1e-7
-
-
-def test_stale_preview_release_ignores_subthreshold_spatial_noise():
-  coefficients = (1.0, 0.2, 0.004, -0.001)
-
-  output = _taper_stale_outward_preview(
-    coefficients, -0.001, 0.010, 0.020, 7.0,
-  )
-
-  assert output == coefficients
-
-
 def test_ordinary_arrival_releases_stale_preview_with_outward_c3():
   raw_coefficients = (4.253234, 0.512123, 0.000270, 0.003431)
   desired_curvature = 0.000390
@@ -1859,18 +1751,6 @@ def test_ordinary_arrival_releases_stale_preview_with_outward_c3():
     assert command.curvature == 0.0
     assert command.curvature_rate == direction * 0.0002
     assert abs(equivalent_curvature(command, 7.0)) <= desired_curvature + ordinary_arrival_margin + 1e-12
-
-
-def test_ordinary_arrival_releases_preview_when_c3_is_zero_without_touching_c2():
-  coefficients = (1.0, 0.2, 0.004, 0.0)
-
-  output = _taper_stale_outward_preview(
-    coefficients, 0.0, 0.001, 0.020, 7.0,
-  )
-
-  assert output[:2] != coefficients[:2]
-  assert output[2:] == coefficients[2:]
-  assert equivalent_curvature(model(*output), 7.0) <= coefficients[2] + 1e-12
 
 
 def test_ordinary_arrival_release_relatches_immediately_when_desired_moves_outward():
