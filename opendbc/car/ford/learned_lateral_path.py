@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from collections import deque
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import numpy as np
@@ -95,11 +96,35 @@ class LearnedLateralPathCommand:
   curvature: float = 0.0
   curvature_rate: float = 0.0
 
+  def coefficients(self) -> tuple[float, float, float, float]:
+    return self.path_offset, self.path_angle, self.curvature, self.curvature_rate
+
 
 def _equivalent_curvature(coefficients: np.ndarray, distance_m: float) -> float:
   c0, c1, c2, c3 = coefficients
   offset = c0 + c1 * distance_m + 0.5 * c2 * distance_m**2 + c3 * distance_m**3 / 6.0
   return float(2.0 * offset / distance_m**2)
+
+
+def lmc2_control_utilization(command: LearnedLateralPathCommand, lat_ctl_limit: int) -> float:
+  """Return signed command-envelope usage, raised by genuine PSCM limit status."""
+  coefficients = np.asarray(command.coefficients())
+  denominators = np.where(coefficients >= 0.0, COEFFICIENT_LIMITS[:, 1], np.abs(COEFFICIENT_LIMITS[:, 0]))
+  coefficient_utilization = np.abs(coefficients) / denominators
+  coefficient_magnitude = float(np.clip(np.max(coefficient_utilization), 0.0, 1.0))
+  if coefficient_magnitude == 0.0:
+    return 0.0
+
+  magnitude = coefficient_magnitude
+  if lat_ctl_limit == 1:
+    magnitude = max(magnitude, 0.8)
+  elif lat_ctl_limit == 2:
+    magnitude = 1.0
+
+  direction_source = _equivalent_curvature(coefficients, 7.0)
+  if abs(direction_source) < 1e-9:
+    direction_source = float(coefficients[int(np.argmax(coefficient_utilization))])
+  return math.copysign(magnitude, direction_source)
 
 
 class LearnedLateralPathController:

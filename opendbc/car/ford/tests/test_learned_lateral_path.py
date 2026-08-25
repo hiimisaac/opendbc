@@ -1,7 +1,13 @@
 import pytest
 from types import SimpleNamespace
 
-from opendbc.car.ford.learned_lateral_path import LearnedLateralPathController, PathPolynomial, SteeringAngleProjector
+from opendbc.car.ford.learned_lateral_path import (
+  LearnedLateralPathCommand,
+  LearnedLateralPathController,
+  lmc2_control_utilization,
+  PathPolynomial,
+  SteeringAngleProjector,
+)
 
 
 def test_path_polynomial_advances_exactly_in_space():
@@ -39,6 +45,14 @@ def test_angle_projector_exposes_causal_20hz_rate():
 
   assert projector.rate_deg_s == pytest.approx(20.0)
   assert projected == pytest.approx(18.0)
+
+
+def test_lmc2_utilization_preserves_ui_meter_without_legacy_controller():
+  command = LearnedLateralPathCommand(True, 0.0, 0.0, 0.01, 0.0)
+
+  assert lmc2_control_utilization(command, 0) == pytest.approx(0.5)
+  assert lmc2_control_utilization(command, 1) == pytest.approx(0.8)
+  assert lmc2_control_utilization(command, 2) == pytest.approx(1.0)
 
 
 def test_learned_controller_is_bounded_and_inactive_is_zero():
