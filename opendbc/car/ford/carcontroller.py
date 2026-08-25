@@ -5,6 +5,7 @@ from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.learned_lateral_path import (
+  AdaptiveLateralState,
   driver_steering_opposes_command,
   LearnedLateralPathCommand,
   LearnedLateralPathController,
@@ -78,6 +79,15 @@ class CarController(CarControllerBase):
     self.steer_alert_last = False
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
+
+  @property
+  def adaptive_lateral_state(self) -> AdaptiveLateralState:
+    return self.lateral_path_controller.adaptive_state
+
+  def set_adaptive_lateral_enabled(self, enabled: bool) -> None:
+    self.lateral_path_controller.set_adaptive_enabled(
+      enabled and self.CP.carFingerprint == CAR.FORD_F_150_LIGHTNING_MK1,
+    )
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -156,6 +166,7 @@ class CarController(CarControllerBase):
             desired_curvature=desired_angle_curvature,
             lat_ctl_limit=CS.lat_ctl_limit,
             active=CC.latActive,
+            driver_override=driver_override,
           )
         else:
           # The learned policy is currently identified on the Lightning. Other

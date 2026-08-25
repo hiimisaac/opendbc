@@ -2,12 +2,98 @@ import pytest
 from types import SimpleNamespace
 
 from opendbc.car.ford.learned_lateral_path import (
+  AdaptiveLateralTrim,
   LearnedLateralPathCommand,
   LearnedLateralPathController,
   lmc2_control_utilization,
   PathPolynomial,
   SteeringAngleProjector,
 )
+
+
+def test_adaptive_trim_disabled_preserves_nominal_command_exactly():
+  trim = AdaptiveLateralTrim(enabled=False)
+  nominal = LearnedLateralPathCommand(True, 0.42, -0.031, 0.004, -0.0002)
+
+  command = trim.update(
+    nominal, desired_curvature=0.02, measured_curvature=0.0,
+    active=True, driver_override=False, lat_ctl_limit=0,
+  )
+
+  assert command == nominal
+
+
+def test_adaptive_trim_learns_coherent_fast_authority_without_changing_c2():
+  trim = AdaptiveLateralTrim(enabled=True)
+  nominal = LearnedLateralPathCommand(True, 0.4, 0.04, 0.003, 0.0003)
+
+  command = nominal
+  for _ in range(200):
+    command = trim.update(
+      nominal, desired_curvature=0.02, measured_curvature=0.0,
+      active=True, driver_override=False, lat_ctl_limit=0,
+    )
+
+  assert 1.0 < command.path_offset / nominal.path_offset <= 1.12
+  assert command.path_angle / nominal.path_angle == pytest.approx(command.path_offset / nominal.path_offset)
+  assert command.curvature_rate / nominal.curvature_rate == pytest.approx(command.path_offset / nominal.path_offset)
+  assert command.curvature == nominal.curvature
+
+
+def test_adaptive_trim_does_not_modify_straight_commands_after_learning():
+  trim = AdaptiveLateralTrim(enabled=True)
+  turn = LearnedLateralPathCommand(True, 0.4, 0.04, 0.003, 0.0003)
+  for _ in range(200):
+    trim.update(turn, 0.02, 0.0, True, False, 0)
+  assert trim.state.gain > 0.0
+
+  straight = LearnedLateralPathCommand(True, 0.02, 0.001, 0.0002, 0.00001)
+  command = trim.update(straight, 0.001, 0.001, True, False, 0)
+
+  assert command == straight
+  assert not trim.state.adapting
+
+
+@pytest.mark.parametrize("driver_override,lat_ctl_limit", [(True, 0), (False, 1), (False, 2)])
+def test_adaptive_trim_freezes_during_override_and_pscm_limits(driver_override, lat_ctl_limit):
+  trim = AdaptiveLateralTrim(enabled=True)
+  nominal = LearnedLateralPathCommand(True, 0.4, 0.04, 0.003, 0.0003)
+  for _ in range(200):
+    trim.update(nominal, 0.02, 0.0, True, False, 0)
+  learned_gain = trim.state.gain
+
+  command = trim.update(nominal, 0.02, 0.0, True, driver_override, lat_ctl_limit)
+
+  assert not trim.state.adapting
+  assert trim.state.gain == pytest.approx(learned_gain)
+  assert command.path_offset == pytest.approx(nominal.path_offset * (1.0 + learned_gain))
+
+
+def test_adaptive_trim_uses_projected_arrival_to_taper_before_overshoot():
+  trim = AdaptiveLateralTrim(enabled=True)
+  nominal = LearnedLateralPathCommand(True, 0.4, 0.04, 0.003, 0.0003)
+
+  command = nominal
+  for _ in range(200):
+    command = trim.update(
+      nominal, desired_curvature=0.02, measured_curvature=0.0,
+      active=True, driver_override=False, lat_ctl_limit=0,
+      projected_curvature=0.03,
+    )
+
+  assert command.path_offset < nominal.path_offset
+  assert trim.state.tracking_error < 0.0
+
+
+def test_adaptive_trim_uses_openpilot_sign_headroom_at_asymmetric_wire_limits():
+  trim = AdaptiveLateralTrim(enabled=True)
+  nominal = LearnedLateralPathCommand(True, 0.0, -0.52, 0.003, 0.0)
+
+  command = nominal
+  for _ in range(200):
+    command = trim.update(nominal, -0.02, 0.0, True, False, 0)
+
+  assert -0.5235 <= command.path_angle <= nominal.path_angle
 
 
 def test_path_polynomial_advances_exactly_in_space():
@@ -77,3 +163,21 @@ def test_learned_controller_is_bounded_and_inactive_is_zero():
   assert controller.update(
     path, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False,
   ).valid is False
+
+
+def test_learned_controller_toggle_enables_adaptive_trim_around_nominal_policy():
+  nominal_controller = LearnedLateralPathController()
+  adaptive_controller = LearnedLateralPathController()
+  adaptive_controller.set_adaptive_enabled(True)
+  path = SimpleNamespace(valid=True, pathOffset=0.59, pathAngle=0.031, curvature=-0.00137, curvatureRate=-0.00102)
+
+  args = (path, -100.0, 0.0, 0.0, 9.0, 8.0, 0.0, 0.0, -0.02, 0, True)
+  nominal = nominal_controller.update(*args)
+  adaptive = nominal
+  for _ in range(200):
+    adaptive = adaptive_controller.update(*args)
+
+  assert abs(adaptive.path_offset) > abs(nominal.path_offset)
+  assert adaptive.curvature == nominal.curvature
+  adaptive_controller.set_adaptive_enabled(False)
+  assert adaptive_controller.update(*args) == nominal

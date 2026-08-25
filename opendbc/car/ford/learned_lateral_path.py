@@ -13,11 +13,17 @@ COEFFICIENT_LIMITS = np.asarray((
   (-0.02, 0.02),
   (-0.001024, 0.001023),
 ))
+COMMAND_LIMITS = np.column_stack((-COEFFICIENT_LIMITS[:, 1], -COEFFICIENT_LIMITS[:, 0]))
 COEFFICIENT_RESOLUTIONS = np.asarray((0.01, 0.0005, 0.00002, 0.000001))
 COEFFICIENT_SCALES = np.asarray((5.12, 0.5235, 0.02, 0.001024))
 PATH_CURVATURE_DISTANCES = (3.0, 5.0, 7.0, 10.0)
 FORD_PATH_DT = 0.05
 FORD_PATH_ANGLE_PROJECTION_HORIZON = 0.35
+ADAPTIVE_RATE = 0.08
+ADAPTIVE_LEAK = 0.01
+ADAPTIVE_GAIN_LIMIT = 0.12
+ADAPTIVE_MANEUVER_START = 0.002
+ADAPTIVE_MANEUVER_FULL = 0.012
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
@@ -62,7 +68,8 @@ class PathPolynomial:
 
   def as_wire_coefficients(self) -> tuple[float, float, float, float]:
     """Ford's LMC2 CAN signal convention is opposite openpilot's path convention."""
-    return tuple(-value for value in self.coefficients())
+    c0, c1, c2, c3 = self.coefficients()
+    return -c0, -c1, -c2, -c3
 
   def advanced(self, distance_m: float) -> "PathPolynomial":
     """Translate this cubic path into a coordinate frame `distance_m` farther along it."""
@@ -98,6 +105,91 @@ class LearnedLateralPathCommand:
 
   def coefficients(self) -> tuple[float, float, float, float]:
     return self.path_offset, self.path_angle, self.curvature, self.curvature_rate
+
+
+@dataclass(frozen=True)
+class AdaptiveLateralState:
+  enabled: bool = False
+  gain: float = 0.0
+  reference_curvature: float = 0.0
+  tracking_error: float = 0.0
+  adapting: bool = False
+
+
+class AdaptiveLateralTrim:
+  """Bounded per-drive adaptation around a nominal Ford LMC2 command."""
+
+  def __init__(self, enabled: bool = False):
+    self.enabled = bool(enabled)
+    self._gains = np.zeros(2)
+    self.state = AdaptiveLateralState(enabled=self.enabled)
+
+  @staticmethod
+  def _maneuver_weight(desired_curvature: float) -> float:
+    normalized = float(np.clip(
+      (abs(desired_curvature) - ADAPTIVE_MANEUVER_START) /
+      (ADAPTIVE_MANEUVER_FULL - ADAPTIVE_MANEUVER_START), 0.0, 1.0,
+    ))
+    return normalized**2 * (3.0 - 2.0 * normalized)
+
+  def set_enabled(self, enabled: bool) -> None:
+    enabled = bool(enabled)
+    if self.enabled and not enabled:
+      self._gains.fill(0.0)
+    self.enabled = enabled
+    self.state = AdaptiveLateralState(enabled=enabled)
+
+  def update(self, nominal: LearnedLateralPathCommand, desired_curvature: float,
+             measured_curvature: float, active: bool, driver_override: bool,
+             lat_ctl_limit: int, projected_curvature: float | None = None) -> LearnedLateralPathCommand:
+    if not self.enabled:
+      return nominal
+    if not active or not nominal.valid:
+      self.state = AdaptiveLateralState(enabled=True)
+      return nominal
+
+    reference_curvature = float(desired_curvature)
+    arrival_curvature = float(measured_curvature if projected_curvature is None else projected_curvature)
+    tracking_error = reference_curvature - arrival_curvature
+
+    coefficients = np.asarray(nominal.coefficients())
+    fast_coefficients = coefficients.copy()
+    fast_coefficients[2] = 0.0
+    fast_curvature = _equivalent_curvature(fast_coefficients, 7.0)
+    maneuver_weight = self._maneuver_weight(desired_curvature)
+    direction_agrees = desired_curvature * fast_curvature > 0.0
+    direction_index = int(desired_curvature >= 0.0)
+    adaptation_frozen = driver_override or lat_ctl_limit != 0
+    adapting = bool(direction_agrees and maneuver_weight > 0.0 and not adaptation_frozen)
+
+    if not adaptation_frozen:
+      self._gains *= max(1.0 - ADAPTIVE_LEAK * FORD_PATH_DT, 0.0)
+    if adapting:
+      normalized_error = float(np.clip(tracking_error / 0.02, -1.0, 1.0))
+      normalized_command = float(np.clip(fast_curvature / 0.1, -1.0, 1.0))
+      self._gains[direction_index] = np.clip(
+        self._gains[direction_index] +
+        ADAPTIVE_RATE * FORD_PATH_DT * normalized_error * normalized_command * maneuver_weight,
+        -ADAPTIVE_GAIN_LIMIT, ADAPTIVE_GAIN_LIMIT,
+      )
+
+    applied_gain = float(self._gains[direction_index]) if direction_agrees else 0.0
+    requested_scale = 1.0 + applied_gain * maneuver_weight
+    maximum_scale = 1.0 + ADAPTIVE_GAIN_LIMIT
+    for index in (0, 1, 3):
+      value = coefficients[index]
+      if value > 0.0:
+        maximum_scale = min(maximum_scale, COMMAND_LIMITS[index, 1] / value)
+      elif value < 0.0:
+        maximum_scale = min(maximum_scale, COMMAND_LIMITS[index, 0] / value)
+    scale = float(np.clip(requested_scale, 1.0 - ADAPTIVE_GAIN_LIMIT, maximum_scale))
+    adapted = coefficients.copy()
+    adapted[[0, 1, 3]] *= scale
+    self.state = AdaptiveLateralState(
+      enabled=True, gain=(scale - 1.0), reference_curvature=reference_curvature,
+      tracking_error=tracking_error, adapting=adapting,
+    )
+    return LearnedLateralPathCommand(nominal.valid, *(float(value) for value in adapted))
 
 
 def _equivalent_curvature(coefficients: np.ndarray, distance_m: float) -> float:
@@ -139,6 +231,14 @@ class LearnedLateralPathController:
       self.l2_bias = model["l2.bias"]
       self.out_weight = model["out.weight"]
       self.out_bias = model["out.bias"]
+    self.adaptive_trim = AdaptiveLateralTrim()
+
+  @property
+  def adaptive_state(self) -> AdaptiveLateralState:
+    return self.adaptive_trim.state
+
+  def set_adaptive_enabled(self, enabled: bool) -> None:
+    self.adaptive_trim.set_enabled(enabled)
 
   @staticmethod
   def _features(path: PathPolynomial, desired_angle_deg: float, actual_angle_deg: float,
@@ -181,7 +281,8 @@ class LearnedLateralPathController:
   def update(self, path, desired_angle_deg: float, actual_angle_deg: float,
              steering_rate_deg_s: float, speed_mps: float, eps_current_a: float,
              projected_curvature: float, measured_curvature: float,
-             desired_curvature: float, lat_ctl_limit: int, active: bool) -> LearnedLateralPathCommand:
+             desired_curvature: float, lat_ctl_limit: int, active: bool,
+             driver_override: bool = False) -> LearnedLateralPathCommand:
     if not active or path is None or not bool(getattr(path, "valid", False)):
       return LearnedLateralPathCommand()
 
@@ -200,4 +301,12 @@ class LearnedLateralPathController:
     # CarController retains the normal openpilot convention and negates once
     # at the CAN boundary, so convert the learned wire command back here.
     command = -wire_coefficients
-    return LearnedLateralPathCommand(True, *(float(value) for value in command))
+    nominal = LearnedLateralPathCommand(True, *(float(value) for value in command))
+    adapted = self.adaptive_trim.update(
+      nominal, desired_curvature, measured_curvature, active, driver_override, lat_ctl_limit,
+      projected_curvature=projected_curvature,
+    )
+    if adapted == nominal:
+      return nominal
+    adapted_wire = self._quantize_wire(-np.asarray(adapted.coefficients()))
+    return LearnedLateralPathCommand(True, *(float(value) for value in -adapted_wire))

@@ -64,6 +64,22 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(actuators.lateralPath.curvature, 0.01, rel_tol=1e-6)
     assert math.isclose(actuators.lateralPath.curvatureRate, -0.0004, rel_tol=1e-6)
 
+  def test_canfd_controller_exposes_adaptive_lateral_toggle(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+
+    controller.set_adaptive_lateral_enabled(True)
+
+    assert controller.adaptive_lateral_state.enabled
+
+  def test_adaptive_lateral_toggle_is_lightning_only(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_MK14)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+
+    controller.set_adaptive_lateral_enabled(True)
+
+    assert not controller.adaptive_lateral_state.enabled
+
   def test_canfd_controller_consumes_lateral_path_actuator(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
