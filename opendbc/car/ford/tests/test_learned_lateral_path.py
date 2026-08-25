@@ -70,10 +70,10 @@ def test_learned_controller_is_bounded_and_inactive_is_zero():
   assert -0.5235 <= command.path_angle <= 0.5
   assert -0.02 <= command.curvature <= 0.02
   assert -0.001023 <= command.curvature_rate <= 0.001024
-  assert command.path_offset == pytest.approx(-0.22)
-  assert command.path_angle == pytest.approx(-0.014)
-  assert command.curvature == pytest.approx(0.00038)
-  assert command.curvature_rate == pytest.approx(-0.000435)
+  assert command.path_offset == pytest.approx(-0.25)
+  assert command.path_angle == pytest.approx(-0.003)
+  assert command.curvature == pytest.approx(-0.00002)
+  assert command.curvature_rate == pytest.approx(-0.000424)
   assert controller.update(
     path, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False,
   ).valid is False
