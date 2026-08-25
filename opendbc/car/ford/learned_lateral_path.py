@@ -26,8 +26,20 @@ ADAPTIVE_MANEUVER_START = 0.002
 ADAPTIVE_MANEUVER_FULL = 0.012
 MODEL_C2_FULL_OWNERSHIP_ANGLE_DEG = 35.0
 MODEL_C2_ZERO_OWNERSHIP_ANGLE_DEG = 80.0
-MODEL_C2_FULL_OWNERSHIP_CURVATURE = 0.035
-MODEL_C2_ZERO_OWNERSHIP_CURVATURE = 0.08
+MODEL_C2_FULL_OWNERSHIP_CURVATURE = 0.008
+MODEL_C2_ZERO_OWNERSHIP_CURVATURE = 0.018
+OUTCOME_CORRECTION_START_ANGLE_DEG = 10.0
+OUTCOME_CORRECTION_FULL_ANGLE_DEG = 25.0
+OUTCOME_CORRECTION_START_ERROR_DEG = 4.0
+OUTCOME_CORRECTION_FULL_ERROR_DEG = 14.0
+OUTCOME_CORRECTION_FULL_SPEED_MPS = 16.0
+OUTCOME_CORRECTION_ZERO_SPEED_MPS = 18.0
+FAST_COEFFICIENT_INDICES = np.asarray((0, 1, 3), dtype=np.int64)
+FORD_LATERAL_POLICY_VERSION = 2
+FORD_LATERAL_POLICY_ARRAYS = frozenset((
+  "l1.weight", "l1.bias", "l2.weight", "l2.bias", "out.weight", "out.bias",
+  "residual.l1.weight", "residual.l1.bias", "residual.out.weight", "residual.out.bias", "residual.scales",
+))
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
@@ -202,6 +214,15 @@ def _equivalent_curvature(coefficients: np.ndarray, distance_m: float) -> float:
   return float(2.0 * offset / distance_m**2)
 
 
+def _quantize_wire_coefficients(coefficients: np.ndarray) -> np.ndarray:
+  clipped = np.clip(coefficients, COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1])
+  steps = np.rint((clipped - COEFFICIENT_LIMITS[:, 0]) / COEFFICIENT_RESOLUTIONS)
+  return np.clip(
+    COEFFICIENT_LIMITS[:, 0] + steps * COEFFICIENT_RESOLUTIONS,
+    COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1],
+  )
+
+
 def _model_c2_ownership(path: PathPolynomial, desired_angle_deg: float) -> float:
   """Keep Ford's stable C2 on ordinary roads, then stop feeding its sticky PSCM path in large turns."""
   angle_progress = (
@@ -209,11 +230,101 @@ def _model_c2_ownership(path: PathPolynomial, desired_angle_deg: float) -> float
     (MODEL_C2_ZERO_OWNERSHIP_ANGLE_DEG - MODEL_C2_FULL_OWNERSHIP_ANGLE_DEG)
   )
   curvature_progress = (
-    (abs(_equivalent_curvature(np.asarray(path.coefficients()), 7.0)) - MODEL_C2_FULL_OWNERSHIP_CURVATURE) /
+    (abs(path.c2) - MODEL_C2_FULL_OWNERSHIP_CURVATURE) /
     (MODEL_C2_ZERO_OWNERSHIP_CURVATURE - MODEL_C2_FULL_OWNERSHIP_CURVATURE)
   )
   progress = float(np.clip(max(angle_progress, curvature_progress), 0.0, 1.0))
   return 1.0 - progress**2 * (3.0 - 2.0 * progress)
+
+
+def _smoothstep(value: float, start: float, end: float) -> float:
+  progress = float(np.clip((value - start) / (end - start), 0.0, 1.0))
+  return progress**2 * (3.0 - 2.0 * progress)
+
+
+def _outcome_correction_weight(path: PathPolynomial, desired_angle_deg: float,
+                               actual_angle_deg: float, steering_rate_deg_s: float,
+                               speed_mps: float, projected_curvature: float, desired_curvature: float,
+                               driver_input: bool, lat_ctl_limit: int) -> float:
+  """Continuously admit learned authority only while the wheel is demonstrably behind the model."""
+  if driver_input or lat_ctl_limit != 0 or desired_angle_deg == 0.0:
+    return 0.0
+  model_curvature = _equivalent_curvature(np.asarray(path.coefficients()), 7.0)
+  if desired_angle_deg * model_curvature >= 0.0:
+    return 0.0
+  projected_angle_deg = actual_angle_deg + steering_rate_deg_s * FORD_PATH_ANGLE_PROJECTION_HORIZON
+  direction = math.copysign(1.0, desired_angle_deg)
+  actual_undertrack_deg = direction * (desired_angle_deg - actual_angle_deg)
+  projected_undertrack_deg = direction * (desired_angle_deg - projected_angle_deg)
+  if desired_curvature != 0.0:
+    curvature_direction = math.copysign(1.0, desired_curvature)
+    if curvature_direction * (desired_curvature - projected_curvature) <= 0.0:
+      return 0.0
+  # Both estimates must still be behind. This rejects a fast unwind that has
+  # already crossed the target, even if the projection lands on its far side.
+  conservative_undertrack_deg = min(actual_undertrack_deg, projected_undertrack_deg)
+  speed_weight = 1.0 - _smoothstep(
+    speed_mps, OUTCOME_CORRECTION_FULL_SPEED_MPS, OUTCOME_CORRECTION_ZERO_SPEED_MPS,
+  )
+  return (
+    _smoothstep(abs(desired_angle_deg), OUTCOME_CORRECTION_START_ANGLE_DEG, OUTCOME_CORRECTION_FULL_ANGLE_DEG) *
+    _smoothstep(conservative_undertrack_deg, OUTCOME_CORRECTION_START_ERROR_DEG, OUTCOME_CORRECTION_FULL_ERROR_DEG) *
+    speed_weight
+  )
+
+
+def _apply_model_aligned_outcome_residual(wire_command: np.ndarray, model_wire: np.ndarray,
+                                          residual: np.ndarray, correction_weight: float) -> np.ndarray:
+  """Add 7 m authority while keeping the complete bounded arc on the model-requested side."""
+  bounded_baseline = np.clip(wire_command, COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1])
+  full_candidate = wire_command.copy()
+  full_candidate[FAST_COEFFICIENT_INDICES] += correction_weight * residual
+  bounded_candidate = np.clip(full_candidate, COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1])
+  bounded_delta = bounded_candidate - bounded_baseline
+
+  model_7m = _equivalent_curvature(model_wire, 7.0)
+  added_7m = _equivalent_curvature(bounded_delta, 7.0)
+  if model_7m * added_7m <= 0.0:
+    return wire_command
+
+  scale = 1.0
+  for distance in PATH_CURVATURE_DISTANCES:
+    model_curvature = _equivalent_curvature(model_wire, distance)
+    if abs(model_curvature) < 1e-9:
+      continue
+    direction = math.copysign(1.0, model_curvature)
+    baseline_alignment = direction * _equivalent_curvature(bounded_baseline, distance)
+    delta_alignment = direction * _equivalent_curvature(bounded_delta, distance)
+    if baseline_alignment <= 0.0:
+      if delta_alignment <= 0.0:
+        return wire_command
+      continue
+    if delta_alignment < 0.0:
+      scale = min(scale, baseline_alignment / -delta_alignment)
+
+  quantized_baseline = _quantize_wire_coefficients(bounded_baseline)
+
+  def quantized_candidate(candidate_scale: float) -> np.ndarray:
+    return _quantize_wire_coefficients(bounded_baseline + candidate_scale * bounded_delta)
+
+  def arc_is_safe(candidate: np.ndarray) -> bool:
+    for distance in PATH_CURVATURE_DISTANCES:
+      model_curvature = _equivalent_curvature(model_wire, distance)
+      if abs(model_curvature) < 1e-9:
+        continue
+      baseline_alignment = model_curvature * _equivalent_curvature(quantized_baseline, distance)
+      candidate_alignment = model_curvature * _equivalent_curvature(candidate, distance)
+      if baseline_alignment >= 0.0 and candidate_alignment < 0.0:
+        return False
+    return model_7m * (
+      _equivalent_curvature(candidate, 7.0) - _equivalent_curvature(quantized_baseline, 7.0)
+    ) > 0.0
+
+  scale = float(np.clip(scale, 0.0, 1.0))
+  for candidate_scale in np.linspace(scale, 0.0, 33)[:-1]:
+    if arc_is_safe(quantized_candidate(float(candidate_scale))):
+      return bounded_baseline + float(candidate_scale) * bounded_delta
+  return wire_command
 
 
 def lmc2_control_utilization(command: LearnedLateralPathCommand, lat_ctl_limit: int) -> float:
@@ -241,14 +352,27 @@ class LearnedLateralPathController:
   """Compact, memoryless Ford LMC2 policy distilled from validated road control."""
 
   def __init__(self, model_path: Path | None = None):
-    path = Path(__file__).with_name("ford_lateral_policy_v1.npz") if model_path is None else model_path
+    path = Path(__file__).with_name("ford_lateral_policy_v2.npz") if model_path is None else model_path
     with np.load(path, allow_pickle=False) as model:
+      if "version" not in model.files:
+        raise ValueError("Ford lateral policy artifact is missing its schema version")
+      version = int(model["version"])
+      if version != FORD_LATERAL_POLICY_VERSION:
+        raise ValueError(f"Unsupported Ford lateral policy version {version}")
+      missing_arrays = FORD_LATERAL_POLICY_ARRAYS.difference(model.files)
+      if missing_arrays:
+        raise ValueError(f"Ford lateral policy v{version} is missing arrays: {sorted(missing_arrays)}")
       self.l1_weight = model["l1.weight"]
       self.l1_bias = model["l1.bias"]
       self.l2_weight = model["l2.weight"]
       self.l2_bias = model["l2.bias"]
       self.out_weight = model["out.weight"]
       self.out_bias = model["out.bias"]
+      self.residual_l1_weight = model["residual.l1.weight"]
+      self.residual_l1_bias = model["residual.l1.bias"]
+      self.residual_out_weight = model["residual.out.weight"]
+      self.residual_out_bias = model["residual.out.bias"]
+      self.residual_scales = model["residual.scales"]
     self.adaptive_trim = AdaptiveLateralTrim()
 
   @property
@@ -289,12 +413,7 @@ class LearnedLateralPathController:
 
   @staticmethod
   def _quantize_wire(coefficients: np.ndarray) -> np.ndarray:
-    clipped = np.clip(coefficients, COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1])
-    steps = np.rint((clipped - COEFFICIENT_LIMITS[:, 0]) / COEFFICIENT_RESOLUTIONS)
-    return np.clip(
-      COEFFICIENT_LIMITS[:, 0] + steps * COEFFICIENT_RESOLUTIONS,
-      COEFFICIENT_LIMITS[:, 0], COEFFICIENT_LIMITS[:, 1],
-    )
+    return _quantize_wire_coefficients(coefficients)
 
   def update(self, path, desired_angle_deg: float, actual_angle_deg: float,
              steering_rate_deg_s: float, speed_mps: float, eps_current_a: float,
@@ -320,6 +439,15 @@ class LearnedLateralPathController:
     hidden = np.tanh(self.l2_weight @ hidden + self.l2_bias)
     wire_command = np.tanh(self.out_weight @ hidden + self.out_bias) * COEFFICIENT_SCALES
     wire_command[2] = -polynomial.c2 * _model_c2_ownership(polynomial, desired_angle_deg)
+    correction_weight = _outcome_correction_weight(
+      polynomial, desired_angle_deg, actual_angle_deg, steering_rate_deg_s, speed_mps,
+      projected_curvature, desired_curvature, driver_input, lat_ctl_limit,
+    )
+    if correction_weight > 0.0:
+      residual_hidden = np.tanh(self.residual_l1_weight @ features + self.residual_l1_bias)
+      residual = np.tanh(self.residual_out_weight @ residual_hidden + self.residual_out_bias) * self.residual_scales
+      model_wire = -np.asarray(polynomial.coefficients())
+      wire_command = _apply_model_aligned_outcome_residual(wire_command, model_wire, residual, correction_weight)
     wire_coefficients = self._quantize_wire(wire_command)
     # CarController retains the normal openpilot convention and negates once
     # at the CAN boundary, so convert the learned wire command back here.
