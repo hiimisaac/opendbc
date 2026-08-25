@@ -439,6 +439,8 @@ class LearnedLateralPathController:
     hidden = np.tanh(self.l2_weight @ hidden + self.l2_bias)
     wire_command = np.tanh(self.out_weight @ hidden + self.out_bias) * COEFFICIENT_SCALES
     wire_command[2] = -polynomial.c2 * _model_c2_ownership(polynomial, desired_angle_deg)
+    baseline_wire = self._quantize_wire(wire_command)
+    model_wire = -np.asarray(polynomial.coefficients())
     correction_weight = _outcome_correction_weight(
       polynomial, desired_angle_deg, actual_angle_deg, steering_rate_deg_s, speed_mps,
       projected_curvature, desired_curvature, driver_input, lat_ctl_limit,
@@ -446,7 +448,6 @@ class LearnedLateralPathController:
     if correction_weight > 0.0:
       residual_hidden = np.tanh(self.residual_l1_weight @ features + self.residual_l1_bias)
       residual = np.tanh(self.residual_out_weight @ residual_hidden + self.residual_out_bias) * self.residual_scales
-      model_wire = -np.asarray(polynomial.coefficients())
       wire_command = _apply_model_aligned_outcome_residual(wire_command, model_wire, residual, correction_weight)
     wire_coefficients = self._quantize_wire(wire_command)
     # CarController retains the normal openpilot convention and negates once
@@ -457,7 +458,11 @@ class LearnedLateralPathController:
       nominal, desired_curvature, measured_curvature, active, driver_input, lat_ctl_limit,
       projected_curvature=projected_curvature,
     )
-    if adapted == nominal:
-      return nominal
     adapted_wire = self._quantize_wire(-np.asarray(adapted.coefficients()))
-    return LearnedLateralPathCommand(True, *(float(value) for value in -adapted_wire))
+    adapted_baseline_wire = baseline_wire.copy()
+    adapted_baseline_wire[FAST_COEFFICIENT_INDICES] *= 1.0 + self.adaptive_state.gain
+    adapted_baseline_wire = self._quantize_wire(adapted_baseline_wire)
+    adapted_residual = adapted_wire[FAST_COEFFICIENT_INDICES] - adapted_baseline_wire[FAST_COEFFICIENT_INDICES]
+    safe_wire = _apply_model_aligned_outcome_residual(adapted_baseline_wire, model_wire, adapted_residual, 1.0)
+    safe_wire = self._quantize_wire(safe_wire)
+    return LearnedLateralPathCommand(True, *(float(value) for value in -safe_wire))

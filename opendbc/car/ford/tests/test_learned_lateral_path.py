@@ -377,6 +377,36 @@ def test_learned_controller_keeps_mixed_residual_on_model_side_at_every_horizon(
   assert float(model_coefficients @ weights_7m) * float((command_coefficients - baseline_coefficients) @ weights_7m) > 0.0
 
 
+def test_adaptive_trim_cannot_reverse_an_admitted_residual_arc(tmp_path):
+  model_path = Path(__file__).parents[1] / "ford_lateral_policy_v2.npz"
+  with np.load(model_path, allow_pickle=False) as model:
+    adversarial = {name: model[name] for name in model.files}
+  adversarial["residual.l1.weight"] = np.zeros_like(adversarial["residual.l1.weight"])
+  adversarial["residual.l1.bias"] = np.zeros_like(adversarial["residual.l1.bias"])
+  adversarial["residual.out.weight"] = np.zeros_like(adversarial["residual.out.weight"])
+  residual = np.asarray((1.17683657, -0.252244421, -0.000545466214))
+  adversarial["residual.out.bias"] = np.arctanh(residual / adversarial["residual.scales"])
+  adversarial_path = tmp_path / "adaptive_adversarial.npz"
+  np.savez(adversarial_path, **adversarial)
+
+  controller = LearnedLateralPathController(adversarial_path)
+  controller.set_adaptive_enabled(True)
+  controller.adaptive_trim._gains[1] = 0.12
+  path = SimpleNamespace(
+    valid=True, pathOffset=0.257308691740036, pathAngle=0.092901848256588,
+    curvature=0.012884913012385368, curvatureRate=0.0010777440620586276,
+  )
+  command = controller.update(
+    path, -54.77340316772461, -23.0, -44.0, 10.230555534362793, 1.05,
+    0.00945987737547583, 0.006128934637632228, 0.014595765560680964, 0, True,
+  )
+  model_coefficients = np.asarray((path.pathOffset, path.pathAngle, path.curvature, path.curvatureRate))
+  command_coefficients = np.asarray(command.coefficients())
+  for distance in (3.0, 5.0, 7.0, 10.0):
+    weights = np.asarray((2.0 / distance**2, 2.0 / distance, 1.0, distance / 3.0))
+    assert float(model_coefficients @ weights) * float(command_coefficients @ weights) >= 0.0
+
+
 def test_learned_controller_rejects_unversioned_artifact(tmp_path):
   model_path = Path(__file__).parents[1] / "ford_lateral_policy_v2.npz"
   with np.load(model_path, allow_pickle=False) as model:
