@@ -17,7 +17,7 @@ def test_adaptive_trim_disabled_preserves_nominal_command_exactly():
 
   command = trim.update(
     nominal, desired_curvature=0.02, measured_curvature=0.0,
-    active=True, driver_override=False, lat_ctl_limit=0,
+    active=True, driver_input=False, lat_ctl_limit=0,
   )
 
   assert command == nominal
@@ -31,7 +31,7 @@ def test_adaptive_trim_learns_coherent_fast_authority_without_changing_c2():
   for _ in range(200):
     command = trim.update(
       nominal, desired_curvature=0.02, measured_curvature=0.0,
-      active=True, driver_override=False, lat_ctl_limit=0,
+      active=True, driver_input=False, lat_ctl_limit=0,
     )
 
   assert 1.0 < command.path_offset / nominal.path_offset <= 1.12
@@ -54,15 +54,15 @@ def test_adaptive_trim_does_not_modify_straight_commands_after_learning():
   assert not trim.state.adapting
 
 
-@pytest.mark.parametrize("driver_override,lat_ctl_limit", [(True, 0), (False, 1), (False, 2)])
-def test_adaptive_trim_freezes_during_override_and_pscm_limits(driver_override, lat_ctl_limit):
+@pytest.mark.parametrize("driver_input,lat_ctl_limit", [(True, 0), (False, 1), (False, 2)])
+def test_adaptive_trim_freezes_during_override_and_pscm_limits(driver_input, lat_ctl_limit):
   trim = AdaptiveLateralTrim(enabled=True)
   nominal = LearnedLateralPathCommand(True, 0.4, 0.04, 0.003, 0.0003)
   for _ in range(200):
     trim.update(nominal, 0.02, 0.0, True, False, 0)
   learned_gain = trim.state.gain
 
-  command = trim.update(nominal, 0.02, 0.0, True, driver_override, lat_ctl_limit)
+  command = trim.update(nominal, 0.02, 0.0, True, driver_input, lat_ctl_limit)
 
   assert not trim.state.adapting
   assert trim.state.gain == pytest.approx(learned_gain)
@@ -77,7 +77,7 @@ def test_adaptive_trim_uses_projected_arrival_to_taper_before_overshoot():
   for _ in range(200):
     command = trim.update(
       nominal, desired_curvature=0.02, measured_curvature=0.0,
-      active=True, driver_override=False, lat_ctl_limit=0,
+      active=True, driver_input=False, lat_ctl_limit=0,
       projected_curvature=0.03,
     )
 

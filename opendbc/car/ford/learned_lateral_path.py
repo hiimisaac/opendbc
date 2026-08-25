@@ -140,7 +140,7 @@ class AdaptiveLateralTrim:
     self.state = AdaptiveLateralState(enabled=enabled)
 
   def update(self, nominal: LearnedLateralPathCommand, desired_curvature: float,
-             measured_curvature: float, active: bool, driver_override: bool,
+             measured_curvature: float, active: bool, driver_input: bool,
              lat_ctl_limit: int, projected_curvature: float | None = None) -> LearnedLateralPathCommand:
     if not self.enabled:
       return nominal
@@ -159,7 +159,7 @@ class AdaptiveLateralTrim:
     maneuver_weight = self._maneuver_weight(desired_curvature)
     direction_agrees = desired_curvature * fast_curvature > 0.0
     direction_index = int(desired_curvature >= 0.0)
-    adaptation_frozen = driver_override or lat_ctl_limit != 0
+    adaptation_frozen = driver_input or lat_ctl_limit != 0
     adapting = bool(direction_agrees and maneuver_weight > 0.0 and not adaptation_frozen)
 
     if not adaptation_frozen:
@@ -282,11 +282,11 @@ class LearnedLateralPathController:
              steering_rate_deg_s: float, speed_mps: float, eps_current_a: float,
              projected_curvature: float, measured_curvature: float,
              desired_curvature: float, lat_ctl_limit: int, active: bool,
-             driver_override: bool = False) -> LearnedLateralPathCommand:
+             driver_input: bool = False) -> LearnedLateralPathCommand:
     if not active or path is None or not bool(getattr(path, "valid", False)):
       inactive_command = LearnedLateralPathCommand()
       self.adaptive_trim.update(
-        inactive_command, desired_curvature, measured_curvature, False, driver_override, lat_ctl_limit,
+        inactive_command, desired_curvature, measured_curvature, False, driver_input, lat_ctl_limit,
         projected_curvature=projected_curvature,
       )
       return inactive_command
@@ -308,7 +308,7 @@ class LearnedLateralPathController:
     command = -wire_coefficients
     nominal = LearnedLateralPathCommand(True, *(float(value) for value in command))
     adapted = self.adaptive_trim.update(
-      nominal, desired_curvature, measured_curvature, active, driver_override, lat_ctl_limit,
+      nominal, desired_curvature, measured_curvature, active, driver_input, lat_ctl_limit,
       projected_curvature=projected_curvature,
     )
     if adapted == nominal:
