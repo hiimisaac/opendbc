@@ -4,8 +4,12 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
-from opendbc.car.ford.lateral_path import driver_steering_opposes_command, SteeringAngleProjector
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
+from opendbc.car.ford.learned_lateral_path import (
+  driver_steering_opposes_command,
+  LearnedLateralPathCommand,
+  LearnedLateralPathController,
+  SteeringAngleProjector,
+)
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -63,7 +67,7 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
-    self.lateral_path_controller = ProjectedLatControlPath()
+    self.lateral_path_controller = LearnedLateralPathController()
     self.steering_angle_projector = SteeringAngleProjector()
 
     self.accel = 0.0
@@ -139,13 +143,27 @@ class CarController(CarControllerBase):
         if desired_curvature != path_target.curvature:
           path_target = path_target.as_builder()
           path_target.curvature = desired_curvature
-        cmd = self.lateral_path_controller.update(
-          path_target, measured_curvature, CS.out.vEgoRaw,
-          CC.latActive, driver_override,
-          projected_measured_curvature=projected_wheel_curvature,
-          desired_angle_curvature=desired_angle_curvature,
-          lat_ctl_limit=CS.lat_ctl_limit,
-        )
+        if self.CP.carFingerprint == CAR.FORD_F_150_LIGHTNING_MK1:
+          cmd = self.lateral_path_controller.update(
+            path_target,
+            desired_angle_deg=actuators.steeringAngleDeg,
+            actual_angle_deg=actual_angle_deg,
+            steering_rate_deg_s=self.steering_angle_projector.rate_deg_s,
+            speed_mps=CS.out.vEgoRaw,
+            eps_current_a=getattr(CS, "eps_current", 0.0),
+            projected_curvature=projected_wheel_curvature,
+            measured_curvature=measured_curvature,
+            desired_curvature=desired_angle_curvature,
+            lat_ctl_limit=CS.lat_ctl_limit,
+            active=CC.latActive,
+          )
+        else:
+          # The learned policy is currently identified on the Lightning. Other
+          # CAN-FD Fords retain the model polynomial without vehicle-specific inference.
+          cmd = LearnedLateralPathCommand(
+            bool(path_target.valid), float(path_target.pathOffset), float(path_target.pathAngle),
+            float(desired_curvature), float(path_target.curvatureRate),
+          )
         apply_curvature = cmd.curvature
         curvature_rate = cmd.curvature_rate
         path_angle = cmd.path_angle

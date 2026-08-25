@@ -7,7 +7,7 @@ from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.carcontroller import CarController
-from opendbc.car.ford.lateral_path import LateralPathCommand
+from opendbc.car.ford.learned_lateral_path import LearnedLateralPathCommand
 from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
@@ -77,7 +77,7 @@ class TestFordFW(unittest.TestCase):
       def update(self, path, *args, **kwargs):
         self.path = path
         self.lat_ctl_limit = kwargs["lat_ctl_limit"]
-        return LateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
+        return LearnedLateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
 
     path_controller = RecordingPathController()
     controller.lateral_path_controller = path_controller
@@ -119,7 +119,7 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
     assert len(can_sends) == 1
 
-  def test_canfd_controller_transfers_changing_spatial_path_out_of_c2(self):
+  def test_canfd_controller_produces_bounded_learned_spatial_command(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
 
@@ -156,9 +156,11 @@ class TestFordFW(unittest.TestCase):
       output, _ = controller.update(CC.as_reader(), CS, 0)
 
     assert output is not None
-    assert output.lateralPath.curvature < CC.actuators.lateralPath.curvature
-    assert output.lateralPath.pathOffset > 0.0
-    assert output.lateralPath.pathAngle > 0.0
+    assert output.lateralPath.valid
+    assert abs(output.lateralPath.pathOffset) <= 5.12
+    assert abs(output.lateralPath.pathAngle) <= 0.5235
+    assert abs(output.lateralPath.curvature) <= 0.02
+    assert abs(output.lateralPath.curvatureRate) <= 0.001024
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
