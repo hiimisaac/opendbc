@@ -284,7 +284,12 @@ class LearnedLateralPathController:
              desired_curvature: float, lat_ctl_limit: int, active: bool,
              driver_override: bool = False) -> LearnedLateralPathCommand:
     if not active or path is None or not bool(getattr(path, "valid", False)):
-      return LearnedLateralPathCommand()
+      inactive_command = LearnedLateralPathCommand()
+      self.adaptive_trim.update(
+        inactive_command, desired_curvature, measured_curvature, False, driver_override, lat_ctl_limit,
+        projected_curvature=projected_curvature,
+      )
+      return inactive_command
 
     polynomial = PathPolynomial(
       float(path.pathOffset), float(path.pathAngle), float(path.curvature), float(path.curvatureRate),

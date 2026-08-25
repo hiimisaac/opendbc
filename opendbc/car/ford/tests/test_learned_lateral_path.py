@@ -181,3 +181,21 @@ def test_learned_controller_toggle_enables_adaptive_trim_around_nominal_policy()
   assert adaptive.curvature == nominal.curvature
   adaptive_controller.set_adaptive_enabled(False)
   assert adaptive_controller.update(*args) == nominal
+
+
+def test_learned_controller_clears_adapting_state_while_inactive_without_forgetting_gain():
+  controller = LearnedLateralPathController()
+  controller.set_adaptive_enabled(True)
+  path = SimpleNamespace(valid=True, pathOffset=0.59, pathAngle=0.031, curvature=-0.00137, curvatureRate=-0.00102)
+  args = (path, -100.0, 0.0, 0.0, 9.0, 8.0, 0.0, 0.0, -0.02, 0, True)
+
+  for _ in range(200):
+    controller.update(*args)
+  assert controller.adaptive_state.adapting
+  learned_command = controller.update(*args, True)
+
+  assert not controller.update(path, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False).valid
+  assert controller.adaptive_state.enabled
+  assert not controller.adaptive_state.adapting
+  assert controller.adaptive_state.tracking_error == 0.0
+  assert controller.update(*args, True) == learned_command

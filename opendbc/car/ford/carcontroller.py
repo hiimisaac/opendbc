@@ -166,7 +166,7 @@ class CarController(CarControllerBase):
             desired_curvature=desired_angle_curvature,
             lat_ctl_limit=CS.lat_ctl_limit,
             active=CC.latActive,
-            driver_override=driver_override,
+            driver_override=bool(CC.latActive and CS.out.steeringPressed),
           )
         else:
           # The learned policy is currently identified on the Lightning. Other

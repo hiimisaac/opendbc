@@ -89,10 +89,12 @@ class TestFordFW(unittest.TestCase):
       def __init__(self):
         self.path = None
         self.lat_ctl_limit = None
+        self.driver_override = None
 
       def update(self, path, *args, **kwargs):
         self.path = path
         self.lat_ctl_limit = kwargs["lat_ctl_limit"]
+        self.driver_override = kwargs["driver_override"]
         return LearnedLateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
 
     path_controller = RecordingPathController()
@@ -111,8 +113,8 @@ class TestFordFW(unittest.TestCase):
       out=SimpleNamespace(
         cruiseState=SimpleNamespace(available=False, standstill=False),
         steeringAngleDeg=0.0,
-        steeringPressed=False,
-        steeringTorque=0.0,
+        steeringPressed=True,
+        steeringTorque=1.0,
         vEgoRaw=7.0,
         vEgo=7.0,
         yawRate=0.0,
@@ -129,6 +131,7 @@ class TestFordFW(unittest.TestCase):
 
     assert path_controller.path is not None
     assert path_controller.lat_ctl_limit == 2
+    assert path_controller.driver_override
     assert math.isclose(path_controller.path.pathOffset, 0.4, rel_tol=1e-6)
     assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)
