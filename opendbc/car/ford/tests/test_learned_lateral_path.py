@@ -158,11 +158,53 @@ def test_learned_controller_is_bounded_and_inactive_is_zero():
   assert -0.001023 <= command.curvature_rate <= 0.001024
   assert command.path_offset == pytest.approx(-0.21)
   assert command.path_angle == pytest.approx(0.006)
-  assert command.curvature == pytest.approx(0.00024)
+  assert command.curvature == pytest.approx(-0.00136)
   assert command.curvature_rate == pytest.approx(-0.00037)
   assert controller.update(
     path, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False,
   ).valid is False
+
+
+def test_learned_controller_preserves_model_c2_for_ordinary_driving():
+  controller = LearnedLateralPathController()
+  path = SimpleNamespace(valid=True, pathOffset=0.0, pathAngle=0.0, curvature=0.004, curvatureRate=0.0)
+
+  command = controller.update(
+    path, desired_angle_deg=20.0, actual_angle_deg=18.0, steering_rate_deg_s=2.0,
+    speed_mps=25.0, eps_current_a=2.0, projected_curvature=0.0038,
+    measured_curvature=0.0037, desired_curvature=0.004, lat_ctl_limit=0, active=True,
+  )
+
+  assert command.curvature == pytest.approx(path.curvature)
+
+
+def test_learned_controller_smoothly_releases_model_c2_for_large_maneuvers():
+  path = SimpleNamespace(valid=True, pathOffset=0.0, pathAngle=0.0, curvature=0.004, curvatureRate=0.0)
+
+  commands = []
+  for desired_angle_deg in (20.0, 57.5, 100.0):
+    commands.append(LearnedLateralPathController().update(
+      path, desired_angle_deg=desired_angle_deg, actual_angle_deg=0.0, steering_rate_deg_s=0.0,
+      speed_mps=8.0, eps_current_a=2.0, projected_curvature=0.0,
+      measured_curvature=0.0, desired_curvature=0.02, lat_ctl_limit=0, active=True,
+    ))
+
+  ordinary, transition, hard = commands
+  assert 0.0 < abs(transition.curvature) < abs(ordinary.curvature)
+  assert hard.curvature == 0.0
+
+
+def test_learned_controller_releases_c2_when_model_geometry_is_already_large():
+  controller = LearnedLateralPathController()
+  path = SimpleNamespace(valid=True, pathOffset=2.0, pathAngle=0.0, curvature=0.004, curvatureRate=0.0)
+
+  command = controller.update(
+    path, desired_angle_deg=20.0, actual_angle_deg=0.0, steering_rate_deg_s=0.0,
+    speed_mps=8.0, eps_current_a=2.0, projected_curvature=0.0,
+    measured_curvature=0.0, desired_curvature=0.02, lat_ctl_limit=0, active=True,
+  )
+
+  assert command.curvature == 0.0
 
 
 def test_learned_controller_toggle_enables_adaptive_trim_around_nominal_policy():

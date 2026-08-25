@@ -24,6 +24,10 @@ ADAPTIVE_LEAK = 0.01
 ADAPTIVE_GAIN_LIMIT = 0.12
 ADAPTIVE_MANEUVER_START = 0.002
 ADAPTIVE_MANEUVER_FULL = 0.012
+MODEL_C2_FULL_OWNERSHIP_ANGLE_DEG = 35.0
+MODEL_C2_ZERO_OWNERSHIP_ANGLE_DEG = 80.0
+MODEL_C2_FULL_OWNERSHIP_CURVATURE = 0.035
+MODEL_C2_ZERO_OWNERSHIP_CURVATURE = 0.08
 
 
 def driver_steering_opposes_command(steering_pressed: bool, steering_torque: float,
@@ -198,6 +202,20 @@ def _equivalent_curvature(coefficients: np.ndarray, distance_m: float) -> float:
   return float(2.0 * offset / distance_m**2)
 
 
+def _model_c2_ownership(path: PathPolynomial, desired_angle_deg: float) -> float:
+  """Keep Ford's stable C2 on ordinary roads, then stop feeding its sticky PSCM path in large turns."""
+  angle_progress = (
+    (abs(desired_angle_deg) - MODEL_C2_FULL_OWNERSHIP_ANGLE_DEG) /
+    (MODEL_C2_ZERO_OWNERSHIP_ANGLE_DEG - MODEL_C2_FULL_OWNERSHIP_ANGLE_DEG)
+  )
+  curvature_progress = (
+    (abs(_equivalent_curvature(np.asarray(path.coefficients()), 7.0)) - MODEL_C2_FULL_OWNERSHIP_CURVATURE) /
+    (MODEL_C2_ZERO_OWNERSHIP_CURVATURE - MODEL_C2_FULL_OWNERSHIP_CURVATURE)
+  )
+  progress = float(np.clip(max(angle_progress, curvature_progress), 0.0, 1.0))
+  return 1.0 - progress**2 * (3.0 - 2.0 * progress)
+
+
 def lmc2_control_utilization(command: LearnedLateralPathCommand, lat_ctl_limit: int) -> float:
   """Return signed command-envelope usage, raised by genuine PSCM limit status."""
   coefficients = np.asarray(command.coefficients())
@@ -300,9 +318,9 @@ class LearnedLateralPathController:
     )
     hidden = np.tanh(self.l1_weight @ features + self.l1_bias)
     hidden = np.tanh(self.l2_weight @ hidden + self.l2_bias)
-    wire_coefficients = self._quantize_wire(
-      np.tanh(self.out_weight @ hidden + self.out_bias) * COEFFICIENT_SCALES,
-    )
+    wire_command = np.tanh(self.out_weight @ hidden + self.out_bias) * COEFFICIENT_SCALES
+    wire_command[2] = -polynomial.c2 * _model_c2_ownership(polynomial, desired_angle_deg)
+    wire_coefficients = self._quantize_wire(wire_command)
     # CarController retains the normal openpilot convention and negates once
     # at the CAN boundary, so convert the learned wire command back here.
     command = -wire_coefficients
