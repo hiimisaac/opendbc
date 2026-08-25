@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "vehicle": "FORD_F_150_LIGHTNING_MK1",
   "teacher_opendbc_commit": "4b0da0134eb1ee325a57bd883918f278a8481f69",
   "architecture": "20x128x128x4 tanh MLP",
@@ -7,6 +7,9 @@
   "validation_routes": [
     "112e4d6e0cad05e1_00000079--331888fa58",
     "112e4d6e0cad05e1_0000007c--bea1ff76f8"
+  ],
+  "calibration_routes": [
+    "112e4d6e0cad05e1_00000072--0b4f258cf5"
   ],
   "validation": {
     "active_no_override_samples": 39939,
@@ -16,5 +19,19 @@
     "large_turn_equivalent_curvature_mae_at_7m": 0.01458085,
     "large_turn_equivalent_curvature_p90_at_7m": 0.03065508
   },
-  "notes": "Fork-only road-test policy. Outputs are DBC-bounded and quantized; no legacy Ford path state machine is invoked."
+  "route72_retrain_validation": {
+    "active_no_override_samples": 5733,
+    "lane_change_samples": 255,
+    "lane_change_equivalent_curvature_mae_at_7m_before": 0.002950,
+    "lane_change_equivalent_curvature_mae_at_7m_after": 0.002238,
+    "lane_change_opposite_model_before": 0.373,
+    "lane_change_opposite_model_after": 0.251,
+    "steer_saturated_window_samples": 966,
+    "steer_saturated_equivalent_curvature_mae_at_7m_before": 0.008773,
+    "steer_saturated_equivalent_curvature_mae_at_7m_after": 0.008543,
+    "low_speed_command_reversals_before": 1575,
+    "low_speed_command_reversals_after": 1548,
+    "historical_large_turn_mae_ratio": 1.0146
+  },
+  "notes": "Fork-only road-test policy. Version 2 refits only the output head with route 72 event weighting and temporal consistency; architecture, runtime logic, DBC bounds, and quantization are unchanged. No legacy Ford path state machine is invoked."
 }
