@@ -7,7 +7,8 @@
   "validation_routes": [
     "112e4d6e0cad05e1_00000079--331888fa58",
     "112e4d6e0cad05e1_0000007c--bea1ff76f8",
-    "112e4d6e0cad05e1_00000072--0b4f258cf5"
+    "112e4d6e0cad05e1_00000072--0b4f258cf5",
+    "112e4d6e0cad05e1_0000007a--44f04fb268"
   ],
   "validation": {
     "historical_active_no_override_samples": 39939,
@@ -21,7 +22,11 @@
     "route72_straight_command_variation": 0.000392,
     "route72_hard_turn_equivalent_curvature_mae_at_7m": 0.032829,
     "route72_saturated_window_authority_median": 0.02742,
-    "route72_saturated_window_authority_p90": 0.145821
+    "route72_saturated_window_authority_p90": 0.145821,
+    "outcome_head_historical_turn_mae": 0.009097,
+    "nominal_historical_turn_mae": 0.007878,
+    "outcome_head_route7a_turn_mae": 0.012481,
+    "nominal_route7a_turn_mae": 0.012595
   },
-  "notes": "Fork-only, regime-balanced road-test policy. Straight and gentle samples follow the validated teacher with temporal consistency; hard turns and saturated windows retain the road-tested compact policy. Outputs are DBC-bounded and quantized; no legacy Ford path state machine is invoked."
+  "notes": "Fork-only, regime-balanced road-test policy. The virtual-EPS outcome head is disabled in the artifact: held-out replay showed a 15.5% historical turn regression for only a 0.9% route7a turn improvement. The validated nominal policy, deterministic C2 ownership, DBC bounds, and quantization are retained unchanged."
 }

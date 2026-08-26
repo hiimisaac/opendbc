@@ -181,41 +181,13 @@ def test_learned_controller_preserves_model_c2_for_ordinary_driving():
   assert command.curvature == pytest.approx(path.curvature)
 
 
-def test_learned_controller_keeps_authority_in_captured_moving_right_turn():
-  controller = LearnedLateralPathController()
-  path = SimpleNamespace(
-    valid=True,
-    pathOffset=0.257308691740036,
-    pathAngle=0.092901848256588,
-    curvature=0.012884913012385368,
-    curvatureRate=0.0010777440620586276,
-  )
-
-  command = controller.update(
-    path, desired_angle_deg=-54.77340316772461, actual_angle_deg=-23.0, steering_rate_deg_s=-44.0,
-    speed_mps=10.230555534362793, eps_current_a=1.05, projected_curvature=0.00945987737547583,
-    measured_curvature=0.006128934637632228, desired_curvature=0.014595765560680964,
-    lat_ctl_limit=0, active=True,
-  )
-  baseline = LearnedLateralPathController().update(
-    path, desired_angle_deg=-54.77340316772461, actual_angle_deg=-23.0, steering_rate_deg_s=-44.0,
-    speed_mps=10.230555534362793, eps_current_a=1.05, projected_curvature=0.00945987737547583,
-    measured_curvature=0.006128934637632228, desired_curvature=0.014595765560680964,
-    lat_ctl_limit=0, active=True, driver_input=True,
-  )
-  equivalent_curvature = 2.0 * (
-    command.path_offset + command.path_angle * 7.0 + 0.5 * command.curvature * 7.0**2 +
-    command.curvature_rate * 7.0**3 / 6.0
-  ) / 7.0**2
-  baseline_equivalent_curvature = 2.0 * (
-    baseline.path_offset + baseline.path_angle * 7.0 + 0.5 * baseline.curvature * 7.0**2 +
-    baseline.curvature_rate * 7.0**3 / 6.0
-  ) / 7.0**2
-
-  # The validated virtual EPS planner needs about 0.055 here. Leave
-  # distillation margin while rejecting the current 0.027 collapse.
-  assert equivalent_curvature > 0.045
-  assert equivalent_curvature > baseline_equivalent_curvature
+def test_shipped_policy_disables_unvalidated_outcome_model():
+  model_path = Path(__file__).parents[1] / "ford_lateral_policy_v2.npz"
+  with np.load(model_path, allow_pickle=False) as model:
+    assert not np.any(model["residual.l1.weight"])
+    assert not np.any(model["residual.l1.bias"])
+    assert not np.any(model["residual.out.weight"])
+    assert not np.any(model["residual.out.bias"])
 
 
 def test_learned_controller_smoothly_releases_model_c2_for_large_maneuvers():
