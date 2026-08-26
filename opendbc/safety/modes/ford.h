@@ -100,6 +100,17 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
   .max_steer_power = 0,               // disabled, Ford has no steed power signal
 };
 
+// C0/C1 can steer independently of C2 in CAN FD path mode, so measured
+// curvature is not a valid C2 error signal. Bound C2 to a centering trim.
+static const CurvatureSteeringLimits FORD_PATH_STEERING_LIMITS = {
+  .max_curvature = 50,                // 0.001 rad/m C2 centering trim with C0/C1 active
+  .curvature_to_can = 50000,
+  .frequency = 20,
+  .max_curvature_error = 100,
+  .curvature_error_min_speed = 1.0e6,
+  .max_steer_power = 0,
+};
+
 static void ford_rx_hook(const CANPacket_t *msg) {
   if (msg->bus == FORD_MAIN_BUS) {
     // Update in motion state from standstill signal
@@ -267,11 +278,13 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     int desired_path_offset = (int)raw_path_offset - (int)FORD_INACTIVE_PATH_OFFSET;
     int desired_curvature = (int)raw_curvature - (int)FORD_INACTIVE_CURVATURE;
     int desired_curvature_rate = (int)raw_curvature_rate - (int)FORD_CANFD_INACTIVE_CURVATURE_RATE;
+    bool path_control_enabled = lat_ctl_mode == 2U;
 
     bool violation = false;
     violation |= safety_max_limit_check(desired_path_angle, FORD_MAX_PATH_ANGLE, FORD_MIN_PATH_ANGLE);
     violation |= safety_max_limit_check(desired_path_offset, FORD_MAX_PATH_OFFSET, FORD_MIN_PATH_OFFSET);
-    violation |= steer_curvature_cmd_checks(desired_curvature, 0, steer_control_enabled, FORD_STEERING_LIMITS);
+    violation |= steer_curvature_cmd_checks(desired_curvature, 0, steer_control_enabled,
+                                            path_control_enabled ? FORD_PATH_STEERING_LIMITS : FORD_STEERING_LIMITS);
     if (!steer_control_enabled) {
       violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature_rate != 0);
     }

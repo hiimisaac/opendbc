@@ -75,6 +75,10 @@ class CarController(CarControllerBase):
         apply_curvature = float(path.curvature)
         curvature_rate = float(path.curvatureRate)
         path_valid = True
+        if self.CP.flags & FordFlags.CANFD:
+          apply_curvature = CarControllerParams.CURVATURE_LIMITS.apply_limits(
+            apply_curvature, self.apply_curvature_last, CS.out.vEgoRaw, 0.0, True, CarControllerParams.STEER_STEP,
+          )
 
       self.apply_curvature_last = apply_curvature
       self.path_offset_last = path_offset

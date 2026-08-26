@@ -161,12 +161,13 @@ class TestFordPathActuators(unittest.TestCase):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
     controller.frame = CarControllerParams.STEER_STEP
+    controller.apply_curvature_last = 0.001
 
     CC = CarControl(latActive=True)
     CC.actuators.lateralPath.valid = True
     CC.actuators.lateralPath.pathOffset = 0.4
     CC.actuators.lateralPath.pathAngle = 0.1
-    CC.actuators.lateralPath.curvature = 0.01
+    CC.actuators.lateralPath.curvature = 0.001
     CC.actuators.lateralPath.curvatureRate = 0.0002
     CC.hudControl.leadDistanceBars = 0
 
@@ -188,7 +189,7 @@ class TestFordPathActuators(unittest.TestCase):
     assert output.lateralPath.valid
     assert math.isclose(output.lateralPath.pathOffset, 0.4, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.pathAngle, 0.1, rel_tol=1e-6)
-    assert math.isclose(output.lateralPath.curvature, 0.01, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.curvature, 0.001, rel_tol=1e-6)
     assert math.isclose(output.lateralPath.curvatureRate, 0.0002, rel_tol=1e-6)
 
     parser = CANParser("ford_lincoln_base_pt", [("LateralMotionControl2", 0)], 0)
@@ -197,6 +198,38 @@ class TestFordPathActuators(unittest.TestCase):
     assert msg["LatCtl_D2_Rq"] == 2
     assert math.isclose(msg["LatCtlPathOffst_L_Actl"], -0.4, abs_tol=0.01)
     assert math.isclose(msg["LatCtlPath_An_Actl"], -0.1, abs_tol=0.001)
-    assert math.isclose(msg["LatCtlCurv_No_Actl"], -0.01, abs_tol=1e-5)
+    assert math.isclose(msg["LatCtlCurv_No_Actl"], -0.001, abs_tol=1e-5)
     assert math.isclose(msg["LatCtlCrv_NoRate2_Actl"], -0.0002, abs_tol=2e-6)
 
+  def test_controller_unloads_c2_without_dropping_path(self):
+    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    controller.frame = CarControllerParams.STEER_STEP
+    controller.apply_curvature_last = 0.001
+
+    CC = CarControl(latActive=True)
+    CC.actuators.lateralPath.valid = True
+    CC.actuators.lateralPath.pathOffset = 0.4
+    CC.actuators.lateralPath.pathAngle = 0.1
+    CC.actuators.lateralPath.curvature = 0.0
+    CC.hudControl.leadDistanceBars = 0
+
+    CS = SimpleNamespace(
+      out=SimpleNamespace(
+        cruiseState=SimpleNamespace(available=False, standstill=False),
+        vEgoRaw=35.0,
+        vEgo=35.0,
+        yawRate=0.0,
+      ),
+      buttons_stock_values={},
+      acc_tja_status_stock_values={"Tja_D_Stat": 0},
+      lkas_status_stock_values={},
+    )
+    controller.lkas_enabled_last = True
+    controller.lead_distance_bars_last = 0
+
+    output, _ = controller.update(CC.as_reader(), CS, 0)
+
+    assert math.isclose(output.lateralPath.pathOffset, 0.4, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathAngle, 0.1, rel_tol=1e-6)
+    assert 0.0 < output.lateralPath.curvature < 0.001
