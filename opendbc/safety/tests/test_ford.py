@@ -77,7 +77,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
   DEG_TO_CAN = 50000   # CAN units per rad/m
   MAX_CURVATURE = 0.02 # rad/m, 1000 CAN units
   MAX_CURVATURE_ERROR = 0.002         # rad/m, 100 CAN units
-  MAX_PATH_CURVATURE = 0.001          # rad/m, bounded C2 centering trim with C0/C1 active
+  MAX_PATH_CURVATURE = 0.02           # rad/m, LMC2 field/PSCM limit
   CURVATURE_ERROR_MIN_SPEED = 10.0    # m/s
   LATERAL_FREQUENCY = 20              # Hz, for per-frame jerk limit
 
@@ -342,11 +342,13 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
     self.assertFalse(self._tx(self._lat_ctl_msg(True, 0.4, 0.1, over_rate, 0.0, mode=2)))
 
-  def test_path_command_caps_c2_centering_trim(self):
+  def test_path_command_caps_c2_at_pscm_limit(self):
     if self.STEER_MESSAGE != MSG_LateralMotionControl2:
       raise unittest.SkipTest("CAN FD only")
     self.safety.set_controls_allowed(True)
-    self._reset_curvature_measurement(0.0, 20.0)
+    # At road speeds the lateral-acceleration envelope is tighter than the
+    # field limit; isolate the absolute LMC2/PSCM bound at low speed.
+    self._reset_curvature_measurement(0.0, 1.0)
 
     for curvature in (self.MAX_PATH_CURVATURE, -self.MAX_PATH_CURVATURE):
       self._set_prev_desired_angle(curvature)

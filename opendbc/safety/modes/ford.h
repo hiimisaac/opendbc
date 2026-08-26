@@ -101,9 +101,9 @@ static const CurvatureSteeringLimits FORD_STEERING_LIMITS = {
 };
 
 // C0/C1 can steer independently of C2 in CAN FD path mode, so measured
-// curvature is not a valid C2 error signal. Bound C2 to a centering trim.
+// curvature is not a valid C2 error signal. Bound C2 to the PSCM field range.
 static const CurvatureSteeringLimits FORD_PATH_STEERING_LIMITS = {
-  .max_curvature = 50,                // 0.001 rad/m C2 centering trim with C0/C1 active
+  .max_curvature = 1000,              // 0.02 rad/m LMC2 field/PSCM limit
   .curvature_to_can = 50000,
   .frequency = 20,
   .max_curvature_error = 100,
