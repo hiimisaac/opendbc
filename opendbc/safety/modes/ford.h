@@ -256,7 +256,8 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
   // Safety check for LateralMotionControl2 action
   if (msg->addr == FORD_LateralMotionControl2) {
     // Signal: LatCtl_D2_Rq
-    bool steer_control_enabled = ((msg->data[0] >> 4) & 0x7U) != 0U;
+    unsigned int lat_ctl_mode = ((msg->data[0] >> 4) & 0x7U);
+    bool steer_control_enabled = (lat_ctl_mode != 0U) && (lat_ctl_mode != 3U);
     unsigned int raw_curvature = (msg->data[2] << 3) | (msg->data[3] >> 5);
     unsigned int raw_curvature_rate = (msg->data[6] << 3) | (msg->data[7] >> 5);
     unsigned int raw_path_angle = ((msg->data[3] & 0x1FU) << 6) | (msg->data[4] >> 2);

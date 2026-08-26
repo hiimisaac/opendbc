@@ -28,6 +28,7 @@ class CarController(CarControllerBase):
     self.path_angle_last = 0.0
     self.curvature_rate_last = 0.0
     self.path_valid_last = False
+    self.lmc2_ramp_out = 0
     self.accel = 0.0
     self.gas = 0.0
     self.brake_request = False
@@ -82,8 +83,16 @@ class CarController(CarControllerBase):
       self.path_valid_last = path_valid
 
       if self.CP.flags & FordFlags.CANFD:
-        # Mode 2 = PathFollowingExtendedMode (c0/c1/c2/c3). Mode 1 is curvature-only.
-        mode = 2 if CC.latActive else 0
+        # Mode 2 = PathFollowingExtendedMode. Mode 3 = SafeRampOut so PSCM
+        # does not sit Unavailable for ~5s after we drop to mode 0.
+        if CC.latActive:
+          mode = 2
+          self.lmc2_ramp_out = 20
+        elif self.lmc2_ramp_out > 0:
+          mode = 3
+          self.lmc2_ramp_out -= 1
+        else:
+          mode = 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode,
                                                      -path_offset, -path_angle, -apply_curvature, -curvature_rate, counter))

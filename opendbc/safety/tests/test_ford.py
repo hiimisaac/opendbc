@@ -178,7 +178,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
 
   # LCA command
   def _lat_ctl_msg(self, enabled: bool, path_offset: float, path_angle: float, curvature: float, curvature_rate: float,
-                   increment_timer: bool = True):
+                   increment_timer: bool = True, mode: int | None = None):
     if increment_timer:
       self.safety.set_timer(self.cnt_lat_ctl * int(1e6 / self.LATERAL_FREQUENCY))
       self.__class__.cnt_lat_ctl += 1
@@ -193,7 +193,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
       return self.packer.make_can_msg_safety("LateralMotionControl", 0, values)
     elif self.STEER_MESSAGE == MSG_LateralMotionControl2:
       values = {
-        "LatCtl_D2_Rq": 1 if enabled else 0,
+        "LatCtl_D2_Rq": (1 if enabled else 0) if mode is None else mode,
         "LatCtlPathOffst_L_Actl": path_offset,     # Path offset [-5.12|5.11] meter
         "LatCtlPath_An_Actl": path_angle,          # Path angle [-0.5|0.5235] radians
         "LatCtlCrv_NoRate2_Actl": curvature_rate,  # Curvature rate [-0.001024|0.001023] 1/meter^2
@@ -313,6 +313,13 @@ class TestFordSafetyBase(common.CarSafetyTest):
                                     path_offset=float(path_offset), path_angle=float(path_angle), curvature_rate=float(curvature_rate),
                                     curvature=float(curvature)):
                     self.assertEqual(should_tx, self._tx(self._lat_ctl_msg(steer_control_enabled, path_offset, path_angle, curvature, curvature_rate)))
+
+  def test_safe_ramp_out(self):
+    if self.STEER_MESSAGE != MSG_LateralMotionControl2:
+      raise unittest.SkipTest("CAN FD only")
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._lat_ctl_msg(False, 0, 0, 0, 0, mode=3)))
+    self.assertFalse(self._tx(self._lat_ctl_msg(False, 0.5, 0, 0, 0, mode=3)))
 
   def test_curvature_rate_limits(self):
     """
