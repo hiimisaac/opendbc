@@ -301,10 +301,12 @@ class TestFordSafetyBase(common.CarSafetyTest):
                   self._set_prev_desired_angle(curvature)
                   self._reset_curvature_measurement(curvature, speed)
 
-                  should_tx = path_offset == 0 and path_angle == 0 and curvature_rate == 0
-                  # when request bit is 0, only allow curvature of 0 since the signal range
-                  # is not large enough to enforce it tracking measured
-                  should_tx = should_tx and (controls_allowed if steer_control_enabled else curvature == 0)
+                  # Enabled: bounded c0/c1/c3 plus existing curvature checks. Inactive: all zeros.
+                  should_tx = -5.12 <= path_offset <= 5.11 and -0.5 <= path_angle <= 0.5235
+                  if steer_control_enabled:
+                    should_tx = should_tx and controls_allowed
+                  else:
+                    should_tx = should_tx and path_offset == 0 and path_angle == 0 and curvature_rate == 0 and curvature == 0
                   should_tx = should_tx and abs(round(curvature * self.DEG_TO_CAN)) <= max_curvature_can
 
                   with self.subTest(controls_allowed=controls_allowed, steer_control_enabled=steer_control_enabled,
