@@ -7,7 +7,6 @@ from opendbc.car.structs import CarControl, CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.ford.interface import CarInterface
 from opendbc.car.ford.carcontroller import CarController
-from opendbc.car.ford.learned_lateral_path import LearnedLateralPathCommand
 from opendbc.car.ford.values import CAR, DBC, CarControllerParams, FW_QUERY_CONFIG, FW_PATTERN, get_platform_codes
 from opendbc.car.ford.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test, parameterized
@@ -49,7 +48,7 @@ class TestFordFW(unittest.TestCase):
     non_canfd = CarInterface.get_non_essential_params(CAR.FORD_ESCAPE_MK4)
 
     assert canfd.steerControlType == CarParams.SteerControlType.path
-    assert non_canfd.steerControlType == CarParams.SteerControlType.angle
+    assert non_canfd.steerControlType == CarParams.SteerControlType.path
 
   def test_lateral_path_actuator_round_trip(self):
     actuators = CarControl.Actuators(lateralPath={
@@ -64,44 +63,14 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(actuators.lateralPath.curvature, 0.01, rel_tol=1e-6)
     assert math.isclose(actuators.lateralPath.curvatureRate, -0.0004, rel_tol=1e-6)
 
-  def test_canfd_controller_exposes_adaptive_lateral_toggle(self):
-    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
-    controller = CarController(DBC[CP.carFingerprint], CP)
-
-    controller.set_adaptive_lateral_enabled(True)
-
-    assert controller.adaptive_lateral_state.enabled
-
-  def test_adaptive_lateral_toggle_is_lightning_only(self):
-    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_MK14)
-    controller = CarController(DBC[CP.carFingerprint], CP)
-
-    controller.set_adaptive_lateral_enabled(True)
-
-    assert not controller.adaptive_lateral_state.enabled
-
-  def test_canfd_controller_consumes_lateral_path_actuator(self):
+  def test_controller_packs_lateral_path_only(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
     controller.frame = CarControllerParams.STEER_STEP
-
-    class RecordingPathController:
-      def __init__(self):
-        self.path = None
-        self.lat_ctl_limit = None
-        self.driver_input = None
-
-      def update(self, path, *args, **kwargs):
-        self.path = path
-        self.lat_ctl_limit = kwargs["lat_ctl_limit"]
-        self.driver_input = kwargs["driver_input"]
-        return LearnedLateralPathCommand(True, 0.1, 0.2, 0.003, 0.0004)
-
-    path_controller = RecordingPathController()
-    controller.lateral_path_controller = path_controller
+    assert not hasattr(controller, "lateral_path_controller")
+    assert not hasattr(controller, "set_adaptive_lateral_enabled")
 
     CC = CarControl(latActive=True)
-    CC.actuators.steeringAngleDeg = 10.0
     CC.actuators.lateralPath.valid = True
     CC.actuators.lateralPath.pathOffset = 0.4
     CC.actuators.lateralPath.pathAngle = 0.1
@@ -129,57 +98,17 @@ class TestFordFW(unittest.TestCase):
 
     output, can_sends = controller.update(CC.as_reader(), CS, 0)
 
-    assert path_controller.path is not None
-    assert path_controller.lat_ctl_limit == 2
-    assert path_controller.driver_input
-    assert math.isclose(path_controller.path.pathOffset, 0.4, rel_tol=1e-6)
-    assert math.isclose(path_controller.path.curvatureRate, 0.0002, rel_tol=1e-6)
-    assert math.isclose(output.lateralPath.pathOffset, 0.1, rel_tol=1e-6)
-    assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathOffset, 0.4, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.pathAngle, 0.1, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.curvature, 0.01, rel_tol=1e-6)
+    assert math.isclose(output.lateralPath.curvatureRate, 0.0002, rel_tol=1e-6)
+    assert output.lateralPath.valid
     assert len(can_sends) == 1
 
-  def test_canfd_controller_produces_bounded_learned_spatial_command(self):
-    CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
-    controller = CarController(DBC[CP.carFingerprint], CP)
-
-    CC = CarControl(latActive=True)
-    CC.actuators.lateralPath.valid = True
-    CC.actuators.lateralPath.pathOffset = 0.5 * 0.004 * 7.0 ** 2 + 0.0005 * 7.0 ** 3 / 6.0
-    CC.actuators.lateralPath.pathAngle = 0.004 * 7.0 + 0.5 * 0.0005 * 7.0 ** 2
-    CC.actuators.lateralPath.curvature = 0.004
-    CC.actuators.lateralPath.curvatureRate = 0.0005
-    CC.actuators.steeringAngleDeg = math.degrees(controller.VM.get_steer_from_curvature(-0.004, 7.0, 0.0))
-    CC.hudControl.leadDistanceBars = 0
-
-    CS = SimpleNamespace(
-      out=SimpleNamespace(
-        cruiseState=SimpleNamespace(available=False, standstill=False),
-        steeringAngleDeg=0.0,
-        steeringPressed=False,
-        steeringTorque=0.0,
-        vEgoRaw=7.0,
-        vEgo=7.0,
-        yawRate=0.0,
-      ),
-      buttons_stock_values={},
-      acc_tja_status_stock_values={"Tja_D_Stat": 0},
-      lkas_status_stock_values={},
-      lat_ctl_limit=0,
-    )
-    controller.lkas_enabled_last = True
-    controller.lead_distance_bars_last = 0
-
-    output = None
-    for _ in range(30):
-      controller.frame = CarControllerParams.STEER_STEP
-      output, _ = controller.update(CC.as_reader(), CS, 0)
-
-    assert output is not None
-    assert output.lateralPath.valid
-    assert abs(output.lateralPath.pathOffset) <= 5.12
-    assert abs(output.lateralPath.pathAngle) <= 0.5235
-    assert abs(output.lateralPath.curvature) <= 0.02
-    assert abs(output.lateralPath.curvatureRate) <= 0.001024
+    from opendbc.can.parser import CANParser
+    parser = CANParser("ford_lincoln_base_pt", [("LateralMotionControl2", 0)], 0)
+    parser.update([0, can_sends])
+    assert parser.vl["LateralMotionControl2"]["LatCtlPathOffst_L_Actl"] < 0
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:

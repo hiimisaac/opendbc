@@ -237,18 +237,36 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
   // Safety check for LateralMotionControl action
   if (msg->addr == FORD_LateralMotionControl) {
     // Signal: LatCtl_D_Rq
-    bool steer_control_enabled = ((msg->data[4] >> 2) & 0x7U) != 0U;
+    unsigned int lat_ctl_mode = (msg->data[4] >> 2) & 0x7U;
     unsigned int raw_curvature = (msg->data[0] << 3) | (msg->data[1] >> 5);
     unsigned int raw_curvature_rate = ((msg->data[1] & 0x1FU) << 8) | msg->data[2];
     unsigned int raw_path_angle = (msg->data[3] << 3) | (msg->data[4] >> 5);
     unsigned int raw_path_offset = (msg->data[5] << 2) | (msg->data[6] >> 6);
 
-    // These signals are not yet tested with the current safety limits
-    bool violation = (raw_curvature_rate != FORD_INACTIVE_CURVATURE_RATE) || (raw_path_angle != FORD_INACTIVE_PATH_ANGLE) || (raw_path_offset != FORD_INACTIVE_PATH_OFFSET);
+    bool steer_control_enabled = lat_ctl_mode == 1U;
+    bool violation = false;
 
-    // Check angle error and steer_control_enabled
-    int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;  // /FORD_STEERING_LIMITS.curvature_to_can to get real curvature
-    violation |= steer_curvature_cmd_checks(desired_curvature, 0, steer_control_enabled, FORD_STEERING_LIMITS);
+    int desired_path_angle = raw_path_angle - FORD_INACTIVE_PATH_ANGLE;
+    int desired_path_offset = raw_path_offset - FORD_INACTIVE_PATH_OFFSET;
+    int desired_curvature = raw_curvature - FORD_INACTIVE_CURVATURE;
+    int desired_curvature_rate = raw_curvature_rate - FORD_INACTIVE_CURVATURE_RATE;
+    speed_mismatch_check((float)vehicle_speed_2.values[0] / VEHICLE_SPEED_FACTOR);
+
+    // Classic CAN path: mode 1 with bounded c0/c1/c2 and full signed c3.
+    violation |= (lat_ctl_mode != 0U) && !steer_control_enabled;
+    violation |= safety_max_limit_check(desired_path_angle, FORD_MAX_PATH_ANGLE, FORD_MIN_PATH_ANGLE);
+    violation |= safety_max_limit_check(desired_path_offset, FORD_MAX_PATH_OFFSET, FORD_MIN_PATH_OFFSET);
+    violation |= safety_max_limit_check(desired_curvature, FORD_STEERING_LIMITS.max_curvature, -FORD_STEERING_LIMITS.max_curvature);
+
+    if (!steer_control_enabled) {
+      violation |= (desired_path_angle != 0) || (desired_path_offset != 0) || (desired_curvature != 0) || (desired_curvature_rate != 0);
+    }
+    const bool lateral_allowed = controls_allowed || controls_allowed_lateral;
+    violation |= steer_control_enabled && !lateral_allowed;
+
+    if (lateral_allowed && steer_control_enabled) {
+      violation |= rt_curvature_rate_limit_check(FORD_STEERING_LIMITS);
+    }
 
     if (violation) {
       tx = false;
