@@ -4,8 +4,8 @@ import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
 from opendbc.car.ford import fordcan
+from opendbc.car.ford.direct_lateral_path import DirectLatControlPath
 from opendbc.car.ford.lateral_path import driver_steering_opposes_command, SteeringAngleProjector
-from opendbc.car.ford.lateral_path_projector import ProjectedLatControlPath
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
 from opendbc.car.interfaces import CarControllerBase, V_CRUISE_MAX
 from opendbc.car.vehicle_model import VehicleModel
@@ -63,7 +63,7 @@ class CarController(CarControllerBase):
     self.curvature_rate_last = 0.0
     self.path_valid_last = False
     self.anti_overshoot_curvature_last = 0
-    self.lateral_path_controller = ProjectedLatControlPath()
+    self.lateral_path_controller = DirectLatControlPath()
     self.steering_angle_projector = SteeringAngleProjector()
 
     self.accel = 0.0
@@ -116,7 +116,8 @@ class CarController(CarControllerBase):
 
         # Bronco and some other cars consistently overshoot curvature requests.
         # Apply the same input shaping before either Ford lateral command path.
-        if self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
+        if not self.CP.flags & FordFlags.CANFD and \
+           self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
           self.anti_overshoot_curvature_last = anti_overshoot(desired_curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
           desired_curvature = self.anti_overshoot_curvature_last
 

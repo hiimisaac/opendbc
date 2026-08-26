@@ -119,7 +119,7 @@ class TestFordFW(unittest.TestCase):
     assert math.isclose(output.lateralPath.curvatureRate, 0.0004, rel_tol=1e-6)
     assert len(can_sends) == 1
 
-  def test_canfd_controller_transfers_changing_spatial_path_out_of_c2(self):
+  def test_canfd_controller_sends_the_clean_polynomial_directly(self):
     CP = CarInterface.get_non_essential_params(CAR.FORD_F_150_LIGHTNING_MK1)
     controller = CarController(DBC[CP.carFingerprint], CP)
 
@@ -150,15 +150,14 @@ class TestFordFW(unittest.TestCase):
     controller.lkas_enabled_last = True
     controller.lead_distance_bars_last = 0
 
-    output = None
-    for _ in range(30):
-      controller.frame = CarControllerParams.STEER_STEP
-      output, _ = controller.update(CC.as_reader(), CS, 0)
+    controller.frame = CarControllerParams.STEER_STEP
+    output, _ = controller.update(CC.as_reader(), CS, 0)
 
-    assert output is not None
-    assert output.lateralPath.curvature < CC.actuators.lateralPath.curvature
-    assert output.lateralPath.pathOffset > 0.0
-    assert output.lateralPath.pathAngle > 0.0
+    assert output.lateralPath.valid
+    assert output.lateralPath.pathOffset == CC.actuators.lateralPath.pathOffset
+    assert output.lateralPath.pathAngle == CC.actuators.lateralPath.pathAngle
+    assert output.lateralPath.curvature == CC.actuators.lateralPath.curvature
+    assert output.lateralPath.curvatureRate == CC.actuators.lateralPath.curvatureRate
 
   def test_fw_query_config(self):
     for (ecu, addr, subaddr) in FW_QUERY_CONFIG.extra_ecus:
