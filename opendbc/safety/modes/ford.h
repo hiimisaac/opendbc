@@ -110,6 +110,7 @@ static const CurvatureSteeringLimits FORD_PATH_STEERING_LIMITS = {
   .max_curvature_error = 100,
   .curvature_error_min_speed = 1.0e6,
   .max_steer_power = 0,
+  .inactive_curvature_is_zero = true,
 };
 
 static void ford_rx_hook(const CANPacket_t *msg) {
